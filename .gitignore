@@ -1,0 +1,29 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+signing.properties
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Local telemetry and captures may contain device identifiers
+captures/
+riders-hub-telemetry/
+
+# Android/Gradle build state
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.apk
+*.aab
