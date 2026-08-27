@@ -28,15 +28,12 @@ respective owners.
 - Short-disconnect continuity: reconnecting within two minutes resumes the
   same logical ride and telemetry log.
 - A low-board-battery notification at 20% or below.
-- Lossless local telemetry archives with decoded values and original BLE frame
-  data; finalized JSONL is appended to bounded working partitions, which become
-  verified compressed analytics packages when full.
+- Local ride archives that preserve decoded telemetry and original BLE frames
+  in compact, verified files.
 - Battery Longevity tracking with a speed-normalized full-charge estimate,
   observed charge windows, and an adaptive daily-to-yearly capacity chart.
 - Optional Home Assistant export for battery, estimated range, current-trip
   distance, last update, and in-use state—never live speed.
-- A monochrome, dot-matrix-inspired dashboard with no Riders Hub account or
-  required cloud service.
 
 A separate remote-battery field has not been identified, so Riders Hub shows
 that value as unavailable instead of presenting an inferred reading.
@@ -91,45 +88,52 @@ lock, or permanent foreground notification running in the background.
 
 ## Range and battery longevity
 
-The large number in **Range** is the estimated distance remaining at the
-current battery level. The bar beneath it is estimator readiness—not another
-distance or battery gauge. It fills as Riders Hub observes usable distance and
-battery depletion: an estimate appears after at least 1 km and 2% depletion,
-becomes **Ready** after 5 km and 10%, and continues gaining confidence up to 20
-km and 30% depletion. Completed rides are split into 5 km/h speed buckets so
-the estimate can reflect the speed profile of the current ride instead of
-treating every kilometre as equally demanding.
+**Range** estimates the kilometres remaining at the current battery level. Its
+bar shows how much useful ride data supports the estimate—not battery level or
+distance. An estimate appears after 1 km and 2% battery use and becomes
+**Ready** after 5 km and 10%. Speed buckets help adapt it to the current riding
+style.
 
-**Battery Longevity** tracks a separate speed-normalized estimate of kilometres
-per full charge. Because the known board protocol does not expose charger
-state, Riders Hub infers a new charge observation when a later ride begins at
-least five percentage points above the previous ending level. A capacity point
-requires at least 0.5 km, 5% depletion, and sufficiently complete speed data;
-the headline weights the latest three usable observations by their measured
-depletion. The chart begins with daily bars. Pinch inward to group by week,
-month, and year, or tap a grouped bar to inspect the next finer interval. Its
-vertical scale always runs from zero to the all-time observed high.
-
-These are empirical estimates for the recorded rider, board, routes,
-temperature, tires, and riding style. They are not measured Ah/Wh capacity or a
-definitive battery-health diagnosis. Voltage, speed, battery, and the currently
-unidentified signed load field are retained locally as compact statistical
-summaries for future correlation studies; they are not sent to Home Assistant.
+**Battery Longevity** compares speed-normalized kilometres per full charge over
+inferred charging cycles. It needs at least 0.5 km and 5% battery use for a data
+point. The chart starts daily; pinch to group by week, month, or year, and tap a
+bar to inspect it more closely. Local voltage statistics support future
+analysis, but these estimates are not a measured capacity or battery-health
+diagnosis.
 
 ## Local telemetry archives
 
-When a ride ends, its complete JSONL log is appended unchanged to an
-append-only working partition. A partition is sealed when it reaches roughly
-10 MiB or the paired remote changes, then compressed into an immutable,
-checksummed analytics package; the next sequence becomes the new working
-partition. Existing entries are never rotated away or overwritten. Interrupted
-trailing writes are ignored while earlier completed entries remain usable.
+After each ride, Riders Hub moves the complete log into a local archive. Archive
+files are compressed and verified at roughly 10 MiB or when the paired remote
+changes; existing rides are never overwritten. Interrupted final writes are
+ignored without losing earlier entries.
 
-The archive header stores one remote address for the whole partition so entries
-from different remotes are never mixed. This identifier and the ride data stay
-in the app-specific storage and must be treated as sensitive when exported. The
-binary format and verification rules are documented in the
-[Android app guide](docs/android-logger.md#rhprha-archive-format-version-1).
+Archives contain ride data and a device identifier, so exported files are
+sensitive. See the [Android app guide](docs/android-logger.md#rhprha-archive-format-version-1)
+for the technical format.
+
+## Home Assistant
+
+The optional Home Assistant connection uses its official `mobile_app` webhook
+interface. In **Device → Home Assistant**:
+
+1. Enable Home Assistant export.
+2. In the Home Assistant Companion app, navigate to **Sidebar → Profile →
+   Security → Long-Lived Access Tokens → Create Token**, then copy the token.
+3. Enter the Home Assistant URL and token, then tap **Connect**. They are used
+   once for registration and are not saved.
+4. Keep the supplied webhook URL or replace it with a Nabu Casa cloudhook, local
+   URL, or HTTPS proxy such as `https://ha.example.com/api/webhook/…`.
+
+Riders Hub creates entities for battery, estimated range, trip distance, last
+update, and in-use state. During a ride it updates every ten seconds, sends
+battery changes immediately, and emits start/end events. Payloads and stored
+webhook credentials are encrypted; remote URLs require HTTPS, while HTTP is
+accepted only on a trusted local network. Home Assistant may also create an
+empty device tracker, but Riders Hub never supplies location data.
+
+**Disconnect** removes the local webhook credentials. Remove the integration in
+Home Assistant separately if it is no longer needed.
 
 ## Privacy
 
@@ -152,42 +156,6 @@ app is not granted location access and does not receive coordinates.
 Exported logs can contain ride data and a stable Bluetooth address. Local
 captures, signing material, and build outputs are ignored by Git; review any
 file carefully before forcing it into a public commit.
-
-## Home Assistant
-
-Home Assistant support uses the official `mobile_app` registration and webhook
-interfaces. In **Device → Home Assistant**:
-
-1. Enable Home Assistant export.
-2. In the Home Assistant Companion app, navigate to **Sidebar → Profile →
-   Security → Long-Lived Access Tokens → Create Token**, then copy the token.
-3. Enter the Home Assistant base URL and token in Riders Hub, then tap
-   **Connect**.
-4. Riders Hub registers itself and five telemetry entities, enables Home
-   Assistant's encrypted webhook protocol, securely stores the returned webhook
-   URL and encryption key, and immediately forgets the base URL and token.
-5. Once connected, optionally replace the webhook URL with the equivalent Nabu
-   Casa cloudhook, local URL, or an HTTPS proxy such as
-   `https://ha.example.com/api/webhook/…`.
-
-While a ride is active, estimated range and current-trip distance are delivered
-every ten seconds, with an immediate delivery whenever the integer battery
-percentage changes. One final update is delivered at ride end; start/end
-transitions are also sent as `riders_hub_trip_started` and
-`riders_hub_trip_ended` events. Webhook data payloads and sensor-response bodies
-are encrypted between Riders Hub and Home Assistant; routing metadata such as
-the webhook URL and operation type remains visible to the transport. HTTPS is
-still required for every remotely reachable address because the URL path is a
-credential. Plain HTTP is accepted only for a private or `.local` address on a
-trusted LAN.
-
-Home Assistant may additionally create its standard mobile-app device tracker.
-Riders Hub has no location permission and never supplies coordinates, so that
-tracker remains without location data.
-
-**Disconnect** removes the saved webhook from Riders Hub. Home Assistant does
-not expose registration deletion through this webhook API, so remove the Riders
-Hub entry in Home Assistant separately when you no longer want it there.
 
 ## Requirements
 
