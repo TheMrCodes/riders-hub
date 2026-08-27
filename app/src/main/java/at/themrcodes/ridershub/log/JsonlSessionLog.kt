@@ -134,6 +134,14 @@ class JsonlSessionLog(
                 .put("distance_km", summary.distanceKm)
                 .put("moving_seconds", summary.movingSeconds)
                 .put("max_speed_kmh", summary.maxSpeedKmh)
+                .put(
+                    "speed_bucket_distances_km",
+                    JSONObject().apply {
+                        summary.speedBucketDistancesKm.toSortedMap().forEach { (bucket, distance) ->
+                            put(bucket.toString(), distance)
+                        }
+                    },
+                )
                 .put("board_battery_start", summary.boardBatteryStart ?: JSONObject.NULL)
                 .put("board_battery_end", summary.boardBatteryEnd ?: JSONObject.NULL)
                 .put("pack_voltage_start", summary.packVoltageStart ?: JSONObject.NULL)

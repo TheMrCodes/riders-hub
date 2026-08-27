@@ -66,21 +66,83 @@ remote is paired.
 
 ## Permissions and privacy
 
-The manifest contains five permissions:
+The manifest contains six permissions:
 
 - `BLUETOOTH_SCAN`, marked `neverForLocation`
 - `BLUETOOTH_CONNECT`
 - `REQUEST_COMPANION_RUN_IN_BACKGROUND`
 - `REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE`
 - `POST_NOTIFICATIONS`, for the user-requested low-battery warning
+- `INTERNET`, used only when the optional Home Assistant export is enabled
 
-It contains no Internet, location, storage, boot, wake-lock, exact-alarm, or
-foreground-service permission. Backups are disabled, cleartext traffic is
-disabled, and data-extraction rules exclude all app data.
+It contains no location, storage, boot, wake-lock, exact-alarm, or
+foreground-service permission. Backups are disabled and data-extraction rules
+exclude all app data. The app permits cleartext networking so a user-selected
+local Home Assistant instance can use its common `http://*.local:8123` address,
+but input validation rejects plain HTTP for non-local hosts.
 
 Android may require the device-wide Location Services switch during companion
 device discovery. This is a system scanner prerequisite; the app is not granted
 a location permission and does not receive coordinates.
+
+## Optional Home Assistant export
+
+The Device panel contains an off-by-default Home Assistant section. Its setup
+flow is intentionally split into two states:
+
+1. Enable the section.
+2. In the Home Assistant Companion app, navigate to **Sidebar → Profile →
+   Security → Long-Lived Access Tokens → Create Token**, then copy the token.
+3. Enter the Home Assistant base URL and token and select **Connect**.
+4. Riders Hub sends one authenticated `POST` to
+   `/api/mobile_app/registrations`, then registers five telemetry entities
+   through the returned webhook.
+5. After success, the base URL and token disappear and are not persisted. The
+   webhook URL remains editable while the Home Assistant encryption key stays
+   hidden. Home Assistant may initially supply a Nabu Casa cloudhook, a remote
+   URL, or a local webhook; a user-managed HTTPS proxy such as
+   `https://ha.example.com/api/webhook/…` can replace it.
+
+The registration uses a generated app-local UUID rather than a hardware or
+Android device identifier. The registered device is generically named
+**Riders Hub / Android device**. The retained webhook URL is a bearer credential.
+It and the Home Assistant encryption key are encrypted with a non-exportable
+Android Keystore key before being stored in private preferences excluded from
+backup and device transfer. The long-lived token is held only for the
+registration request and is never logged or written to preferences.
+
+Registration declares `supports_encryption: true`. Riders Hub uses Home
+Assistant's XSalsa20-Poly1305 SecretBox wire format for every webhook data
+payload and decrypts encrypted sensor responses before accepting a delivery as
+successful. The outer operation type and routing metadata are not hidden by
+this application-level encryption.
+An existing registration created by an older Riders Hub build is upgraded with
+Home Assistant's one-time `enable_encryption` command before further telemetry
+is sent. If that key cannot be retained, delivery stays paused and the UI asks
+the user to reconnect instead of falling back to plaintext.
+
+The integration exposes:
+
+- board battery percentage, also delivered immediately when its integer value
+  changes;
+- estimated remaining range in kilometres;
+- current logical-trip distance, delivered with battery and estimated range
+  every ten seconds while in use, alongside battery changes, and once more at
+  ride end;
+- the last update timestamp;
+- an in-use binary sensor plus `riders_hub_trip_started` and
+  `riders_hub_trip_ended` events.
+
+Home Assistant may also create the standard device tracker that accompanies a
+`mobile_app` registration. Riders Hub has no location permission and never
+submits coordinates, so this tracker remains without location data and is not
+one of the five telemetry entities above.
+
+It does not send speed, voltage, odometer, mode, remote name/address, ride ID,
+raw frames, or logs. Turning the section off pauses delivery without forgetting
+the connection. **Disconnect** forgets the local webhook; removing the mobile
+app registration from Home Assistant remains a separate action in Home
+Assistant because its webhook API has no registration-deletion command.
 
 ## Build and install
 
@@ -112,7 +174,7 @@ presence observation. A different phone requires its own association.
 
 ## Log location and extraction
 
-Each logical use session creates one UTF-8 JSONL file beneath:
+Each active logical session creates one temporary UTF-8 JSONL file beneath:
 
 ```text
 /storage/emulated/0/Android/data/at.themrcodes.ridershub/files/telemetry/
@@ -125,8 +187,79 @@ adb shell ls -l /storage/emulated/0/Android/data/at.themrcodes.ridershub/files/t
 adb pull /storage/emulated/0/Android/data/at.themrcodes.ridershub/files/telemetry ./riders-hub-telemetry
 ```
 
-Uninstalling the app removes this app-specific directory. Pull logs before an
-uninstall or **Clear storage** operation.
+After `session_end` is written, Riders Hub appends the exact JSONL bytes to the
+current binary working partition beneath `telemetry/archive/`. Working files use
+generic sequenced names such as `telemetry-000001.rhp`; device names and
+addresses are not copied into filenames. Existing completed entries are never
+rewritten. A single working partition belongs to one remote and stores its MAC
+once in the partition header.
+
+When the working partition reaches the 10 MiB target, or the connected remote
+changes, its complete contents are compressed as one unit and finalized under
+the same sequence, for example `telemetry-000001.rhp` becomes the immutable
+analytics package `telemetry-000001.rha`. The next write starts
+`telemetry-000002.rhp`. A single unusually large session may make a working
+partition exceed the target before it is finalized.
+
+The JSONL source is deleted only after its appended entry has been read back and
+its byte length, record count, and checksums verified. If that append finalizes
+the partition, the complete compressed package is also expanded and verified
+first. An incomplete trailing binary entry is truncated and ignored; all earlier
+completed entries remain valid. An incomplete, malformed, or mismatched source
+JSONL remains in place. On startup the app retries finalized JSONL files left by
+an older version or an interrupted cleanup. Temporary active logs are never
+migrated.
+
+Uninstalling the app removes this app-specific directory, including archives.
+Pull the complete `telemetry/` directory before an uninstall or **Clear storage**
+operation. These files contain private device and activity telemetry even though
+the partition filenames themselves are generic.
+
+### RHP/RHA archive format version 1
+
+All integers are big-endian. An append-only `.rhp` working partition starts with
+a fixed 24-byte `RHP1` header:
+
+| Field | Size | Meaning |
+| --- | ---: | --- |
+| `RHP1` magic | 4 bytes | Working-partition marker |
+| format version | 4 bytes | Partition schema version |
+| header length | 4 bytes | `24` for version 1 |
+| sequence | 4 bytes | Monotonic partition index |
+| remote MAC | 6 bytes | Remote associated with every entry in this partition |
+| reserved | 2 bytes | Reserved for future metadata |
+
+The MAC appears once per partition, not once per entry. The header is followed
+by direct, uncompressed session appends. Each append contains:
+
+| Field | Size | Meaning |
+| --- | ---: | --- |
+| `RHE1` magic | 4 bytes | Start of one session entry |
+| format version | 2 bytes | Entry schema version |
+| header length | 2 bytes | `48` for version 1 |
+| entry ID | 16 bytes | Truncated SHA-256 of the local session ID |
+| payload length | 8 bytes | Exact original JSONL byte count and payload boundary |
+| record count | 4 bytes | Number of JSONL objects |
+| source CRC32 | 4 bytes | Integrity check over the original JSONL bytes |
+| archived at | 8 bytes | UTC epoch milliseconds when the entry was appended |
+| payload | variable | One complete original JSONL session, stored unchanged |
+
+Every payload ends with a fixed 32-byte `RHC1` completion footer. `RHC1` simply
+means **Riders Hub Commit, version 1**: it repeats the entry ID and committed
+header-plus-payload length, then stores a CRC32 over those bytes. It is not a
+second archive and contains no remote MAC. Its purpose is to distinguish a fully
+written append from bytes left when a write stops midway. Such an incomplete
+tail is removed before the next append.
+
+A finalized `.rha` file starts with a fixed 56-byte `RHA1` package header. It
+contains the format version, header length, unchanged partition sequence, the
+single remote MAC, seal time as UTC epoch milliseconds, original partition
+length, compressed payload length, entry count, and CRC32 of the complete
+uncompressed `.rhp` bytes. The remainder is one DEFLATE stream containing that
+whole partition. The package is expanded and scanned after creation; once
+verified it becomes the immutable representation of that sequence and the next
+sequence is used for new entries. The MAC remains private local telemetry and is
+never used in the filename or a Home Assistant payload.
 
 ## JSONL schema
 
@@ -170,12 +303,12 @@ valid and unchanged. Schema 3 adds the explicit child-limiter command events.
 | `application_command_confirmed_by_telemetry` | requested state observed in a valid mode/status frame |
 | `application_command_rejected` / `application_command_not_confirmed` | local rejection or eight-second timeout |
 | `connection_segment_end` | reason and per-connection notification/frame/CRC totals |
-| `session_end` | logical-ride distance, time, battery, voltage, frames and segments |
+| `session_end` | logical-ride distance, 5 km/h speed-bucket distances, time, battery, voltage, frames and segments |
 
 A typical decoded record has this shape (values are illustrative):
 
 ```json
-{"seq":8,"type":"telemetry_frame","wall_time":"2026-08-25T10:00:00Z","elapsed_realtime_ns":123456789,"frame_number":1,"raw_hex":"ac 00 19 ...","frame_length":25,"mode_code":2,"mode":"Sport","board_battery_percent":20,"speed_candidates_kmh":[0,0],"speed_kmh":0,"pack_voltage_v":41.545,"load_raw_signed_be":7,"trip_km":0,"odometer_km":2355.8,"unknown":{"byte_1":"00","byte_3":"01","bytes_12_15":"00 07 00 00","bytes_21_22":"80 00"},"crc_expected":53215,"crc_actual":53215,"crc_valid":true}
+{"seq":8,"type":"telemetry_frame","wall_time":"2030-01-01T10:00:00Z","elapsed_realtime_ns":123456789,"frame_number":1,"raw_hex":"ac 00 19 ...","frame_length":25,"mode_code":2,"mode":"Sport","board_battery_percent":20,"speed_candidates_kmh":[0,0],"speed_kmh":0,"pack_voltage_v":41.545,"load_raw_signed_be":7,"trip_km":0,"odometer_km":123.4,"unknown":{"byte_1":"00","byte_3":"01","bytes_12_15":"00 07 00 00","bytes_21_22":"80 00"},"crc_expected":53215,"crc_actual":53215,"crc_valid":true}
 ```
 
 `notification` preserves original BLE chunk boundaries and `telemetry_frame`
@@ -191,19 +324,89 @@ JSONL but do not clutter ride history.
 - Distance uses trapezoidal integration of decoded speed and only CRC-valid
   adjacent frames separated by at most two seconds. Unknown gaps are not
   guessed.
+- Each integrated interval is assigned by its average speed to a durable 5 km/h
+  bucket (`0` means 0–<5 km/h, `5` means 5–<10 km/h, and so on). Each track
+  stores the kilometres travelled in every observed bucket.
 - Motion time uses those safe intervals with a 1 km/h threshold.
 - Stationary voltage points are sampled at 0.5 km/h or below when percentage
   changes or every ten minutes.
 - A personal voltage-versus-percentage regression can resolve useful depletion
   below the telemetry field's one-percent resolution.
+- While the dashboard is open, the current logical ride contributes to the
+  provisional range estimate before that ride is finalized.
+- Tracks with complete bucket coverage form equations relating battery
+  depletion to distance in each speed bucket. A regularized non-negative model
+  estimates percentage use per kilometre for each bucket; the active track's
+  speed mix is used for live range, with the aggregate recorded mix as the
+  fallback. Legacy tracks without buckets still contribute to the aggregate
+  fallback and confidence thresholds.
 - The estimate remains **Collecting data** until at least 1 km and 2% useful
   depletion exist. It is **Calibrated** only after at least 5 km and 10%;
   between those thresholds it is labelled **Provisional**.
+- The bar below the Range value visualizes estimator readiness, not battery or
+  remaining distance. Before an estimate exists, distance progress toward 1 km
+  and depletion progress toward 2% each contribute half. Afterwards, observed
+  distance up to 20 km and depletion up to 30% each contribute half. The status
+  becomes **Ready** at 5 km and 10%, while the bar can continue filling as the
+  evidence base grows.
 - Efficiencies outside 0.03–1.5 km per percentage point are rejected rather
   than displayed.
 
 This is an empirical estimate for the captured rider, board, route,
 temperature, tires, and riding style—not a guaranteed safe range.
+
+### Charge-cycle analysis foundation
+
+Riders Hub also keeps local, durable charge-to-charge observation summaries for
+range-retention analysis. The **Battery Longevity** section appears between
+Range and Rides; none of this data is exported to Home Assistant.
+
+- Charger state is not exposed by the known protocol. A new observation window
+  is therefore marked as **inferred** when the next recorded track starts at
+  least five battery percentage points above the preceding track's final value.
+- Each window retains its first, last, minimum, and maximum battery readings;
+  resting-voltage endpoints and extrema; recorded distance and motion time; the
+  accumulated 5 km/h speed-bucket profile; odometer endpoints; and ride count.
+- The odometer span is kept separately from app-integrated distance. A future
+  estimator can reject a window when unrecorded riding makes its speed profile
+  incomplete instead of treating missing kilometres as low energy use.
+- Windows are separated by a local pseudonymous board key so observations from
+  different paired devices cannot be combined. Raw addresses are not copied
+  into the charge-cycle summaries.
+- Up to 500 completed windows are retained independently of the shorter visible
+  ride history. Collection starts prospectively; older ride summaries are not
+  backfilled because they do not contain a durable board key.
+- During a valid board session, one voltage correlation sample is taken every
+  ten seconds. Samples are compacted within each ride by battery percentage,
+  5 km/h speed bucket, and resting/moving state before they are written to a
+  local SQLite history and associated with the inferred charge window.
+- The compact history retains voltage, speed, and the still-unidentified signed
+  load field as counts, sums, squared sums, cross-product sums, and extrema.
+  This supports later variance, covariance, regression, and voltage-sag studies
+  without retaining every roughly 120 ms BLE notification in the database.
+- Observation timestamps, odometer/distance bounds, and ride/cycle identifiers
+  preserve evolution over time. The database contains only the pseudonymous
+  local board key, never the raw Bluetooth address, and is not exported.
+
+These summaries are sufficient statistics for fitting battery depletion per
+speed bucket over successive time windows and comparing every window against a
+fixed reference riding profile. They deliberately do not claim measured Ah/Wh
+capacity or definitive battery state of health.
+
+The visible estimator accepts a charge window only after at least 0.5 km, 5%
+depletion, and 90% coverage by recorded speed buckets. It fits depletion per
+kilometre for each observed 5 km/h bucket, constructs one reference riding
+profile, and translates every accepted window into the full-charge range that
+window would provide under that same profile. This prevents a change in riding
+speed alone from being presented as battery degradation. The headline is a
+depletion-weighted average of the latest three usable observations; it remains
+explicitly provisional until multiple observations exist.
+
+The capacity chart starts with daily buckets and always uses zero as its minimum
+and the all-time observed high as its maximum. Pinching inward groups the data
+by week, month, and then year. Tapping a grouped bar drills into that interval at
+the next finer time unit; tapping a daily bar selects its value. Each time bar is
+a depletion-weighted average when it contains more than one observation.
 
 ## Battery warnings
 
@@ -245,28 +448,15 @@ than assumed to be 10 km/h.
 
 ## Current verification boundary
 
-- Twenty-five JVM tests pass: six protocol, four session-continuity, three
-  range-estimator, three GATT-deadline, three Bluetooth-address, three
-  board-data-validity, and three presence-compatibility tests.
-- The debug APK assembles and Android lint completes with zero errors.
-- Version 0.1 was installed and associated on the Nothing `A059`, Android
-  16/API 36. Nineteen presence-triggered JSONL sessions were pulled; all 1,331
-  reconstructed frames passed CRC validation.
-- That capture exposed the deprecated address-observation lifecycle defect in
-  [`capture-analysis-2026-08-25.md`](capture-analysis-2026-08-25.md). Later
-  versions replace that lifecycle and have been deployed during UI work.
-  Version 0.5.4 adds GATT timeout recovery, current-runtime presence state,
-  canonical Android Bluetooth-address handling, and recovery from a companion
-  service rebind without a replayed appearance event. It was installed in place
-  on the Android 16 Nothing A059 and reached F1F2 listening after automatically
-  recovering one transient GATT status 133. The verification capture contains
-  645 CRC-valid frames; nonzero board fields still require a board-powered
-  check. Supporting protocol and capture evidence is recorded in the BLE API
-  notes and capture analysis.
-- Version 0.6.0 clean-builds as a minSdk-34 APK, and Android lint reports no
-  unguarded API-above-34 calls. Its packaged resources contain the expected
-  default legacy and `v36` modern service selection. The Android 16 target went
-  offline before this build could be installed, so both that regression and a
-  physical Android 14 background appear/disappear test remain pending; build
-  and static compatibility are not substitutes for OEM-specific lifecycle
-  testing.
+The debug app is covered by focused JVM tests for protocol decoding, lifecycle
+continuity, range and longevity estimation, charge-window tracking, voltage
+statistics, Home Assistant payloads and cadence, URL validation, and telemetry
+archive recovery. Current verification uses the complete JVM test task, Android
+lint, and a debug assembly. Device testing has also covered registration,
+encrypted webhook delivery, BLE reconnection, and current Android adaptive-icon
+behavior.
+
+Build and static compatibility checks do not replace physical background
+appear/disappear testing across Android versions and OEM power-management
+implementations. Battery longevity is prospective and model-based; its quality
+will improve only as representative charge observations accumulate.

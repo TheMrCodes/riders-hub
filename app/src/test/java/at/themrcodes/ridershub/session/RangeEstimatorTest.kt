@@ -57,17 +57,90 @@ class RangeEstimatorTest {
         assertEquals(0.2, result.kmPerPercent!!, 0.0001)
     }
 
+    @Test
+    fun estimatesFromCurrentVisibleRide() {
+        val active = summary(distance = 1.0, startPercent = 80, endPercent = 75)
+            .copy(id = "active", endedAt = null, active = true)
+
+        val result = RangeEstimator.estimate(
+            currentBatteryPercent = 75,
+            currentRestingVoltageV = null,
+            sessions = rangeEstimationSessions(emptyList(), active),
+            calibrationPoints = emptyList(),
+        )
+
+        assertEquals(RangeEstimateStatus.PROVISIONAL, result.status)
+        assertEquals(0.2, result.kmPerPercent!!, 0.0001)
+        assertEquals(15.0, result.remainingKm!!, 0.0001)
+    }
+
+    @Test
+    fun currentRideIsNotCountedTwice() {
+        val active = summary(distance = 1.0, startPercent = 80, endPercent = 75)
+            .copy(id = "same-ride", endedAt = null, active = true)
+        val sessions = rangeEstimationSessions(
+            completedTracks = listOf(active.copy(active = false)),
+            activeRide = active,
+        )
+
+        assertEquals(1, sessions.size)
+    }
+
+    @Test
+    fun currentHighSpeedMixProducesShorterRangeThanLowSpeedMix() {
+        val history = listOf(
+            summary(
+                distance = 4.0,
+                startPercent = 100,
+                endPercent = 92,
+                speedBuckets = mapOf(10 to 4.0),
+            ),
+            summary(
+                distance = 4.0,
+                startPercent = 92,
+                endPercent = 76,
+                speedBuckets = mapOf(30 to 4.0),
+            ),
+        )
+        val lowSpeedProfile = summary(
+            distance = 0.2,
+            startPercent = 50,
+            endPercent = 50,
+            speedBuckets = mapOf(10 to 0.2),
+        ).copy(id = "active-low", active = true, endedAt = null)
+        val highSpeedProfile = lowSpeedProfile.copy(
+            id = "active-high",
+            speedBucketDistancesKm = mapOf(30 to 0.2),
+        )
+
+        val lowSpeedRange = RangeEstimator.estimate(
+            50,
+            null,
+            history + lowSpeedProfile,
+            emptyList(),
+        ).remainingKm!!
+        val highSpeedRange = RangeEstimator.estimate(
+            50,
+            null,
+            history + highSpeedProfile,
+            emptyList(),
+        ).remainingKm!!
+
+        assertTrue(highSpeedRange < lowSpeedRange)
+    }
+
     private fun summary(
         distance: Double,
         startPercent: Int,
         endPercent: Int,
         restStart: Double? = null,
         restEnd: Double? = null,
+        speedBuckets: Map<Int, Double> = emptyMap(),
     ) = RideSummary(
         id = "ride-$distance-$startPercent",
-        startedAt = "2026-08-25T10:00:00Z",
-        endedAt = "2026-08-25T11:00:00Z",
-        lastFrameAt = "2026-08-25T11:00:00Z",
+        startedAt = "2030-01-01T10:00:00Z",
+        endedAt = "2030-01-01T11:00:00Z",
+        lastFrameAt = "2030-01-01T11:00:00Z",
         distanceKm = distance,
         movingSeconds = 600.0,
         maxSpeedKmh = 25.0,
@@ -89,5 +162,6 @@ class RangeEstimatorTest {
         modes = setOf("Sport"),
         logFile = "ride.jsonl",
         active = false,
+        speedBucketDistancesKm = speedBuckets,
     )
 }

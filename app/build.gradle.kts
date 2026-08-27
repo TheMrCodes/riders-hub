@@ -57,5 +57,10 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
+    // Home Assistant mobile_app webhook payload encryption (XSalsa20-Poly1305).
+    implementation("com.goterl:lazysodium-android:5.2.0@aar")
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
+
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20260719")
 }

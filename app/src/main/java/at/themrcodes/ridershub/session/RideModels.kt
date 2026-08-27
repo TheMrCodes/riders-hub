@@ -26,6 +26,7 @@ data class RideSummary(
     val modes: Set<String>,
     val logFile: String,
     val active: Boolean,
+    val speedBucketDistancesKm: Map<Int, Double> = emptyMap(),
 ) {
     val isTrack: Boolean
         get() = distanceKm >= 0.02 || movingSeconds >= 10.0
@@ -49,10 +50,16 @@ data class RideSegment(
 
 data class RideStoreSnapshot(
     val activeRide: RideSummary?,
+    val lastCompletedRide: RideSummary?,
     val recentTracks: List<RideSummary>,
     val rangeEstimate: RangeEstimate,
     val reconnectGraceEndsAt: String?,
-)
+    val chargeCycles: ChargeCycleStoreSnapshot,
+    val batteryLongevity: BatteryLongevitySnapshot,
+) {
+    val currentTripDisplay: RideSummary?
+        get() = activeRide ?: lastCompletedRide
+}
 
 object SessionContinuity {
     fun shouldResume(
