@@ -13,6 +13,9 @@ Notable changes to Riders Hub are documented here.
 - Added a shared Android Studio watch run target and a debug-only ADB telemetry
   inlet for repeatable emulator testing; neither synthetic input nor sample
   ride data is present in release builds.
+- Added a one-update-per-minute ambient ride dashboard with burn-in shifting,
+  large trip distance, board battery, estimated range remaining, and a
+  ride-scoped Ongoing Activity that keeps the dashboard visible.
 
 ## 0.6.0 - 2026-08-28
 

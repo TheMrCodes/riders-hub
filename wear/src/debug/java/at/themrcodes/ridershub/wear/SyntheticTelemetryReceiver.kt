@@ -12,6 +12,7 @@ class SyntheticTelemetryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.getBooleanExtra(EXTRA_CLEAR, false)) {
             WearTelemetryStore.update(null)
+            WearOngoingActivity.sync(context, null, System.currentTimeMillis())
             return
         }
         val ageMs = intent.getLongExtra(EXTRA_AGE_MS, 0L).coerceAtLeast(0L)
@@ -26,10 +27,12 @@ class SyntheticTelemetryReceiver : BroadcastReceiver() {
                 speedKmh = intent.optionalDouble(EXTRA_SPEED_KMH),
                 boardBatteryPercent = intent.optionalInt(EXTRA_BATTERY_PERCENT),
                 tripKm = intent.optionalDouble(EXTRA_TRIP_KM),
+                estimatedRangeKm = intent.optionalDouble(EXTRA_ESTIMATED_RANGE_KM),
                 mode = intent.getStringExtra(EXTRA_MODE),
             )
         }.getOrNull() ?: return
         WearTelemetryStore.update(state)
+        WearOngoingActivity.sync(context, state, System.currentTimeMillis())
     }
 
     companion object {
@@ -39,6 +42,7 @@ class SyntheticTelemetryReceiver : BroadcastReceiver() {
         private const val EXTRA_SPEED_KMH = "speed_kmh"
         private const val EXTRA_BATTERY_PERCENT = "battery_percent"
         private const val EXTRA_TRIP_KM = "trip_km"
+        private const val EXTRA_ESTIMATED_RANGE_KM = "estimated_range_km"
         private const val EXTRA_MODE = "mode"
     }
 }

@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Riders Hub</string>
+    <string name="ongoing_channel_name">Active rides</string>
+    <string name="ongoing_channel_description">Keeps the ride dashboard available in ambient mode</string>
+    <string name="ongoing_title">Riders Hub</string>
+    <string name="ongoing_status">Ride dashboard active</string>
 </resources>

@@ -3,6 +3,7 @@ package at.themrcodes.ridershub
 import android.content.Context
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
+import at.themrcodes.ridershub.session.RideStore
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
 import java.util.Locale
@@ -11,7 +12,9 @@ internal class WearTelemetryPublisher(
     context: Context,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    private val dataClient by lazy { Wearable.getDataClient(context.applicationContext) }
+    private val applicationContext = context.applicationContext
+    private val dataClient by lazy { Wearable.getDataClient(applicationContext) }
+    private val rideStore by lazy { RideStore.get(applicationContext) }
     private var lastLivePublishAtMs = 0L
 
     @Synchronized
@@ -21,8 +24,16 @@ internal class WearTelemetryPublisher(
             return
         }
         lastLivePublishAtMs = now
+        val restingVoltage = snapshot.packVoltageV
+            ?.takeIf { (snapshot.speedKmh ?: Float.MAX_VALUE) <= 0.5f }
+            ?.toDouble()
+        val estimatedRangeKm = runCatching {
+            rideStore.snapshot(snapshot.boardBatteryPercent, restingVoltage)
+                .rangeEstimate
+                .remainingKm
+        }.getOrNull()
         val request = PutDataRequest.create(WearTelemetryState.DATA_PATH)
-            .setData(snapshot.toWearTelemetryState(now).encode())
+            .setData(snapshot.toWearTelemetryState(now, estimatedRangeKm).encode())
             .setUrgent()
         runCatching { dataClient.putDataItem(request) }
             // A phone without the Wearable Play services API remains fully supported.
@@ -35,7 +46,10 @@ internal class WearTelemetryPublisher(
     }
 }
 
-internal fun AppSnapshot.toWearTelemetryState(nowEpochMs: Long): WearTelemetryState {
+internal fun AppSnapshot.toWearTelemetryState(
+    nowEpochMs: Long,
+    estimatedRangeKm: Double? = null,
+): WearTelemetryState {
     val normalizedConnection = connection.lowercase(Locale.ROOT)
     val status = when {
         serviceActive && "listening" in normalizedConnection -> WearConnectionStatus.LIVE
@@ -52,6 +66,9 @@ internal fun AppSnapshot.toWearTelemetryState(nowEpochMs: Long): WearTelemetrySt
         speedKmh = speedKmh?.toDouble()?.takeIf { it.isFinite() && it in 0.0..200.0 },
         boardBatteryPercent = boardBatteryPercent?.takeIf { it in 0..100 },
         tripKm = tripKm?.toDouble()?.takeIf { it.isFinite() && it in 0.0..1_000_000.0 },
+        estimatedRangeKm = estimatedRangeKm?.takeIf {
+            it.isFinite() && it in 0.0..1_000_000.0
+        },
         mode = mode?.take(32),
     )
 }

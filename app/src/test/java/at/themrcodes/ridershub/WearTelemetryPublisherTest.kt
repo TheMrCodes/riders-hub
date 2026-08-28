@@ -16,13 +16,14 @@ class WearTelemetryPublisherTest {
             boardBatteryPercent = 64,
             tripKm = 3.75f,
             mode = "SPORT",
-        ).toWearTelemetryState(nowEpochMs = 123_000)
+        ).toWearTelemetryState(nowEpochMs = 123_000, estimatedRangeKm = 12.75)
 
         assertEquals(WearConnectionStatus.LIVE, payload.connection)
         assertEquals(123_000, payload.updatedAtEpochMs)
         assertEquals(21.5, payload.speedKmh!!, 0.001)
         assertEquals(64, payload.boardBatteryPercent)
         assertEquals(3.75, payload.tripKm!!, 0.001)
+        assertEquals(12.75, payload.estimatedRangeKm!!, 0.001)
         assertEquals("SPORT", payload.mode)
     }
 

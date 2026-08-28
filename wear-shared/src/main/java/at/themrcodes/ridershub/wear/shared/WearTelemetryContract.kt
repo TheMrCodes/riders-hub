@@ -16,7 +16,8 @@ enum class WearConnectionStatus {
  * Privacy-minimized state shared with a paired Wear OS watch.
  *
  * Device identifiers, names, odometer values, timestamps from ride history, and raw telemetry
- * intentionally aren't part of this contract.
+ * intentionally aren't part of this contract. Estimated remaining range is derived on the phone
+ * from the user's local ride model and is sent only as the current aggregate estimate.
  */
 data class WearTelemetryState(
     val connection: WearConnectionStatus,
@@ -24,6 +25,7 @@ data class WearTelemetryState(
     val speedKmh: Double?,
     val boardBatteryPercent: Int?,
     val tripKm: Double?,
+    val estimatedRangeKm: Double?,
     val mode: String?,
 ) {
     init {
@@ -31,6 +33,10 @@ data class WearTelemetryState(
         require(speedKmh == null || speedKmh.isFinite() && speedKmh in 0.0..MAX_SPEED_KMH)
         require(boardBatteryPercent == null || boardBatteryPercent in 0..100)
         require(tripKm == null || tripKm.isFinite() && tripKm in 0.0..MAX_TRIP_KM)
+        require(
+            estimatedRangeKm == null ||
+                estimatedRangeKm.isFinite() && estimatedRangeKm in 0.0..MAX_RANGE_KM,
+        )
         require(mode == null || mode.length <= MAX_MODE_LENGTH)
     }
 
@@ -44,6 +50,7 @@ data class WearTelemetryState(
             output.writeOptionalDouble(speedKmh)
             output.writeOptionalInt(boardBatteryPercent)
             output.writeOptionalDouble(tripKm)
+            output.writeOptionalDouble(estimatedRangeKm)
             output.writeOptionalString(mode)
         }
         return bytes.toByteArray()
@@ -52,9 +59,11 @@ data class WearTelemetryState(
     companion object {
         const val DATA_PATH = "/riders-hub/telemetry"
         private const val MAGIC = 0x52485542
-        private const val SCHEMA_VERSION = 1
+        private const val SCHEMA_VERSION = 2
+        private const val LEGACY_SCHEMA_VERSION = 1
         private const val MAX_SPEED_KMH = 200.0
         private const val MAX_TRIP_KM = 1_000_000.0
+        private const val MAX_RANGE_KM = 1_000_000.0
         private const val MAX_MODE_LENGTH = 32
 
         fun decode(bytes: ByteArray): WearTelemetryState = DataInputStream(
@@ -62,13 +71,22 @@ data class WearTelemetryState(
         ).use { input ->
             require(input.readInt() == MAGIC) { "Unknown Wear telemetry payload" }
             val version = input.readInt()
-            require(version == SCHEMA_VERSION) { "Unsupported Wear telemetry schema $version" }
+            require(version == LEGACY_SCHEMA_VERSION || version == SCHEMA_VERSION) {
+                "Unsupported Wear telemetry schema $version"
+            }
+            val connection = WearConnectionStatus.valueOf(input.readUTF())
+            val updatedAtEpochMs = input.readLong()
+            val speedKmh = input.readOptionalDouble()
+            val boardBatteryPercent = input.readOptionalInt()
+            val tripKm = input.readOptionalDouble()
+            val estimatedRangeKm = if (version >= SCHEMA_VERSION) input.readOptionalDouble() else null
             val state = WearTelemetryState(
-                connection = WearConnectionStatus.valueOf(input.readUTF()),
-                updatedAtEpochMs = input.readLong(),
-                speedKmh = input.readOptionalDouble(),
-                boardBatteryPercent = input.readOptionalInt(),
-                tripKm = input.readOptionalDouble(),
+                connection = connection,
+                updatedAtEpochMs = updatedAtEpochMs,
+                speedKmh = speedKmh,
+                boardBatteryPercent = boardBatteryPercent,
+                tripKm = tripKm,
+                estimatedRangeKm = estimatedRangeKm,
                 mode = input.readOptionalString(),
             )
             require(input.available() == 0) { "Wear telemetry payload has trailing data" }

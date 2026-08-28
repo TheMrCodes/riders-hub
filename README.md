@@ -35,7 +35,8 @@ respective owners.
 - Optional Home Assistant export for battery, estimated range, current-trip
   distance, last update, and in-use state—never live speed.
 - A Wear OS companion dashboard for live speed, board battery, trip distance,
-  and ride mode, with clearly subdued last-known values while disconnected.
+  estimated remaining range, and ride mode, with clearly subdued last-known
+  values while disconnected.
 
 A separate remote-battery field has not been identified, so Riders Hub shows
 that value as unavailable instead of presenting an inferred reading.
@@ -158,10 +159,10 @@ device-wide Location Services switch for companion-device discovery, but the
 app is not granted location access and does not receive coordinates.
 
 The optional Wear OS companion receives only connection state, live speed,
-board battery, current trip distance, ride mode, and the update time through
-Google's private paired-device Data Layer. Bluetooth addresses, remote names,
-odometer totals, ride history, locations, and raw telemetry are not sent to
-the watch.
+board battery, current trip distance, the phone's aggregate estimated remaining
+range, ride mode, and the update time through Google's private paired-device
+Data Layer. Bluetooth addresses, remote names, odometer totals, ride history,
+locations, and raw telemetry are not sent to the watch.
 
 Exported logs can contain ride data and a stable Bluetooth address. Local
 captures, signing material, and build outputs are ignored by Git; review any
@@ -212,6 +213,13 @@ certificate. Wear OS 3 and newer does not support ADB debugging through the
 phone's Bluetooth connection; deployment requires a direct Wi-Fi or supported
 USB ADB connection to the watch.
 
+During an active ride, the watch posts a low-priority Ongoing Activity after
+notification permission is granted. This keeps the dashboard available through
+the system's second inactivity timeout. Ambient mode redraws only on the Wear OS
+minute tick, buffers faster phone updates between ticks, and shows only current
+trip kilometres, board battery, and estimated kilometres remaining. Devices
+that request burn-in protection receive a small four-position layout shift.
+
 ### Wear emulator telemetry
 
 The debug Wear APK includes an ADB-only synthetic telemetry receiver. It is
@@ -226,6 +234,7 @@ adb -s WATCH_SERIAL shell am broadcast \
   --ef speed_kmh 24.5 \
   --ei battery_percent 78 \
   --ef trip_km 4.25 \
+  --ef estimated_range_km 12.75 \
   --es mode SPORT
 ```
 

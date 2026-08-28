@@ -1,8 +1,12 @@
 package at.themrcodes.ridershub.wear
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -20,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,6 +41,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
+import androidx.wear.compose.foundation.AmbientMode
+import androidx.wear.compose.foundation.rememberAmbientModeManager
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import com.google.android.gms.wearable.DataClient
@@ -46,10 +54,26 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private val dataClient by lazy { Wearable.getDataClient(this) }
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) syncOngoingActivity()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { RidersHubWearApp(WearTelemetryStore.telemetry) }
+        setContent {
+            RidersHubWearApp(
+                telemetry = WearTelemetryStore.telemetry,
+                onAmbientFrame = ::syncOngoingActivity,
+            )
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     override fun onStart() {
@@ -61,7 +85,7 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                     .filter { it.uri.path == WearTelemetryState.DATA_PATH }
                     .mapNotNull { item -> decodePayload(item.data) }
                     .maxByOrNull { it.updatedAtEpochMs }
-                    ?.let(WearTelemetryStore::update)
+                    ?.let(::updateTelemetry)
             } finally {
                 items.release()
             }
@@ -79,10 +103,23 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
             val updated = if (event.type == DataEvent.TYPE_DELETED) {
                 null
             } else {
-                decodePayload(event.dataItem.data) ?: WearTelemetryStore.telemetry
+                decodePayload(event.dataItem.data) ?: WearTelemetryStore.latest()
             }
-            WearTelemetryStore.update(updated)
+            updateTelemetry(updated)
         }
+    }
+
+    private fun updateTelemetry(value: WearTelemetryState?) {
+        WearTelemetryStore.update(value)
+        WearOngoingActivity.sync(this, value, System.currentTimeMillis())
+    }
+
+    private fun syncOngoingActivity() {
+        WearOngoingActivity.sync(
+            context = this,
+            telemetry = WearTelemetryStore.latest(),
+            nowEpochMs = System.currentTimeMillis(),
+        )
     }
 
     private fun decodePayload(bytes: ByteArray?): WearTelemetryState? = bytes?.let { payload ->
@@ -91,11 +128,49 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 }
 
 internal object WearTelemetryStore {
+    private val ambientGate = AmbientTelemetryGate<WearTelemetryState>()
+
     var telemetry by mutableStateOf<WearTelemetryState?>(null)
         private set
 
     fun update(value: WearTelemetryState?) {
-        telemetry = value
+        ambientGate.update(value)
+        telemetry = ambientGate.visible
+    }
+
+    fun setAmbient(enabled: Boolean) {
+        ambientGate.setAmbient(enabled)
+        telemetry = ambientGate.visible
+    }
+
+    fun renderAmbientFrame() {
+        ambientGate.onAmbientTick()
+        telemetry = ambientGate.visible
+    }
+
+    fun latest(): WearTelemetryState? = ambientGate.latest
+}
+
+internal class AmbientTelemetryGate<T> {
+    var latest: T? = null
+        private set
+    private var ambient = false
+
+    var visible: T? = null
+        private set
+
+    fun update(value: T?) {
+        latest = value
+        if (!ambient) visible = value
+    }
+
+    fun setAmbient(enabled: Boolean) {
+        ambient = enabled
+        if (!enabled) visible = latest
+    }
+
+    fun onAmbientTick() {
+        if (ambient) visible = latest
     }
 }
 
@@ -103,19 +178,47 @@ private val RidersRed = Color(0xFFD71921)
 private val RidersBlack = Color.Black
 private val RidersWhite = Color(0xFFF2F2F2)
 private val RidersMuted = Color(0xFF8C8C8C)
+private val RidersAmbient = Color(0xFF707070)
 private val RidersLine = Color(0xFF292929)
 private val RidersMono = FontFamily.Monospace
 
 @Composable
-private fun RidersHubWearApp(telemetry: WearTelemetryState?) {
+private fun RidersHubWearApp(
+    telemetry: WearTelemetryState?,
+    onAmbientFrame: () -> Unit,
+) {
+    val ambientModeManager = rememberAmbientModeManager()
+    val ambientMode = ambientModeManager.currentAmbientMode
+    val ambientDetails = ambientMode as? AmbientMode.Ambient
+    val ambient = ambientDetails != null
     var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
+    var ambientFrame by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(ambient) {
+        WearTelemetryStore.setAmbient(ambient)
+        nowEpochMs = System.currentTimeMillis()
+        if (ambient) return@LaunchedEffect
         while (true) {
             delay(15_000)
             nowEpochMs = System.currentTimeMillis()
         }
     }
+    LaunchedEffect(ambientModeManager) {
+        while (true) {
+            ambientModeManager.withAmbientTick {
+                WearTelemetryStore.renderAmbientFrame()
+                nowEpochMs = System.currentTimeMillis()
+                ambientFrame++
+                onAmbientFrame()
+            }
+        }
+    }
     val uiState = wearUiState(telemetry, nowEpochMs)
+    val burnInOffset = if (ambientDetails?.isBurnInProtectionRequired == true) {
+        ambientBurnInOffset(ambientFrame)
+    } else {
+        0 to 0
+    }
 
     MaterialTheme {
         Box(
@@ -128,79 +231,130 @@ private fun RidersHubWearApp(telemetry: WearTelemetryState?) {
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
+                    .offset(x = burnInOffset.first.dp, y = burnInOffset.second.dp)
                     .padding(horizontal = 24.dp, vertical = 14.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = if (ambient) Arrangement.Center else Arrangement.Top,
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(
-                        Modifier
-                            .size(6.dp)
-                            .background(if (uiState.live) RidersRed else RidersMuted, CircleShape),
-                    )
-                    Text(
-                        text = uiState.statusLabel,
-                        modifier = Modifier.padding(start = 7.dp),
-                        color = RidersMuted,
-                        fontFamily = RidersMono,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp,
-                    )
+                if (ambient) {
+                    AmbientDashboard(uiState)
+                } else {
+                    InteractiveDashboard(uiState)
                 }
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    text = uiState.speed,
-                    color = uiState.valueColor,
-                    fontFamily = RidersMono,
-                    fontSize = 42.sp,
-                    fontWeight = FontWeight.Black,
-                    lineHeight = 43.sp,
-                )
-                Text(
-                    text = "KM/H",
-                    color = RidersMuted,
-                    fontFamily = RidersMono,
-                    fontSize = 8.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.5.sp,
-                )
-                Spacer(Modifier.height(12.dp))
-                Box(
-                    Modifier
-                        .fillMaxWidth(0.72f)
-                        .height(1.dp)
-                        .background(RidersLine),
-                )
-                Spacer(Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                ) {
-                    WearMetric("BATTERY", uiState.battery, uiState.valueColor)
-                    WearMetric("TRIP", uiState.trip, uiState.valueColor)
-                }
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    text = uiState.mode,
-                    color = RidersMuted,
-                    fontFamily = RidersMono,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
             }
         }
     }
 }
 
 @Composable
-private fun WearMetric(label: String, value: String, valueColor: Color) {
+private fun AmbientDashboard(uiState: WearUiState) {
+    Text(
+        text = uiState.tripValue,
+        color = RidersAmbient,
+        fontFamily = RidersMono,
+        fontSize = 42.sp,
+        fontWeight = FontWeight.Black,
+        lineHeight = 43.sp,
+    )
+    Text(
+        text = "TRIP KM",
+        color = RidersAmbient,
+        fontFamily = RidersMono,
+        fontSize = 8.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 1.5.sp,
+    )
+    Spacer(Modifier.height(18.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+    ) {
+        WearMetric("BATTERY", uiState.battery, RidersAmbient, RidersAmbient)
+        WearMetric("KM LEFT", uiState.rangeValue, RidersAmbient, RidersAmbient)
+    }
+}
+
+@Composable
+private fun InteractiveDashboard(uiState: WearUiState) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(6.dp)
+                .background(if (uiState.live) RidersRed else RidersMuted, CircleShape),
+        )
+        Text(
+            text = uiState.statusLabel,
+            modifier = Modifier.padding(start = 7.dp),
+            color = RidersMuted,
+            fontFamily = RidersMono,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp,
+        )
+    }
+    Spacer(Modifier.height(10.dp))
+    Text(
+        text = uiState.speed,
+        color = uiState.valueColor,
+        fontFamily = RidersMono,
+        fontSize = 42.sp,
+        fontWeight = FontWeight.Black,
+        lineHeight = 43.sp,
+    )
+    Text(
+        text = "KM/H",
+        color = RidersMuted,
+        fontFamily = RidersMono,
+        fontSize = 8.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 1.5.sp,
+    )
+    Spacer(Modifier.height(12.dp))
+    Box(
+        Modifier
+            .fillMaxWidth(0.72f)
+            .height(1.dp)
+            .background(RidersLine),
+    )
+    Spacer(Modifier.height(10.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+    ) {
+        WearMetric("BATTERY", uiState.battery, uiState.valueColor)
+        WearMetric("TRIP", uiState.trip, uiState.valueColor)
+    }
+    Spacer(Modifier.height(10.dp))
+    Text(
+        text = uiState.mode,
+        color = RidersMuted,
+        fontFamily = RidersMono,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 1.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+internal fun ambientBurnInOffset(frame: Int): Pair<Int, Int> = when (Math.floorMod(frame, 4)) {
+    0 -> -2 to -2
+    1 -> 2 to -2
+    2 -> 2 to 2
+    else -> -2 to 2
+}
+
+@Composable
+private fun WearMetric(
+    label: String,
+    value: String,
+    valueColor: Color,
+    labelColor: Color = RidersMuted,
+) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
             text = value,
@@ -212,7 +366,7 @@ private fun WearMetric(label: String, value: String, valueColor: Color) {
         )
         Text(
             text = label,
-            color = RidersMuted,
+            color = labelColor,
             fontFamily = RidersMono,
             fontSize = 8.sp,
             letterSpacing = 1.sp,
@@ -227,6 +381,8 @@ internal data class WearUiState(
     val speed: String,
     val battery: String,
     val trip: String,
+    val tripValue: String,
+    val rangeValue: String,
     val mode: String,
     val valueColor: Color,
 )
@@ -243,12 +399,17 @@ internal fun wearUiState(telemetry: WearTelemetryState?, nowEpochMs: Long): Wear
         telemetry.connection == WearConnectionStatus.RECONNECTING -> "RECONNECTING"
         else -> "STANDBY"
     }
+    val tripValue = telemetry?.tripKm?.let { String.format(Locale.US, "%.1f", it) } ?: "--.-"
     return WearUiState(
         live = live,
         statusLabel = status,
         speed = telemetry?.speedKmh?.let { String.format(Locale.US, "%.1f", it) } ?: "--.-",
         battery = telemetry?.boardBatteryPercent?.let { "$it%" } ?: "--%",
-        trip = telemetry?.tripKm?.let { String.format(Locale.US, "%.1f KM", it) } ?: "--.- KM",
+        trip = "$tripValue KM",
+        tripValue = tripValue,
+        rangeValue = telemetry?.estimatedRangeKm?.let {
+            String.format(Locale.US, "%.1f", it)
+        } ?: "--.-",
         mode = telemetry?.mode?.uppercase(Locale.ROOT) ?: "NO RIDE DATA",
         valueColor = if (live) RidersWhite else RidersMuted,
     )

@@ -48,11 +48,13 @@ dependencies {
     implementation(composeBom)
     implementation(project(":wear-shared"))
     implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.core:core:1.18.0")
     implementation("androidx.fragment:fragment:1.9.0")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.wear.compose:compose-foundation:1.6.2")
     implementation("androidx.wear.compose:compose-material3:1.6.2")
+    implementation("androidx.wear:wear-ongoing:1.1.0")
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
