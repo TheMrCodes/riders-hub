@@ -6,6 +6,7 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.TemporalAdjusters
+import java.util.Locale
 import kotlin.math.max
 
 enum class BatteryLongevityStatus {
@@ -217,6 +218,7 @@ object BatteryLongevityChart {
         focusStart: Instant? = null,
         focusEndExclusive: Instant? = null,
         maxBars: Int = DEFAULT_MAX_BARS,
+        locale: Locale = Locale.US,
     ): List<BatteryLongevityBar> {
         require(maxBars > 0)
         val filtered = observations.filter { observation ->
@@ -234,7 +236,7 @@ object BatteryLongevityChart {
                     id = "${granularity.name}:$start",
                     start = start,
                     endExclusive = end,
-                    label = label(start.atZone(zoneId), granularity),
+                    label = label(start.atZone(zoneId), granularity, locale),
                     fullRangeKm = average,
                     observationCount = values.size,
                 )
@@ -268,11 +270,15 @@ object BatteryLongevityChart {
         LongevityGranularity.YEAR -> start.plusYears(1)
     }
 
-    private fun label(start: ZonedDateTime, granularity: LongevityGranularity): String =
+    private fun label(
+        start: ZonedDateTime,
+        granularity: LongevityGranularity,
+        locale: Locale = Locale.US,
+    ): String =
         when (granularity) {
-            LongevityGranularity.DAY -> DateTimeFormatter.ofPattern("d MMM").format(start)
-            LongevityGranularity.WEEK -> "W${DateTimeFormatter.ofPattern("ww").format(start)}"
-            LongevityGranularity.MONTH -> DateTimeFormatter.ofPattern("MMM").format(start)
-            LongevityGranularity.YEAR -> DateTimeFormatter.ofPattern("yyyy").format(start)
+            LongevityGranularity.DAY -> DateTimeFormatter.ofPattern("d MMM", locale).format(start)
+            LongevityGranularity.WEEK -> "W${DateTimeFormatter.ofPattern("ww", locale).format(start)}"
+            LongevityGranularity.MONTH -> DateTimeFormatter.ofPattern("MMM", locale).format(start)
+            LongevityGranularity.YEAR -> DateTimeFormatter.ofPattern("yyyy", locale).format(start)
         }
 }
