@@ -1,5 +1,6 @@
 package at.themrcodes.ridershub.protocol
 
+import java.util.Locale
 import java.util.UUID
 
 object BackfireProtocol {
@@ -149,4 +150,4 @@ fun ByteArray.signedBe(start: Int, length: Int): Int {
     return if (unsigned and signBit != 0) unsigned - (1 shl (length * 8)) else unsigned
 }
 
-fun ByteArray.hex(): String = joinToString(separator = " ") { "%02x".format(it.u8()) }
+fun ByteArray.hex(): String = joinToString(separator = " ") { "%02x".format(Locale.ROOT, it.u8()) }

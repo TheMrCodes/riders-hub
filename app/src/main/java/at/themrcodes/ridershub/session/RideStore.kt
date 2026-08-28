@@ -16,6 +16,7 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.floor
 import kotlin.math.max
@@ -60,6 +61,7 @@ class RideStore private constructor(private val context: Context) {
             graceMs = SESSION_GRACE_MS,
         )
 
+        val resumeDeadlineEpochMs = if (resumable) current?.pendingFinalizeAtMs else null
         val stored = if (resumable) {
             requireNotNull(current)
         } else {
@@ -86,6 +88,7 @@ class RideStore private constructor(private val context: Context) {
             initialSequence = stored.lastSequence,
             segmentNumber = stored.summary.segmentCount,
             newSession = !resumable,
+            resumeDeadlineEpochMs = resumeDeadlineEpochMs,
         )
     }
 
@@ -187,13 +190,22 @@ class RideStore private constructor(private val context: Context) {
         }
     }
 
-    fun endSegment(reason: String, lastSequence: Long) = synchronized(LOCK) {
+    fun endSegment(
+        reason: String,
+        lastSequence: Long,
+        resumeDeadlineEpochMs: Long? = null,
+    ) = synchronized(LOCK) {
         val stored = active ?: return@synchronized
+        val now = System.currentTimeMillis()
         stored.lastSequence = max(stored.lastSequence, lastSequence)
         stored.segmentOpen = false
-        stored.pendingFinalizeAtMs = System.currentTimeMillis() + SESSION_GRACE_MS
+        stored.pendingFinalizeAtMs = resumeDeadlineEpochMs ?: now + SESSION_GRACE_MS
         persistLocked(force = true)
-        scheduleFinalizationAlarm(stored.pendingFinalizeAtMs!!)
+        if (stored.pendingFinalizeAtMs!! <= now) {
+            finalizeExpiredLocked(now)
+        } else {
+            scheduleFinalizationAlarm(stored.pendingFinalizeAtMs!!)
+        }
     }
 
     fun finalizeExpired(nowEpochMs: Long = System.currentTimeMillis()): RideSummary? = synchronized(LOCK) {
@@ -366,7 +378,7 @@ class RideStore private constructor(private val context: Context) {
     }
 
     private fun newRide(address: String, name: String?, now: Long): StoredRide {
-        val id = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss.SSS'Z'")
+        val id = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss.SSS'Z'", Locale.ROOT)
             .withZone(ZoneOffset.UTC)
             .format(Instant.ofEpochMilli(now))
         val identity = listOfNotNull(name, address)
@@ -733,7 +745,7 @@ private inline fun <reified T : Enum<T>> enumValueOrDefault(value: String, defau
     enumValues<T>().firstOrNull { it.name == value } ?: default
 
 internal fun pseudonymousBoardId(deviceAddress: String): String {
-    val normalizedAddress = deviceAddress.trim().lowercase()
+    val normalizedAddress = deviceAddress.trim().lowercase(Locale.ROOT)
     val digest = MessageDigest.getInstance("SHA-256")
         .digest("riders-hub-board:$normalizedAddress".toByteArray(Charsets.UTF_8))
     val hex = "0123456789abcdef"

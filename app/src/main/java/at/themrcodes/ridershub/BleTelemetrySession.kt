@@ -16,6 +16,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import at.themrcodes.ridershub.log.JsonlSessionLog
 import at.themrcodes.ridershub.protocol.BackfireFrameDecoder
 import at.themrcodes.ridershub.protocol.BackfireProtocol
@@ -32,6 +33,7 @@ class BleTelemetrySession(
     private val deviceName: String?,
     private val state: AppStateStore,
     private val onGattActiveChanged: (Boolean) -> Unit = {},
+    private val onTelemetryInterrupted: ((BleTelemetrySession, String) -> Unit)? = null,
 ) {
     private val deviceAddress = canonicalBluetoothAddress(deviceAddress)
     private val handler = Handler(Looper.getMainLooper())
@@ -63,6 +65,9 @@ class BleTelemetrySession(
     private val gattProgress = GattProgressTracker()
     private var gattDeadline = gattProgress.enter(GattStage.IDLE)
     private var watchdogGatt: BluetoothGatt? = null
+    private var lastUsableTelemetryElapsedMs: Long? = null
+    private var segmentBoardTelemetryReceived = false
+    private var interruptionRequested = false
 
     private val reconnectRunnable = Runnable { connect() }
     private val gattWatchdogRunnable = Runnable {
@@ -96,12 +101,49 @@ class BleTelemetrySession(
             )
         }
     }
+    private val telemetryWatchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!active || !telemetryReady || interruptionRequested) return
+            val lastTelemetry = lastUsableTelemetryElapsedMs ?: return
+            val remaining = nextTelemetryWatchdogDelayMs(
+                nowElapsedMs = SystemClock.elapsedRealtime(),
+                lastTelemetryElapsedMs = lastTelemetry,
+            )
+            if (remaining == 0L) {
+                log.record(
+                    "telemetry_silence_timeout",
+                    JSONObject().put("timeout_ms", TELEMETRY_SILENCE_TIMEOUT_MS),
+                )
+                requestSessionRestart("telemetry_silence_timeout")
+            } else {
+                handler.postDelayed(this, remaining)
+            }
+        }
+    }
+    private val resumeDeadlineRunnable = Runnable {
+        if (active && !segmentBoardTelemetryReceived && !interruptionRequested) {
+            log.record(
+                "resume_grace_expired_without_telemetry",
+                JSONObject().put("deadline_epoch_ms", segment.resumeDeadlineEpochMs),
+            )
+            requestSessionRestart("resume_grace_expired_without_telemetry")
+        }
+    }
 
     init {
         state.setLatestLog(log.file.absolutePath)
         state.setLimiterControlAvailable(false)
         state.clearError()
+        segment.resumeDeadlineEpochMs?.let { deadline ->
+            handler.postDelayed(
+                resumeDeadlineRunnable,
+                (deadline - System.currentTimeMillis()).coerceAtLeast(1L),
+            )
+        }
     }
+
+    val hasUsableBoardTelemetry: Boolean
+        get() = segmentBoardTelemetryReceived
 
     fun start() {
         log.record("presence_appeared", JSONObject().put("device_address", deviceAddress))
@@ -163,6 +205,8 @@ class BleTelemetrySession(
         active = false
         handler.removeCallbacks(reconnectRunnable)
         handler.removeCallbacks(commandTimeoutRunnable)
+        handler.removeCallbacks(telemetryWatchdogRunnable)
+        handler.removeCallbacks(resumeDeadlineRunnable)
         enterGattStage(GattStage.IDLE, null)
         resetCommandTransport("Telemetry session stopped")
         val existingGatt = gatt
@@ -180,7 +224,12 @@ class BleTelemetrySession(
                 .put("crc_error_count", crcErrorCount.get()),
         )
         log.awaitClosed()
-        rideStore.endSegment(reason, finalSequence)
+        rideStore.endSegment(
+            reason = reason,
+            lastSequence = finalSequence,
+            resumeDeadlineEpochMs = segment.resumeDeadlineEpochMs
+                ?.takeUnless { segmentBoardTelemetryReceived },
+        )
     }
 
     private fun connect() {
@@ -324,6 +373,9 @@ class BleTelemetrySession(
                 enterGattStage(GattStage.LISTENING, bluetoothGatt)
                 state.setConnection("Listening for telemetry")
                 telemetryReady = true
+                lastUsableTelemetryElapsedMs = SystemClock.elapsedRealtime()
+                handler.removeCallbacks(telemetryWatchdogRunnable)
+                handler.postDelayed(telemetryWatchdogRunnable, TELEMETRY_SILENCE_TIMEOUT_MS)
                 state.setLimiterControlAvailable(writeCharacteristic != null)
                 state.clearError()
                 log.record("telemetry_listening", JSONObject())
@@ -457,6 +509,17 @@ class BleTelemetrySession(
                 .put("crc_actual", frame.actualCrc)
                 .put("crc_valid", frame.crcValid),
         )
+        if (
+            isPlausibleBoardTelemetry(
+                batteryPercent = frame.boardBatteryPercent,
+                packVoltageV = frame.packVoltageV,
+                crcValid = frame.crcValid,
+            )
+        ) {
+            segmentBoardTelemetryReceived = true
+            lastUsableTelemetryElapsedMs = SystemClock.elapsedRealtime()
+            handler.removeCallbacks(resumeDeadlineRunnable)
+        }
         rideStore.recordFrame(frame)
         state.setFrame(number, frame)
         batteryWarnings.maybeNotifyBoard(
@@ -469,6 +532,14 @@ class BleTelemetrySession(
 
     private fun scheduleReconnect(reason: String, staleGatt: BluetoothGatt? = null) {
         if (!active) return
+        if (segmentBoardTelemetryReceived) {
+            log.record(
+                "telemetry_interrupted",
+                JSONObject().put("reason", reason),
+            )
+            requestSessionRestart(reason)
+            return
+        }
         enterGattStage(GattStage.IDLE, null)
         if (staleGatt != null) {
             if (gatt === staleGatt) gatt = null
@@ -546,13 +617,25 @@ class BleTelemetrySession(
 
     private fun resetCommandTransport(reason: String) {
         handler.removeCallbacks(commandTimeoutRunnable)
+        handler.removeCallbacks(telemetryWatchdogRunnable)
         telemetryReady = false
+        lastUsableTelemetryElapsedMs = null
         writeCharacteristic = null
         state.setLimiterControlAvailable(false)
         val wasPending = synchronized(commandLock) {
             (pendingLimiterEnabled != null).also { pendingLimiterEnabled = null }
         }
         if (wasPending) state.setLimiterCommandStatus(reason)
+    }
+
+    private fun requestSessionRestart(reason: String) {
+        if (!active || interruptionRequested) return
+        interruptionRequested = true
+        handler.removeCallbacks(reconnectRunnable)
+        handler.removeCallbacks(telemetryWatchdogRunnable)
+        handler.removeCallbacks(resumeDeadlineRunnable)
+        val callback = onTelemetryInterrupted
+        if (callback == null) stop(reason) else callback(this, reason)
     }
 
     private fun logError(type: String, error: Throwable) {
@@ -599,5 +682,12 @@ class BleTelemetrySession(
 
     companion object {
         private const val COMMAND_CONFIRMATION_TIMEOUT_MS = 8_000L
+        internal const val TELEMETRY_SILENCE_TIMEOUT_MS = 30_000L
     }
 }
+
+internal fun nextTelemetryWatchdogDelayMs(
+    nowElapsedMs: Long,
+    lastTelemetryElapsedMs: Long,
+    timeoutMs: Long = BleTelemetrySession.TELEMETRY_SILENCE_TIMEOUT_MS,
+): Long = (timeoutMs - (nowElapsedMs - lastTelemetryElapsedMs)).coerceAtLeast(0L)

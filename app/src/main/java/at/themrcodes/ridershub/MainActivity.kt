@@ -38,7 +38,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -65,6 +67,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
@@ -87,11 +90,11 @@ import at.themrcodes.ridershub.session.RideStoreSnapshot
 import at.themrcodes.ridershub.session.RideSummary
 import at.themrcodes.ridershub.homeassistant.HomeAssistantIntegration
 import at.themrcodes.ridershub.homeassistant.HomeAssistantSnapshot
+import at.themrcodes.ridershub.homeassistant.isValidHomeAssistantWebhookUrl
 import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.time.format.FormatStyle
+import java.util.Locale
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -169,6 +172,7 @@ class MainActivity : ComponentActivity() {
                     onConnectHomeAssistant = homeAssistant::connect,
                     onSaveHomeAssistantWebhook = ::saveHomeAssistantWebhook,
                     onDisconnectHomeAssistant = ::disconnectHomeAssistant,
+                    onSyncHomeAssistant = ::syncHomeAssistant,
                 )
             }
         }
@@ -198,6 +202,23 @@ class MainActivity : ComponentActivity() {
 
     private fun disconnectHomeAssistant() {
         homeAssistant.disconnect()
+        dashboard = loadDashboard()
+    }
+
+    private fun syncHomeAssistant() {
+        val current = loadDashboard()
+        val activeRide = current.rides.activeRide
+        val lastKnownRide = activeRide ?: current.rides.lastCompletedRide
+        homeAssistant.sync(
+            boardBatteryPercent = current.app.boardBatteryPercent
+                ?: lastKnownRide?.boardBatteryEnd,
+            estimatedRangeKm = current.rides.rangeEstimate.remainingKm,
+            currentTripKm = activeRide?.distanceKm ?: 0.0,
+            inUse = activeRide?.active == true,
+            updatedAt = activeRide?.lastFrameAt
+                ?: lastKnownRide?.lastFrameAt
+                ?: Instant.now().toString(),
+        )
         dashboard = loadDashboard()
     }
 
@@ -355,12 +376,33 @@ private fun RidersHubDashboard(
     onConnectHomeAssistant: (String, String) -> Unit,
     onSaveHomeAssistantWebhook: (String) -> Unit,
     onDisconnectHomeAssistant: () -> Unit,
+    onSyncHomeAssistant: () -> Unit,
 ) {
     val app = dashboard.app
     val rides = dashboard.rides
     var page by remember { mutableStateOf(DashboardPage.OVERVIEW) }
     var pendingLimiterChoice by remember { mutableStateOf<Boolean?>(null) }
-    BackHandler(enabled = page == DashboardPage.DEVICE) { page = DashboardPage.OVERVIEW }
+    var pendingHomeAssistantRemoval by remember { mutableStateOf(false) }
+    var leaveAfterHomeAssistantRemoval by remember { mutableStateOf(false) }
+    var webhookDraft by remember(dashboard.homeAssistant.webhookUrl) {
+        mutableStateOf(dashboard.homeAssistant.webhookUrl.orEmpty())
+    }
+    fun leaveDevicePage() {
+        if (dashboard.homeAssistant.connected && webhookDraft.isBlank()) {
+            leaveAfterHomeAssistantRemoval = true
+            pendingHomeAssistantRemoval = true
+            return
+        }
+        if (
+            dashboard.homeAssistant.connected &&
+            webhookDraft != dashboard.homeAssistant.webhookUrl &&
+            isValidHomeAssistantWebhookUrl(webhookDraft)
+        ) {
+            onSaveHomeAssistantWebhook(webhookDraft)
+        }
+        page = DashboardPage.OVERVIEW
+    }
+    BackHandler(enabled = page == DashboardPage.DEVICE, onBack = ::leaveDevicePage)
     Surface(Modifier.fillMaxSize(), color = NothingBlack) {
         LazyColumn(
             modifier = Modifier
@@ -391,7 +433,7 @@ private fun RidersHubDashboard(
                 }
 
                 DashboardPage.DEVICE -> {
-                    item { DeviceHeader(onBack = { page = DashboardPage.OVERVIEW }) }
+                    item { DeviceHeader(onBack = ::leaveDevicePage) }
                     app.error?.let { message -> item { ErrorWidget(message) } }
                     item {
                         RemoteSection(
@@ -413,8 +455,14 @@ private fun RidersHubDashboard(
                             state = dashboard.homeAssistant,
                             onSetEnabled = onSetHomeAssistantEnabled,
                             onConnect = onConnectHomeAssistant,
+                            webhookUrl = webhookDraft,
+                            onWebhookUrlChange = { webhookDraft = it },
                             onSaveWebhook = onSaveHomeAssistantWebhook,
-                            onDisconnect = onDisconnectHomeAssistant,
+                            onRequestRemoval = {
+                                leaveAfterHomeAssistantRemoval = false
+                                pendingHomeAssistantRemoval = true
+                            },
+                            onSync = onSyncHomeAssistant,
                         )
                     }
                     item { AppSection(onOpenSettings = onOpenSettings, onVersionTap = onVersionTap) }
@@ -432,6 +480,21 @@ private fun RidersHubDashboard(
             onDismiss = { pendingLimiterChoice = null },
         )
     }
+    if (pendingHomeAssistantRemoval) {
+        HomeAssistantRemovalDialog(
+            onConfirm = {
+                pendingHomeAssistantRemoval = false
+                onDisconnectHomeAssistant()
+                webhookDraft = ""
+                if (leaveAfterHomeAssistantRemoval) page = DashboardPage.OVERVIEW
+                leaveAfterHomeAssistantRemoval = false
+            },
+            onDismiss = {
+                pendingHomeAssistantRemoval = false
+                leaveAfterHomeAssistantRemoval = false
+            },
+        )
+    }
 }
 
 private enum class DashboardPage { OVERVIEW, DEVICE }
@@ -447,7 +510,12 @@ private fun NothingHeader(app: AppSnapshot, onOpenDevice: () -> Unit) {
         }
         Spacer(Modifier.height(20.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            NothingText(app.name ?: "No remote", color = NothingMuted, size = 11, spacing = 0.5f)
+            NothingText(
+                app.name?.let { "$it · $TESTED_BOARD_MODEL" } ?: "No remote",
+                color = NothingMuted,
+                size = 11,
+                spacing = 0.5f,
+            )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(7.dp).background(if (listening) NothingRed else NothingMuted, CircleShape))
                 Spacer(Modifier.width(8.dp))
@@ -515,7 +583,7 @@ private fun CurrentTripWidget(app: AppSnapshot, ride: RideSummary?) {
     val listening = app.serviceActive && app.connection.contains("Listening", ignoreCase = true)
     val rideOpen = ride?.active == true
     val telemetryActive = rideOpen && listening
-    val connectionDetail = app.connection.lowercase()
+    val connectionDetail = app.connection.lowercase(Locale.ROOT)
     val connectionStatus = when {
         listening -> "Telemetry from your remote"
         "connecting" in connectionDetail || "discovering" in connectionDetail ||
@@ -545,7 +613,7 @@ private fun CurrentTripWidget(app: AppSnapshot, ride: RideSummary?) {
                 Spacer(Modifier.height(24.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     NothingText(
-                        ride?.let { "%.2f".format(it.distanceKm) } ?: "--.--",
+                        ride?.let { UiFormat.decimal(it.distanceKm, 2) } ?: "--.--",
                         color = valueColor,
                         size = 58,
                         weight = FontWeight.Black,
@@ -560,17 +628,17 @@ private fun CurrentTripWidget(app: AppSnapshot, ride: RideSummary?) {
                 ) {
                     QuietMetric(
                         "Moving",
-                        ride?.let { formatDuration(it.movingSeconds) } ?: "—",
+                        ride?.let { UiFormat.duration(it.movingSeconds) } ?: "—",
                         valueColor = valueColor,
                     )
                     QuietMetric(
                         "Top speed",
-                        ride?.let { "%.1f km/h".format(it.maxSpeedKmh) } ?: "—",
+                        ride?.let { "${UiFormat.decimal(it.maxSpeedKmh, 1)} km/h" } ?: "—",
                         valueColor = valueColor,
                     )
                     QuietMetric(
                         "Pack",
-                        packVoltage?.let { "%.1f V".format(it) } ?: "—",
+                        packVoltage?.let { "${UiFormat.decimal(it, 1)} V" } ?: "—",
                         valueColor = valueColor,
                     )
                     QuietMetric(
@@ -619,7 +687,7 @@ private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) 
         Spacer(Modifier.height(24.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
             Row(verticalAlignment = Alignment.Bottom) {
-                NothingText(estimate.remainingKm?.let { "%04.1f".format(it) } ?: "--.-", size = 58, weight = FontWeight.Black, lineHeight = 60)
+                NothingText(estimate.remainingKm?.let { UiFormat.decimal(it, 1, minimumWidth = 4) } ?: "--.-", size = 58, weight = FontWeight.Black, lineHeight = 60)
                 NothingText("km", Modifier.padding(bottom = 10.dp), NothingMuted, 11, FontWeight.Bold, 0.5f)
             }
             NothingText(
@@ -663,6 +731,7 @@ private fun BatteryLongevitySection(
     )
     val selected = bars.firstOrNull { it.id == selectedBarId }
     val collecting = longevity.status == BatteryLongevityStatus.COLLECTING_DATA
+    val chartMaximumKm = longevity.allTimeHighKm ?: bars.maxOfOrNull { it.fullRangeKm } ?: 1.0
 
     Column(modifier) {
         SectionTitle(
@@ -681,7 +750,7 @@ private fun BatteryLongevitySection(
         ) {
             Row(verticalAlignment = Alignment.Bottom) {
                 NothingText(
-                    longevity.currentFullRangeKm?.let { "%04.1f".format(it) } ?: "--.-",
+                    longevity.currentFullRangeKm?.let { UiFormat.decimal(it, 1, minimumWidth = 4) } ?: "--.-",
                     size = 50,
                     weight = FontWeight.Black,
                     lineHeight = 54,
@@ -714,7 +783,7 @@ private fun BatteryLongevitySection(
             ) {
                 NothingText(granularity.displayName, color = NothingRed, size = 10, weight = FontWeight.Bold)
                 NothingText(
-                    "0 – ${"%.1f".format(longevity.allTimeHighKm)} km",
+                    "0 – ${UiFormat.decimal(chartMaximumKm, 1)} km",
                     color = NothingMuted,
                     size = 9,
                 )
@@ -722,7 +791,7 @@ private fun BatteryLongevitySection(
             Spacer(Modifier.height(10.dp))
             BatteryLongevityChartView(
                 bars = bars,
-                allTimeHighKm = longevity.allTimeHighKm ?: 1.0,
+                allTimeHighKm = chartMaximumKm,
                 selectedBarId = selectedBarId,
                 onBarSelected = { bar ->
                     val finer = granularity.finer()
@@ -747,7 +816,7 @@ private fun BatteryLongevitySection(
             Spacer(Modifier.height(12.dp))
             NothingText(
                 selected?.let {
-                    "${it.label} · ${"%.1f".format(it.fullRangeKm)} km from ${it.observationCount} observation${if (it.observationCount == 1) "" else "s"}"
+                    "${it.label} · ${UiFormat.decimal(it.fullRangeKm, 1)} km from ${it.observationCount} observation${if (it.observationCount == 1) "" else "s"}"
                 } ?: "Pinch inward to group time · tap a bar to inspect one level deeper",
                 color = NothingMuted,
                 size = 9,
@@ -796,7 +865,7 @@ private fun BatteryLongevityChartView(
                     }
                 }
                 .semantics {
-                    contentDescription = "Battery capacity bar chart from zero to ${"%.1f".format(scaleMax)} kilometres"
+                    contentDescription = "Battery capacity bar chart from zero to ${UiFormat.decimal(scaleMax, 1)} kilometres"
                 },
         ) {
             val baseline = size.height - 3.dp.toPx()
@@ -864,7 +933,7 @@ private fun RidesHeader(odometerKm: Float?, modifier: Modifier = Modifier) {
         Spacer(Modifier.height(24.dp))
         Row(verticalAlignment = Alignment.Bottom) {
             NothingText(
-                odometerKm?.let { "%.1f".format(it) } ?: "----.-",
+                odometerKm?.let { UiFormat.decimal(it, 1) } ?: "----.-",
                 size = 58,
                 weight = FontWeight.Black,
                 lineHeight = 60,
@@ -879,16 +948,16 @@ private fun RideWidget(ride: RideSummary) {
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Column(Modifier.weight(1f)) {
-                NothingText(formatDate(ride.startedAt), color = NothingMuted, size = 10)
+                NothingText(UiFormat.rideDate(ride.startedAt), color = NothingMuted, size = 10)
                 Spacer(Modifier.height(8.dp))
                 NothingText(ride.modes.joinToString(" · ").ifEmpty { "Ride" }, size = 16, weight = FontWeight.Bold)
             }
-            NothingText("%.2f km".format(ride.distanceKm), size = 24, weight = FontWeight.Black)
+            NothingText("${UiFormat.decimal(ride.distanceKm, 2)} km", size = 24, weight = FontWeight.Black)
         }
         Spacer(Modifier.height(20.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            QuietMetric("Moving", formatDuration(ride.movingSeconds))
-            QuietMetric("Top speed", "%.1f km/h".format(ride.maxSpeedKmh))
+            QuietMetric("Moving", UiFormat.duration(ride.movingSeconds))
+            QuietMetric("Top speed", "${UiFormat.decimal(ride.maxSpeedKmh, 1)} km/h")
             QuietMetric("Battery", batteryDelta(ride))
         }
         Spacer(Modifier.height(28.dp))
@@ -914,7 +983,7 @@ private fun RemoteSection(
     onAssociate: () -> Unit,
 ) {
     val linkActive = app.serviceActive && app.connection.contains("Listening", ignoreCase = true)
-    val connectionDetail = app.connection.lowercase()
+    val connectionDetail = app.connection.lowercase(Locale.ROOT)
     val state = when {
         linkActive -> "Receiving telemetry"
         "connecting" in connectionDetail || "discovering" in connectionDetail ||
@@ -1012,35 +1081,41 @@ private fun HomeAssistantSection(
     state: HomeAssistantSnapshot,
     onSetEnabled: (Boolean) -> Unit,
     onConnect: (String, String) -> Unit,
+    webhookUrl: String,
+    onWebhookUrlChange: (String) -> Unit,
     onSaveWebhook: (String) -> Unit,
-    onDisconnect: () -> Unit,
+    onRequestRemoval: () -> Unit,
+    onSync: () -> Unit,
 ) {
     var instanceUrl by remember { mutableStateOf("") }
     var accessToken by remember { mutableStateOf("") }
-    var webhookUrl by remember(state.webhookUrl) { mutableStateOf(state.webhookUrl.orEmpty()) }
+    var webhookInvalid by remember { mutableStateOf(false) }
+    var webhookFocused by remember { mutableStateOf(false) }
     LaunchedEffect(state.connected) {
         if (state.connected) {
             instanceUrl = ""
             accessToken = ""
         }
     }
+    fun commitWebhook() {
+        when {
+            webhookUrl.isBlank() -> onRequestRemoval()
+            isValidHomeAssistantWebhookUrl(webhookUrl) -> {
+                webhookInvalid = false
+                if (webhookUrl != state.webhookUrl) onSaveWebhook(webhookUrl)
+            }
+            else -> webhookInvalid = true
+        }
+    }
 
     Column {
-        SectionTitle("Home Assistant", "Optional, low-frequency webhook export")
-        Spacer(Modifier.height(24.dp))
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                NothingText("Enable Home Assistant", size = 14, weight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                NothingText(
-                    if (state.enabled) "Delivery enabled" else "No data is sent",
-                    color = NothingMuted,
-                    size = 10,
-                )
+                SectionTitle("Home Assistant", "Optional, low-frequency webhook export")
             }
             Spacer(Modifier.width(18.dp))
             Switch(
@@ -1055,41 +1130,12 @@ private fun HomeAssistantSection(
                 ),
             )
         }
-        Spacer(Modifier.height(18.dp))
-        NothingText("Status", color = NothingMuted, size = 10)
-        Spacer(Modifier.height(6.dp))
-        NothingText(
-            state.status,
-            color = if (
-                state.status.contains("failed", true) ||
-                state.status.contains("reconnect", true) ||
-                state.status.contains("rejected", true)
-            ) {
-                NothingRed
-            } else {
-                NothingWhite
-            },
-            size = 10,
-            lineHeight = 15,
-        )
-        if (state.connected) {
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                NothingText("Webhook encryption", color = NothingMuted, size = 10)
-                NothingText(if (state.payloadEncrypted) "ON" else "PENDING", size = 10)
-            }
-        }
-        state.lastDeliveryAt?.let { lastDelivery ->
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                NothingText("Last delivery", color = NothingMuted, size = 10)
-                NothingText(formatLocalDateTime(lastDelivery), size = 10)
-            }
-        }
 
         if (state.enabled) {
             Spacer(Modifier.height(24.dp))
             if (!state.connected) {
+                NothingText("Home Assistant credentials", size = 14, weight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
                 NothingText(
                     "1. In the Home Assistant Companion app: Sidebar → Profile → Security → Long-Lived Access Tokens → Create Token.\n" +
                         "2. Enter the Home Assistant base URL and token below.\n" +
@@ -1118,13 +1164,18 @@ private fun HomeAssistantSection(
                     password = true,
                 )
                 Spacer(Modifier.height(14.dp))
-                Button(
-                    onClick = { onConnect(instanceUrl, accessToken) },
-                    enabled = !state.busy && instanceUrl.isNotBlank() && accessToken.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
                 ) {
-                    NothingLabel(if (state.busy) "CONNECTING" else "CONNECT", Color.White)
+                    Button(
+                        onClick = { onConnect(instanceUrl, accessToken) },
+                        enabled = !state.busy && instanceUrl.isNotBlank() && accessToken.isNotBlank(),
+                        contentPadding = PaddingValues(horizontal = 22.dp, vertical = 10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
+                    ) {
+                        NothingLabel(if (state.busy) "CONNECTING" else "CONNECT", Color.White)
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
                 NothingText(
@@ -1134,6 +1185,8 @@ private fun HomeAssistantSection(
                     lineHeight = 14,
                 )
             } else {
+                NothingText("Webhook", size = 14, weight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
                 NothingText(
                     "This route can be a local Home Assistant webhook, a Nabu Casa cloudhook, or your HTTPS proxy such as https://ha.example.com/api/webhook/…. The encryption key remains protected by Android Keystore.",
                     color = NothingMuted,
@@ -1141,33 +1194,82 @@ private fun HomeAssistantSection(
                     lineHeight = 16,
                 )
                 Spacer(Modifier.height(18.dp))
-                HomeAssistantTextField(
-                    value = webhookUrl,
-                    onValueChange = { webhookUrl = it },
-                    label = "Webhook URL",
-                    placeholder = "https://hooks.nabu.casa/…",
-                    enabled = !state.busy,
-                    keyboardType = KeyboardType.Uri,
-                )
-                Spacer(Modifier.height(14.dp))
-                Button(
-                    onClick = { onSaveWebhook(webhookUrl) },
-                    enabled = !state.busy && webhookUrl.isNotBlank() && webhookUrl != state.webhookUrl,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = NothingRaised),
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    NothingLabel("SAVE WEBHOOK", NothingWhite)
+                    HomeAssistantTextField(
+                        value = webhookUrl,
+                        onValueChange = {
+                            webhookInvalid = false
+                            onWebhookUrlChange(it)
+                        },
+                        label = "Webhook URL",
+                        placeholder = "https://hooks.nabu.casa/…",
+                        enabled = !state.busy,
+                        keyboardType = KeyboardType.Uri,
+                        isError = webhookInvalid,
+                        modifier = Modifier
+                            .weight(1f)
+                            .onFocusChanged { focus ->
+                                val lostFocus = webhookFocused && !focus.isFocused
+                                webhookFocused = focus.isFocused
+                                if (lostFocus) commitWebhook()
+                            },
+                    )
+                    Spacer(Modifier.width(20.dp))
+                    BareHomeAssistantIconButton(
+                        label = "Remove Home Assistant integration",
+                        enabled = !state.busy,
+                        onClick = onRequestRemoval,
+                        icon = { TrashIcon() },
+                    )
                 }
-                Spacer(Modifier.height(10.dp))
-                TextButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) {
-                    NothingLabel("DISCONNECT", NothingRed)
+                if (webhookInvalid) {
+                    Spacer(Modifier.height(8.dp))
+                    NothingText(
+                        "Enter a valid HTTPS webhook or a trusted local HTTP URL.",
+                        color = NothingRed,
+                        size = 9,
+                        lineHeight = 14,
+                    )
                 }
-                NothingText(
-                    "Disconnect forgets this app's webhook. Remove the Riders Hub entry in Home Assistant separately if you no longer want it there.",
-                    color = NothingMuted,
-                    size = 9,
-                    lineHeight = 14,
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        NothingText("Status", color = NothingMuted, size = 10)
+                        NothingText(state.status, size = 10, lineHeight = 15)
+                    }
+                    state.lastDeliveryAt?.let { lastDelivery ->
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            NothingText("Last update", color = NothingMuted, size = 10)
+                            NothingText(UiFormat.localDateTime(lastDelivery), size = 10)
+                        }
+                    }
+                }
+                Spacer(Modifier.width(20.dp))
+                HomeAssistantSyncButton(
+                    syncing = state.syncing,
+                    enabled = state.connected && !state.busy,
+                    onClick = onSync,
                 )
+            }
+            state.lastRequestError?.let { error ->
+                Spacer(Modifier.height(10.dp))
+                NothingText(error, color = NothingRed, size = 9, lineHeight = 14)
             }
         }
     }
@@ -1182,18 +1284,89 @@ private fun HomeAssistantTextField(
     enabled: Boolean = true,
     keyboardType: KeyboardType,
     password: Boolean = false,
+    isError: Boolean = false,
+    modifier: Modifier = Modifier,
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         enabled = enabled,
         singleLine = true,
         label = { NothingText(label, color = NothingMuted, size = 10) },
         placeholder = { NothingText(placeholder, color = NothingMuted, size = 10) },
         keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        isError = isError,
         visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
     )
+}
+
+@Composable
+private fun BareHomeAssistantIconButton(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    icon: @Composable () -> Unit,
+) {
+    IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier
+            .size(44.dp)
+            .semantics { contentDescription = label },
+    ) {
+        icon()
+    }
+}
+
+@Composable
+private fun HomeAssistantSyncButton(
+    syncing: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled && !syncing,
+        modifier = Modifier
+            .width(72.dp)
+            .height(44.dp)
+            .semantics { contentDescription = "Sync Home Assistant now" },
+        shape = RoundedCornerShape(22.dp),
+        contentPadding = PaddingValues(0.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = NothingRaised,
+            contentColor = NothingWhite,
+            disabledContainerColor = NothingRaised,
+            disabledContentColor = NothingWhite,
+        ),
+    ) {
+        if (syncing) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                color = NothingWhite,
+                strokeWidth = 2.dp,
+            )
+        } else {
+            NothingLabel("SYNC", NothingWhite)
+        }
+    }
+}
+
+@Composable
+private fun TrashIcon() {
+    Canvas(Modifier.size(18.dp)) {
+        val stroke = 1.7.dp.toPx()
+        drawLine(NothingWhite, Offset(size.width * 0.25f, size.height * 0.28f), Offset(size.width * 0.75f, size.height * 0.28f), stroke, StrokeCap.Round)
+        drawLine(NothingWhite, Offset(size.width * 0.42f, size.height * 0.17f), Offset(size.width * 0.58f, size.height * 0.17f), stroke, StrokeCap.Round)
+        drawRoundRect(
+            color = NothingWhite,
+            topLeft = Offset(size.width * 0.31f, size.height * 0.35f),
+            size = Size(size.width * 0.38f, size.height * 0.48f),
+            cornerRadius = CornerRadius(2.dp.toPx()),
+            style = Stroke(stroke),
+        )
+    }
 }
 
 @Composable
@@ -1360,6 +1533,35 @@ private fun RidePath() {
 }
 
 @Composable
+private fun HomeAssistantRemovalDialog(
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = NothingPanel,
+        shape = RoundedCornerShape(22.dp),
+        title = { NothingText("Remove Home Assistant?", size = 20, weight = FontWeight.Black) },
+        text = {
+            NothingText(
+                "This resets the Home Assistant integration in Riders Hub and forgets its saved webhook credentials. " +
+                    "Remove the Riders Hub entry in Home Assistant separately if it is no longer needed there.",
+                color = NothingMuted,
+                size = 11,
+                lineHeight = 18,
+                spacing = 0.4f,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { NothingLabel("REMOVE", NothingRed) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { NothingLabel("CANCEL", NothingWhite) }
+        },
+    )
+}
+
+@Composable
 private fun LimiterConfirmationDialog(
     enabled: Boolean,
     onConfirm: () -> Unit,
@@ -1406,11 +1608,10 @@ private fun ErrorWidget(message: String) {
 @Composable
 private fun DotMatrixText(text: String, modifier: Modifier = Modifier, color: Color = NothingWhite) {
     Canvas(modifier.semantics { contentDescription = text }) {
-        val glyphs = text.uppercase().map { DOT_GLYPHS[it] ?: DOT_GLYPHS.getValue(' ') }
+        val glyphs = text.uppercase(Locale.ROOT).map { DOT_GLYPHS[it] ?: DOT_GLYPHS.getValue(' ') }
         val totalColumns = glyphs.sumOf { it.first().length } + (glyphs.size - 1)
         val step = minOf(size.width / totalColumns.coerceAtLeast(1), size.height / 7f)
-        val contentWidth = totalColumns * step
-        var startX = (size.width - contentWidth) / 2f
+        var startX = 0f
         val startY = (size.height - 7f * step) / 2f
         glyphs.forEach { glyph ->
             glyph.forEachIndexed { row, line ->
@@ -1485,21 +1686,7 @@ private val DOT_GLYPHS = mapOf(
     ' ' to listOf("000", "000", "000", "000", "000", "000", "000"),
 )
 
-private fun formatDuration(seconds: Double): String {
-    val total = seconds.roundToInt().coerceAtLeast(0)
-    return if (total >= 3600) "%d:%02d h".format(total / 3600, total % 3600 / 60)
-    else "%d:%02d".format(total / 60, total % 60)
-}
-
-private fun formatDate(value: String): String = runCatching {
-    DateTimeFormatter.ofPattern("EEE, d MMM · HH:mm")
-        .format(Instant.parse(value).atZone(ZoneId.systemDefault()))
-}.getOrDefault(value)
-
-private fun formatLocalDateTime(value: String): String = runCatching {
-    DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM)
-        .format(Instant.parse(value).atZone(ZoneId.systemDefault()))
-}.getOrDefault(value)
+private const val TESTED_BOARD_MODEL = "G3"
 
 private fun batteryDelta(ride: RideSummary): String {
     val start = ride.boardBatteryStart ?: return "—"

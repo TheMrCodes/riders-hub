@@ -56,10 +56,12 @@ The current adapter connects to the remote, not directly to the skateboard
 ESC. The remote must already be connected to the board and advertising with a
 name beginning with `BF_`.
 
-The integration has been tested with a Backfire G3. The BLE transport and core
-telemetry fields are also corroborated by community work on a Zealot S, but
-other board and remote revisions may differ. Compatibility should not be
-assumed until a model has been verified.
+The Backfire G3 is the only board tested so far, which is why the UI displays
+`G3`; Riders Hub should also work with boards using second-generation or newer
+black-plastic remotes with the index-finger opening, but those combinations
+remain unverified. The BLE transport and core telemetry fields are also
+corroborated by community work on a Zealot S, but other board and remote
+revisions may differ.
 
 See the [BLE API notes](docs/ble-api.md) for the current protocol details,
 confidence levels, and known unknowns.

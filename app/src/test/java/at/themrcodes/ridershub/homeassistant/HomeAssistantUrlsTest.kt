@@ -52,4 +52,11 @@ class HomeAssistantUrlsTest {
             HomeAssistantUrls.validateWebhookUrl("https://ha.example.com/api/webhook/id?next=elsewhere")
         }
     }
+
+    @Test
+    fun webhookValidationSupportsFocusLossSaving() {
+        assertEquals(true, isValidHomeAssistantWebhookUrl("https://ha.example.com/api/webhook/synthetic-id"))
+        assertEquals(false, isValidHomeAssistantWebhookUrl(""))
+        assertEquals(false, isValidHomeAssistantWebhookUrl("http://public.example.com/api/webhook/synthetic-id"))
+    }
 }

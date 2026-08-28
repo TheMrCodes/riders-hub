@@ -10,7 +10,7 @@ internal class HomeAssistantStore(context: Context) {
     private val vault = HomeAssistantVault()
 
     @Synchronized
-    fun snapshot(busy: Boolean = false): HomeAssistantSnapshot {
+    fun snapshot(busy: Boolean = false, syncing: Boolean = false): HomeAssistantSnapshot {
         val connection = connection()
         return HomeAssistantSnapshot(
             enabled = preferences.getBoolean(KEY_ENABLED, false),
@@ -20,7 +20,9 @@ internal class HomeAssistantStore(context: Context) {
             status = preferences.getString(KEY_STATUS, null)
                 ?: if (connection == null) "Not connected" else "Connected",
             lastDeliveryAt = preferences.getString(KEY_LAST_DELIVERY_AT, null),
+            lastRequestError = preferences.getString(KEY_LAST_REQUEST_ERROR, null),
             busy = busy,
+            syncing = syncing,
         )
     }
 
@@ -56,6 +58,17 @@ internal class HomeAssistantStore(context: Context) {
         preferences.edit().putString(KEY_STATUS, status).apply()
     }
 
+    fun clearRequestError() {
+        preferences.edit().remove(KEY_LAST_REQUEST_ERROR).apply()
+    }
+
+    fun recordRequestError(message: String) {
+        preferences.edit()
+            .putString(KEY_STATUS, "Request failed")
+            .putString(KEY_LAST_REQUEST_ERROR, message)
+            .apply()
+    }
+
     /** Stores the webhook and encryption key together before either can be used. */
     @Synchronized
     fun connect(connection: HomeAssistantConnection) {
@@ -66,7 +79,7 @@ internal class HomeAssistantStore(context: Context) {
         val editor = preferences.edit()
             .putString(KEY_PROTECTED_WEBHOOK_URL, protectedUrl)
             .remove(KEY_LEGACY_WEBHOOK_URL)
-            .putString(KEY_STATUS, if (protectedSecret == null) "Connected" else "Connected · encrypted")
+            .putString(KEY_STATUS, "Connected")
         if (protectedSecret == null) {
             editor.remove(KEY_PROTECTED_ENCRYPTION_SECRET)
         } else {
@@ -97,16 +110,20 @@ internal class HomeAssistantStore(context: Context) {
         preferences.edit()
             .putString(KEY_STATUS, status)
             .putString(KEY_LAST_DELIVERY_AT, Instant.now().toString())
+            .remove(KEY_LAST_REQUEST_ERROR)
             .apply()
     }
 
     @Synchronized
     fun disconnect(status: String = "Not connected") {
         preferences.edit()
+            .putBoolean(KEY_ENABLED, false)
             .remove(KEY_PROTECTED_WEBHOOK_URL)
             .remove(KEY_PROTECTED_ENCRYPTION_SECRET)
             .remove(KEY_LEGACY_WEBHOOK_URL)
             .remove(KEY_LAST_DELIVERY_AT)
+            .remove(KEY_LAST_REQUEST_ERROR)
+            .remove(KEY_DEVICE_ID)
             .putString(KEY_STATUS, status)
             .commit()
         runCatching(vault::deleteKey)
@@ -125,6 +142,7 @@ internal class HomeAssistantStore(context: Context) {
             .remove(KEY_PROTECTED_ENCRYPTION_SECRET)
             .remove(KEY_LEGACY_WEBHOOK_URL)
             .remove(KEY_LAST_DELIVERY_AT)
+            .remove(KEY_LAST_REQUEST_ERROR)
             .putString(KEY_STATUS, "Secure credentials unavailable; reconnect required")
             .commit()
         runCatching(vault::deleteKey)
@@ -138,6 +156,7 @@ internal class HomeAssistantStore(context: Context) {
         private const val KEY_LEGACY_WEBHOOK_URL = "webhook_url"
         private const val KEY_STATUS = "status"
         private const val KEY_LAST_DELIVERY_AT = "last_delivery_at"
+        private const val KEY_LAST_REQUEST_ERROR = "last_request_error"
         private const val KEY_DEVICE_ID = "device_id"
         private const val PURPOSE_WEBHOOK_URL = "webhook-url"
         private const val PURPOSE_ENCRYPTION_SECRET = "encryption-secret"
@@ -156,5 +175,7 @@ data class HomeAssistantSnapshot(
     val payloadEncrypted: Boolean,
     val status: String,
     val lastDeliveryAt: String?,
+    val lastRequestError: String?,
     val busy: Boolean,
+    val syncing: Boolean,
 )

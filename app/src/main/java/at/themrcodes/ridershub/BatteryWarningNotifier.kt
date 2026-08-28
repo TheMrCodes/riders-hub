@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import java.util.Locale
 
 class BatteryWarningNotifier(private val context: Context) {
     private val preferences = context.getSharedPreferences("battery_warnings", Context.MODE_PRIVATE)
@@ -28,7 +29,7 @@ class BatteryWarningNotifier(private val context: Context) {
         val notification = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Board battery is low")
-            .setContentText("$batteryPercent% remaining (${"%.1f".format(packVoltageV)} V). Recharge before the next ride.")
+            .setContentText("$batteryPercent% remaining (${"%.1f".format(Locale.US, packVoltageV)} V). Recharge before the next ride.")
             .setContentIntent(openApp)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_STATUS)

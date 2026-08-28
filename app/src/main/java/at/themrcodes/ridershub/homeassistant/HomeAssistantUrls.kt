@@ -3,6 +3,7 @@ package at.themrcodes.ridershub.homeassistant
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 
 internal object HomeAssistantUrls {
     fun registrationUrl(instanceUrl: String): String =
@@ -31,8 +32,8 @@ internal object HomeAssistantUrls {
         require(uri.userInfo == null && uri.query == null && uri.fragment == null) {
             "$label must not contain credentials, a query, or a fragment"
         }
-        val scheme = uri.scheme?.lowercase()
-        val host = uri.host?.lowercase()
+        val scheme = uri.scheme?.lowercase(Locale.ROOT)
+        val host = uri.host?.lowercase(Locale.ROOT)
         require(scheme == "https" || scheme == "http") { "$label must use HTTPS or HTTP" }
         require(!host.isNullOrBlank()) { "$label must include a host" }
         require(scheme == "https" || isLocalHost(host)) {
@@ -56,3 +57,6 @@ internal object HomeAssistantUrls {
             parts[0] == 169 && parts[1] == 254
     }
 }
+
+internal fun isValidHomeAssistantWebhookUrl(value: String): Boolean =
+    runCatching { HomeAssistantUrls.validateWebhookUrl(value) }.isSuccess

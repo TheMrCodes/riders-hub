@@ -46,6 +46,7 @@ data class RideSegment(
     val initialSequence: Long,
     val segmentNumber: Int,
     val newSession: Boolean,
+    val resumeDeadlineEpochMs: Long? = null,
 )
 
 data class RideStoreSnapshot(

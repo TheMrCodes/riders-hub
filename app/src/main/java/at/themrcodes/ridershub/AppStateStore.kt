@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import at.themrcodes.ridershub.protocol.TelemetryFrame
 import java.time.Instant
+import java.util.Locale
 
 class AppStateStore(context: Context) {
     private val preferences = context.getSharedPreferences("monitor_state", Context.MODE_PRIVATE)
@@ -111,7 +112,7 @@ class AppStateStore(context: Context) {
             packVoltageV = frame.packVoltageV,
             crcValid = frame.crcValid,
         )
-        val summary = "${frame.mode}, ${"%.2f".format(frame.speedKmh)} km/h, " +
+        val summary = "${frame.mode}, ${"%.2f".format(Locale.US, frame.speedKmh)} km/h, " +
             if (boardTelemetryValid) {
                 "${frame.boardBatteryPercent}%, CRC ok"
             } else {

@@ -65,7 +65,7 @@ reassemble frames and resynchronize safely.
 | Offset | Size | Meaning | Encoding / scale | Evidence |
 | --- | ---: | --- | --- | --- |
 | 0 | 1 | Header | `0xAC` | Live, Community |
-| 1 | 1 | Unknown | seen as `0x00` | Live |
+| 1 | 1 | Unknown compatibility candidate | `0x00` on the tested G3; `0x06` in a published Zealot S sample | Live, Community |
 | 2 | 1 | Total frame length | `0x19` = 25 | Live, Community |
 | 3 | 1 | Unknown | seen as `0x01` | Live |
 | 4 | 1 | Mode/status | see below | Live, Research |
@@ -93,6 +93,14 @@ plausible approximately 38 mΩ voltage/load slope; this is evidence for a
 pack/aggregate-current field, not a confirmed unit. Keep it as raw signed data
 until compared with an independent current measurement. See
 [`capture-analysis-2026-08-25.md`](capture-analysis-2026-08-25.md).
+
+Byte 1 is the only static field currently known to differ between the tested
+G3 and the Swift community project's
+[published Zealot S sample](https://github.com/djensenius/Backfire/blob/2e512f482851144c8ebb5c0b1010ae223c0d48c1/README.md#data-work-in-progress).
+This makes it a useful compatibility candidate, but not a confirmed model
+identifier: the difference could instead represent a remote revision, firmware
+version, or another board property. Riders Hub therefore keeps the raw value
+for research and does not infer a model from it.
 
 No controlled observation or public source has identified the remaining
 unknown fields. Riders Hub keeps their raw bytes available for future research.
@@ -150,7 +158,7 @@ later telemetry frame to confirm the requested state.
 | Receive board battery, speed, trip, odometer, and mode/status | Confirmed |
 | Receive pack voltage | Confirmed by live and community work |
 | Enable/disable child speed limiter | Exact messages documented; not sent |
-| Discover the board model from BLE | No field identified |
+| Discover the board model from BLE | No confirmed field; byte 1 is a compatibility candidate only |
 | Change Eco/Sport/Turbo mode | No command documented |
 | Throttle, brake, reverse, cruise, or power control | No command documented |
 | Change acceleration/braking curves or unrestricted top speed | No command documented |

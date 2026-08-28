@@ -9,6 +9,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.IOException
 import java.security.SecureRandom
+import java.util.Locale
 
 /** Home Assistant's modern mobile_app SecretBox wire format. */
 internal class HomeAssistantCrypto {
@@ -66,7 +67,7 @@ internal class HomeAssistantCrypto {
 
     fun validateSecret(secret: String): String {
         decodeKey(secret).fill(0)
-        return secret.trim().lowercase()
+        return secret.trim().lowercase(Locale.ROOT)
     }
 
     private fun decodeKey(secret: String): ByteArray {

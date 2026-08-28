@@ -132,17 +132,26 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
         }
         presentAddress = address
         session = try {
-            BleTelemetrySession(this, address, name, state) { connected ->
-                handler.post {
-                    gattActive = connected
-                    if (connected) {
-                        handler.removeCallbacks(stopIfAbsent)
-                        state.setPresence(true, "BLE GATT link active")
-                    } else {
-                        scheduleStopIfFullyAbsent()
+            BleTelemetrySession(
+                context = this,
+                deviceAddress = address,
+                deviceName = name,
+                state = state,
+                onGattActiveChanged = { connected ->
+                    handler.post {
+                        gattActive = connected
+                        if (connected) {
+                            handler.removeCallbacks(stopIfAbsent)
+                            state.setPresence(true, "BLE GATT link active")
+                        } else {
+                            scheduleStopIfFullyAbsent()
+                        }
                     }
-                }
-            }.also { it.start() }
+                },
+                onTelemetryInterrupted = { interrupted, reason ->
+                    handler.post { handleTelemetryInterrupted(interrupted, reason) }
+                },
+            ).also { it.start() }
         } catch (error: Exception) {
             state.setError("Could not create telemetry session: ${error.message ?: error.javaClass.simpleName}")
             presentAddress = null
@@ -190,6 +199,32 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
         }
     }
 
+    private fun handleTelemetryInterrupted(
+        interrupted: BleTelemetrySession,
+        reason: String,
+    ) {
+        if (session !== interrupted) return
+        val address = presentAddress ?: state.snapshot().address
+        val name = state.snapshot().name
+        val retry = interrupted.hasUsableBoardTelemetry
+        stopSession(reason)
+        if (retry && address != null) {
+            handler.postDelayed(
+                {
+                    if (session == null) {
+                        handleAvailable(
+                            address = address,
+                            name = name,
+                            source = "Telemetry recovery",
+                            associationId = state.snapshot().associationId ?: return@postDelayed,
+                        )
+                    }
+                },
+                TELEMETRY_RECOVERY_DELAY_MS,
+            )
+        }
+    }
+
     private fun stopSession(reason: String) {
         session?.stop(reason)
         session = null
@@ -202,5 +237,6 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
 
     companion object {
         private const val TRANSPORT_SETTLE_MS = 12_000L
+        private const val TELEMETRY_RECOVERY_DELAY_MS = 2_000L
     }
 }

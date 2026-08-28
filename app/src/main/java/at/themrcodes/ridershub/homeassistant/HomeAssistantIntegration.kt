@@ -19,14 +19,16 @@ class HomeAssistantIntegration private constructor(context: Context) {
     private val deliveryLock = Any()
     private val encryptionUpgradeQueued = AtomicBoolean(false)
     @Volatile private var busy = false
+    @Volatile private var syncing = false
     private var lastQueuedBattery: Int? = null
     private var lastQueuedTripAtElapsedMs = 0L
+    private var lastDeliveryStartedAtElapsedMs = 0L
 
     init {
         ensureEncryption()
     }
 
-    fun snapshot(): HomeAssistantSnapshot = store.snapshot(busy)
+    fun snapshot(): HomeAssistantSnapshot = store.snapshot(busy, syncing)
 
     fun setEnabled(enabled: Boolean) {
         store.setEnabled(enabled)
@@ -36,6 +38,7 @@ class HomeAssistantIntegration private constructor(context: Context) {
     fun connect(instanceUrl: String, accessToken: String) {
         if (busy) return
         busy = true
+        store.clearRequestError()
         store.setStatus("Connecting…")
         executor.execute {
             try {
@@ -50,10 +53,15 @@ class HomeAssistantIntegration private constructor(context: Context) {
                     encryptionSecret = registration.encryptionSecret,
                 )
                 store.connect(connection)
-                runCatching { client.registerSensors(connection) }
-                    .onFailure { store.setStatus("Connected; entity setup failed: ${safeMessage(it)}") }
+                if (connection.encryptionSecret == null) {
+                    store.recordRequestError(ENCRYPTION_UNAVAILABLE_ERROR)
+                    ensureEncryption()
+                } else {
+                    runCatching { client.registerSensors(connection) }
+                        .onFailure { store.recordRequestError("Entity setup failed: ${safeMessage(it)}") }
+                }
             } catch (error: Exception) {
-                store.setStatus("Connection failed: ${safeMessage(error)}")
+                store.recordRequestError("Connection failed: ${safeMessage(error)}")
             } finally {
                 busy = false
             }
@@ -62,7 +70,10 @@ class HomeAssistantIntegration private constructor(context: Context) {
 
     fun saveWebhookUrl(webhookUrl: String) {
         runCatching { HomeAssistantUrls.validateWebhookUrl(webhookUrl) }
-            .onSuccess(store::updateWebhookUrl)
+            .onSuccess {
+                store.updateWebhookUrl(it)
+                store.clearRequestError()
+            }
             .onFailure { store.setStatus("Webhook save failed: ${safeMessage(it)}") }
     }
 
@@ -70,8 +81,42 @@ class HomeAssistantIntegration private constructor(context: Context) {
         synchronized(deliveryLock) {
             lastQueuedBattery = null
             lastQueuedTripAtElapsedMs = 0L
+            lastDeliveryStartedAtElapsedMs = 0L
         }
+        syncing = false
         store.disconnect()
+    }
+
+    fun sync(
+        boardBatteryPercent: Int?,
+        estimatedRangeKm: Double?,
+        currentTripKm: Double,
+        inUse: Boolean,
+        updatedAt: String,
+    ) {
+        if (syncing) return
+        val initial = store.snapshot()
+        if (!initial.enabled || !initial.connected) {
+            store.recordRequestError("Home Assistant is not connected")
+            return
+        }
+        syncing = true
+        executor.execute {
+            try {
+                deliver(
+                    update = HomeAssistantUpdate(
+                        boardBatteryPercent = boardBatteryPercent,
+                        estimatedRangeKm = estimatedRangeKm,
+                        currentTripKm = currentTripKm,
+                        inUse = inUse,
+                        updatedAt = updatedAt,
+                    ),
+                    event = null,
+                )
+            } finally {
+                syncing = false
+            }
+        }
     }
 
     fun onRideStarted(ride: RideSummary) {
@@ -98,7 +143,14 @@ class HomeAssistantIntegration private constructor(context: Context) {
         val nowElapsed = SystemClock.elapsedRealtime()
         val shouldSend = synchronized(deliveryLock) {
             val batteryChanged = battery != null && battery != lastQueuedBattery
-            if (isRunningUpdateDue(nowElapsed, lastQueuedTripAtElapsedMs, batteryChanged)) {
+            if (
+                isRunningUpdateDue(
+                    nowElapsedMs = nowElapsed,
+                    lastQueuedAtElapsedMs = lastQueuedTripAtElapsedMs,
+                    lastRequestStartedAtElapsedMs = lastDeliveryStartedAtElapsedMs,
+                    batteryChanged = batteryChanged,
+                )
+            ) {
                 lastQueuedBattery = battery ?: lastQueuedBattery
                 lastQueuedTripAtElapsedMs = nowElapsed
                 true
@@ -145,24 +197,38 @@ class HomeAssistantIntegration private constructor(context: Context) {
         if (!force && !update.inUse) return
         if (!initial.payloadEncrypted) ensureEncryption()
         executor.execute {
-            val current = store.snapshot()
-            val connection = store.connection()
-            if (!current.enabled || connection == null) return@execute
-            if (connection.encryptionSecret == null) {
-                store.setStatus("Delivery paused until webhook encryption is enabled")
-                return@execute
-            }
-            try {
-                val result = client.updateSensors(connection, update)
-                if (event != null) client.fireTripEvent(connection, event)
-                if (store.connection() == connection) store.recordDelivery(result.disabledCount)
-            } catch (error: Exception) {
-                if (store.connection() != connection) return@execute
-                if (error is HomeAssistantHttpException && error.statusCode == 410) {
-                    store.disconnect("Registration was removed in Home Assistant")
-                } else {
-                    store.setStatus("Delivery failed: ${safeMessage(error)}")
-                }
+            deliver(update, event)
+        }
+    }
+
+    private fun markDeliveryStarted() {
+        synchronized(deliveryLock) {
+            lastDeliveryStartedAtElapsedMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun deliver(
+        update: HomeAssistantUpdate,
+        event: HomeAssistantTripEvent?,
+    ) {
+        val current = store.snapshot()
+        val connection = store.connection()
+        if (!current.enabled || connection == null) return
+        if (connection.encryptionSecret == null) {
+            store.recordRequestError(ENCRYPTION_UNAVAILABLE_ERROR)
+            return
+        }
+        try {
+            markDeliveryStarted()
+            val result = client.updateSensors(connection, update)
+            if (event != null) client.fireTripEvent(connection, event)
+            if (store.connection() == connection) store.recordDelivery(result.disabledCount)
+        } catch (error: Exception) {
+            if (store.connection() != connection) return
+            if (error is HomeAssistantHttpException && error.statusCode == 410) {
+                store.disconnect("Registration was removed in Home Assistant")
+            } else {
+                store.recordRequestError(safeMessage(error))
             }
         }
     }
@@ -184,6 +250,7 @@ class HomeAssistantIntegration private constructor(context: Context) {
                 val current = store.connection()
                 if (current != null && current.encryptionSecret == null) {
                     store.connect(current.copy(encryptionSecret = secret))
+                    store.clearRequestError()
                 }
             } catch (error: Exception) {
                 val status = if (
@@ -194,7 +261,7 @@ class HomeAssistantIntegration private constructor(context: Context) {
                 } else {
                     "Encryption setup failed: ${safeMessage(error)}"
                 }
-                if (store.connection()?.encryptionSecret == null) store.setStatus(status)
+                if (store.connection()?.encryptionSecret == null) store.recordRequestError(status)
             } finally {
                 encryptionUpgradeQueued.set(false)
             }
@@ -221,9 +288,25 @@ class HomeAssistantIntegration private constructor(context: Context) {
 }
 
 internal const val TRIP_UPDATE_INTERVAL_MS = 10_000L
+internal const val ENCRYPTION_UNAVAILABLE_ERROR =
+    "Webhook encryption is unavailable; disconnect and reconnect Home Assistant"
 
 internal fun isRunningUpdateDue(
     nowElapsedMs: Long,
     lastQueuedAtElapsedMs: Long,
+    lastRequestStartedAtElapsedMs: Long,
     batteryChanged: Boolean,
-): Boolean = batteryChanged || nowElapsedMs - lastQueuedAtElapsedMs >= TRIP_UPDATE_INTERVAL_MS
+): Boolean = batteryChanged || remainingRunningUpdateDelayMs(
+    nowElapsedMs = nowElapsedMs,
+    lastQueuedAtElapsedMs = lastQueuedAtElapsedMs,
+    lastRequestStartedAtElapsedMs = lastRequestStartedAtElapsedMs,
+) == 0L
+
+internal fun remainingRunningUpdateDelayMs(
+    nowElapsedMs: Long,
+    lastQueuedAtElapsedMs: Long,
+    lastRequestStartedAtElapsedMs: Long,
+): Long {
+    val cadenceStartedAt = maxOf(lastQueuedAtElapsedMs, lastRequestStartedAtElapsedMs)
+    return (TRIP_UPDATE_INTERVAL_MS - (nowElapsedMs - cadenceStartedAt)).coerceAtLeast(0L)
+}

@@ -1,5 +1,6 @@
 package at.themrcodes.ridershub.session
 
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
@@ -106,9 +107,9 @@ object RangeEstimator {
             observedDistanceKm = observedDistance,
             observedDepletionPercent = observedDepletion,
             message = if (status == RangeEstimateStatus.CALIBRATED) {
-                "Speed-calibrated from ${"%.1f".format(observedDistance)} km of your riding"
+                "Speed-calibrated from ${"%.1f".format(Locale.US, observedDistance)} km of your riding"
             } else {
-                "Provisional speed-aware estimate from ${"%.1f".format(observedDistance)} km"
+                "Provisional speed-aware estimate from ${"%.1f".format(Locale.US, observedDistance)} km"
             },
         )
     }
