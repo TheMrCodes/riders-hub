@@ -34,6 +34,8 @@ respective owners.
   observed charge windows, and an adaptive daily-to-yearly capacity chart.
 - Optional Home Assistant export for battery, estimated range, current-trip
   distance, last update, and in-use state—never live speed.
+- A Wear OS companion dashboard for live speed, board battery, trip distance,
+  and ride mode, with clearly subdued last-known values while disconnected.
 
 A separate remote-battery field has not been identified, so Riders Hub shows
 that value as unavailable instead of presenting an inferred reading.
@@ -155,6 +157,12 @@ device in the app-specific external directory. Android may still require the
 device-wide Location Services switch for companion-device discovery, but the
 app is not granted location access and does not receive coordinates.
 
+The optional Wear OS companion receives only connection state, live speed,
+board battery, current trip distance, ride mode, and the update time through
+Google's private paired-device Data Layer. Bluetooth addresses, remote names,
+odometer totals, ride history, locations, and raw telemetry are not sent to
+the watch.
+
 Exported logs can contain ride data and a stable Bluetooth address. Local
 captures, signing material, and build outputs are ignored by Git; review any
 file carefully before forcing it into a public commit.
@@ -162,6 +170,7 @@ file carefully before forcing it into a public commit.
 ## Requirements
 
 - Android 14 or newer
+- Wear OS 3 or newer for the optional watch companion
 - A compatible board and Bluetooth remote
 - JDK 17 or newer for development
 - Android SDK API 36 for building
@@ -170,16 +179,66 @@ file carefully before forcing it into a public commit.
 
 ```bash
 ./gradlew testDebugUnitTest lintDebug assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s PHONE_SERIAL install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s WATCH_SERIAL install -r wear/build/outputs/apk/debug/wear-debug.apk
 ```
 
 The application ID is `at.themrcodes.ridershub`. Installation, association,
 lifecycle details, log extraction, and the JSONL schema are documented in the
 [Android app guide](docs/android-logger.md).
 
+The watch build is a non-standalone companion and uses the same application ID
+as the phone build. For Google Play distribution, publish both form-factor
+artifacts under the same listing and signing key. Modern Wear OS installs its
+artifact through Play on the compatible watch; a directly sideloaded phone APK
+does not embed or automatically sideload the watch APK.
+
+### Install on a watch from Android Studio
+
+1. Open the repository root in Android Studio and let the Gradle sync finish.
+2. On the watch, enable **ADB debugging** and **Wireless debugging** under
+   **Developer options**. The watch and workstation must be on the same Wi-Fi
+   network.
+3. Pair the watch with the workstation. When pairing manually, use the address
+   under **Pair new device** only with `adb pair`. Then use the separate address
+   on the main **Wireless debugging** screen with `adb connect`.
+4. Select the shared **Riders Hub - Watch** run configuration and the watch in
+   Android Studio's target-device menu, then click **Run**.
+
+Android Studio builds `:wear:assembleDebug`, installs the watch APK, and starts
+the launcher activity. To test real phone-to-watch data, install `:app` on the
+paired phone from the same checkout so both debug APKs use the same signing
+certificate. Wear OS 3 and newer does not support ADB debugging through the
+phone's Bluetooth connection; deployment requires a direct Wi-Fi or supported
+USB ADB connection to the watch.
+
+### Wear emulator telemetry
+
+The debug Wear APK includes an ADB-only synthetic telemetry receiver. It is
+protected by Android's `DUMP` permission and is not compiled into release
+artifacts. With the debug APK running on a watch emulator, inject a live sample:
+
+```bash
+adb -s WATCH_SERIAL shell am broadcast \
+  -n at.themrcodes.ridershub/at.themrcodes.ridershub.wear.SyntheticTelemetryReceiver \
+  -a at.themrcodes.ridershub.wear.DEBUG_TELEMETRY \
+  --es connection LIVE \
+  --ef speed_kmh 24.5 \
+  --ei battery_percent 78 \
+  --ef trip_km 4.25 \
+  --es mode SPORT
+```
+
+Use `RECONNECTING` for `connection` to verify retained-but-dimmed values, add
+`--el age_ms 60000` to a `LIVE` sample to verify the stale-update state, or
+send `--ez clear true` to restore the waiting-for-phone state.
+
 ## Repository layout
 
 - [`app/`](app/) contains the Android application, resources, and JVM tests.
+- [`wear/`](wear/) contains the Wear OS dashboard.
+- [`wear-shared/`](wear-shared/) contains the versioned, privacy-minimized
+  phone-to-watch telemetry contract.
 - [`gradle/`](gradle/) and the root Gradle files provide the reproducible build.
 - [`docs/`](docs/) contains protocol evidence, lifecycle documentation, and
   capture analysis.

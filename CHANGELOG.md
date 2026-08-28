@@ -2,6 +2,18 @@
 
 Notable changes to Riders Hub are documented here.
 
+## Unreleased
+
+### Added
+
+- Added a non-standalone Wear OS companion dashboard for live speed, board
+  battery, trip distance, ride mode, connection state, and stale-data handling.
+- Added a versioned phone-to-watch Data Layer contract that excludes device
+  identifiers, odometer totals, ride history, locations, and raw telemetry.
+- Added a shared Android Studio watch run target and a debug-only ADB telemetry
+  inlet for repeatable emulator testing; neither synthetic input nor sample
+  ride data is present in release builds.
+
 ## 0.6.0 - 2026-08-28
 
 ### Added

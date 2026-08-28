@@ -12,7 +12,10 @@ keystore.properties
 signing.properties
 
 # Editors and operating systems
-.idea/
+.idea/*
+!.idea/runConfigurations/
+.idea/runConfigurations/*
+!.idea/runConfigurations/Riders_Hub_Watch.xml
 .vscode/
 *.iml
 .DS_Store

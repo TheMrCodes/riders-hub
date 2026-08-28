@@ -7,21 +7,20 @@ plugins {
 }
 
 android {
-    namespace = "at.themrcodes.ridershub"
+    namespace = "at.themrcodes.ridershub.wear"
     compileSdk = 36
 
     defaultConfig {
         applicationId = "at.themrcodes.ridershub"
-        minSdk = 34
+        minSdk = 30
         targetSdk = 36
-        versionCode = 19
+        versionCode = 600_019
         versionName = "0.6.0"
 
         testInstrumentationRunner = "android.app.Instrumentation"
     }
 
     buildFeatures {
-        buildConfig = true
         compose = true
     }
 
@@ -35,7 +34,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
 }
 
 kotlin {
@@ -45,27 +43,20 @@ kotlin {
 }
 
 dependencies {
-    // Compose 1.11 is the last stable line compatible with API 36 / AGP 8.x.
     val composeBom = platform("androidx.compose:compose-bom:2026.04.01")
 
     implementation(composeBom)
-    androidTestImplementation(composeBom)
+    implementation(project(":wear-shared"))
     implementation("androidx.activity:activity-compose:1.13.0")
-    // Play services still references Fragment 1.1 transitively; keep Activity Result compatible.
     implementation("androidx.fragment:fragment:1.9.0")
-    implementation("androidx.compose.foundation:foundation")
-    implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
-    debugImplementation("androidx.compose.ui:ui-tooling")
-
-    implementation(project(":wear-shared"))
+    implementation("androidx.wear.compose:compose-foundation:1.6.2")
+    implementation("androidx.wear.compose:compose-material3:1.6.2")
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
 
-    // Home Assistant mobile_app webhook payload encryption (XSalsa20-Poly1305).
-    implementation("com.goterl:lazysodium-android:5.2.0@aar")
-    implementation("net.java.dev.jna:jna:5.17.0@aar")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.wear.compose:compose-ui-tooling:1.6.2")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.json:json:20260719")
 }

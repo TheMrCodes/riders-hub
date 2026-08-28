@@ -8,6 +8,7 @@ import java.util.Locale
 
 class AppStateStore(context: Context) {
     private val preferences = context.getSharedPreferences("monitor_state", Context.MODE_PRIVATE)
+    private val wearPublisher = WearTelemetryPublisher(context.applicationContext)
     private var lastFramePersistElapsedMs = 0L
 
     fun setAssociation(address: String, name: String?, associationId: Int?) {
@@ -25,6 +26,7 @@ class AppStateStore(context: Context) {
             }
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setObserving(observing: Boolean, detail: String) {
@@ -33,6 +35,7 @@ class AppStateStore(context: Context) {
             .putString(KEY_MONITOR_DETAIL, detail)
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     /**
@@ -63,6 +66,7 @@ class AppStateStore(context: Context) {
             }
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setServiceActive(active: Boolean) {
@@ -70,6 +74,7 @@ class AppStateStore(context: Context) {
             .putBoolean(KEY_SERVICE_ACTIVE, active)
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setPresence(present: Boolean, detail: String) {
@@ -78,6 +83,7 @@ class AppStateStore(context: Context) {
             .putString(KEY_PRESENCE_DETAIL, detail)
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setConnection(state: String) {
@@ -85,6 +91,7 @@ class AppStateStore(context: Context) {
             .putString(KEY_CONNECTION, state)
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setLatestLog(path: String) {
@@ -101,6 +108,7 @@ class AppStateStore(context: Context) {
             .remove(KEY_CHILD_LIMITER_ACTIVE)
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = true)
     }
 
     fun setFrame(frameCount: Long, frame: TelemetryFrame) {
@@ -144,6 +152,7 @@ class AppStateStore(context: Context) {
             }
             .putString(KEY_LAST_EVENT_AT, Instant.now().toString())
             .apply()
+        publishWear(force = false)
     }
 
     fun setLimiterControlAvailable(available: Boolean) {
@@ -208,6 +217,10 @@ class AppStateStore(context: Context) {
         error = preferences.getString(KEY_ERROR, null),
         lastEventAt = preferences.getString(KEY_LAST_EVENT_AT, null),
     )
+
+    private fun publishWear(force: Boolean) {
+        wearPublisher.publish(snapshot(), force)
+    }
 
     companion object {
         private const val KEY_ADDRESS = "address"

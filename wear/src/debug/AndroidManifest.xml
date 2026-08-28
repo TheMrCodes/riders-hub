@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug-only test inlet. Requiring DUMP limits explicit broadcasts to ADB/system. -->
+        <receiver
+            android:name=".SyntheticTelemetryReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="at.themrcodes.ridershub.wear.DEBUG_TELEMETRY" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

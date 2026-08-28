@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "RidersHub"
 include(":app")
+include(":wear")
+include(":wear-shared")
