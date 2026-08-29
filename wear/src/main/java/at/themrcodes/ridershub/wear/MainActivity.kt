@@ -1,6 +1,7 @@
 package at.themrcodes.ridershub.wear
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -23,6 +24,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -33,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -63,7 +66,6 @@ class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, Ambie
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ambientController = AmbientModeSupport.attach(this)
         setContent {
             RidersHubWearApp(
@@ -225,6 +227,19 @@ private fun RidersHubWearApp(
     val burnInRequired = WearAmbientState.isBurnInProtectionRequired
     val ambientFrame = WearAmbientState.ambientFrame
     var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    val keepScreenOn = shouldKeepRideVisible(telemetry, nowEpochMs)
+    val activity = LocalContext.current as? Activity
+    DisposableEffect(keepScreenOn) {
+        if (keepScreenOn) {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     LaunchedEffect(ambient, ambientFrame) {
         nowEpochMs = System.currentTimeMillis()
