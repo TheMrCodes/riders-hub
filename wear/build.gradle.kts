@@ -54,6 +54,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.wear.compose:compose-foundation:1.6.2")
     implementation("androidx.wear.compose:compose-material3:1.6.2")
+    implementation("androidx.wear:wear:1.3.0")
     implementation("androidx.wear:wear-ongoing:1.1.0")
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
 

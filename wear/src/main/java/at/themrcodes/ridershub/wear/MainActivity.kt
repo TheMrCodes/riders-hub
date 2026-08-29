@@ -39,10 +39,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.fragment.app.FragmentActivity
+import androidx.wear.ambient.AmbientModeSupport
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
-import androidx.wear.compose.foundation.AmbientMode
-import androidx.wear.compose.foundation.rememberAmbientModeManager
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import com.google.android.gms.wearable.DataClient
@@ -52,8 +52,9 @@ import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.delay
 import java.util.Locale
 
-class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
+class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, AmbientModeSupport.AmbientCallbackProvider {
     private val dataClient by lazy { Wearable.getDataClient(this) }
+    private lateinit var ambientController: AmbientModeSupport.AmbientController
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -62,10 +63,10 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ambientController = AmbientModeSupport.attach(this)
         setContent {
             RidersHubWearApp(
                 telemetry = WearTelemetryStore.telemetry,
-                onAmbientFrame = ::syncOngoingActivity,
             )
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -75,6 +76,33 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+
+    override fun getAmbientCallback(): AmbientModeSupport.AmbientCallback =
+        object : AmbientModeSupport.AmbientCallback() {
+            override fun onEnterAmbient(ambientDetails: Bundle?) {
+                super.onEnterAmbient(ambientDetails)
+                val burnIn = ambientDetails?.getBoolean(AmbientModeSupport.EXTRA_BURN_IN_PROTECTION, false) ?: false
+                WearAmbientState.isAmbient = true
+                WearAmbientState.isBurnInProtectionRequired = burnIn
+                WearAmbientState.ambientFrame++
+                WearTelemetryStore.setAmbient(true)
+                syncOngoingActivity()
+            }
+
+            override fun onExitAmbient() {
+                super.onExitAmbient()
+                WearAmbientState.isAmbient = false
+                WearTelemetryStore.setAmbient(false)
+                syncOngoingActivity()
+            }
+
+            override fun onUpdateAmbient() {
+                super.onUpdateAmbient()
+                WearTelemetryStore.renderAmbientFrame()
+                WearAmbientState.ambientFrame++
+                syncOngoingActivity()
+            }
+        }
 
     override fun onStart() {
         super.onStart()
@@ -182,78 +210,22 @@ private val RidersAmbient = Color(0xFF707070)
 private val RidersLine = Color(0xFF292929)
 private val RidersMono = FontFamily.Monospace
 
-private val isAmbientSupported: Boolean by lazy {
-    if (Build.VERSION.SDK_INT < 30) return@lazy false
-    try {
-        Class.forName("com.google.wear.services.ambient.AmbientComponentState")
-        true
-    } catch (_: Throwable) {
-        false
-    }
+internal object WearAmbientState {
+    var isAmbient by mutableStateOf(false)
+    var isBurnInProtectionRequired by mutableStateOf(false)
+    var ambientFrame by mutableIntStateOf(0)
 }
 
 @Composable
 private fun RidersHubWearApp(
     telemetry: WearTelemetryState?,
-    onAmbientFrame: () -> Unit,
 ) {
-    if (isAmbientSupported) {
-        AmbientRidersHubWearApp(telemetry, onAmbientFrame)
-    } else {
-        StandardRidersHubWearApp(telemetry)
-    }
-}
-
-@Composable
-private fun StandardRidersHubWearApp(
-    telemetry: WearTelemetryState?,
-) {
+    val ambient = WearAmbientState.isAmbient
+    val burnInRequired = WearAmbientState.isBurnInProtectionRequired
+    val ambientFrame = WearAmbientState.ambientFrame
     var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
-    LaunchedEffect(Unit) {
-        WearTelemetryStore.setAmbient(false)
-        while (true) {
-            delay(15_000)
-            nowEpochMs = System.currentTimeMillis()
-        }
-    }
-    val uiState = wearUiState(telemetry, nowEpochMs)
-
-    MaterialTheme {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(RidersBlack),
-            contentAlignment = Alignment.Center,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 24.dp, vertical = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Top,
-            ) {
-                InteractiveDashboard(uiState)
-            }
-        }
-    }
-}
-
-@Composable
-private fun AmbientRidersHubWearApp(
-    telemetry: WearTelemetryState?,
-    onAmbientFrame: () -> Unit,
-) {
-    val ambientModeManager = rememberAmbientModeManager()
-    val ambientMode = ambientModeManager.currentAmbientMode
-    val ambientDetails = ambientMode as? AmbientMode.Ambient
-    val ambient = ambientDetails != null
-    var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var ambientFrame by remember { mutableIntStateOf(0) }
-
-    LaunchedEffect(ambient) {
-        WearTelemetryStore.setAmbient(ambient)
+    LaunchedEffect(ambient, ambientFrame) {
         nowEpochMs = System.currentTimeMillis()
         if (ambient) return@LaunchedEffect
         while (true) {
@@ -261,18 +233,8 @@ private fun AmbientRidersHubWearApp(
             nowEpochMs = System.currentTimeMillis()
         }
     }
-    LaunchedEffect(ambientModeManager) {
-        while (true) {
-            ambientModeManager.withAmbientTick {
-                WearTelemetryStore.renderAmbientFrame()
-                nowEpochMs = System.currentTimeMillis()
-                ambientFrame++
-                onAmbientFrame()
-            }
-        }
-    }
     val uiState = wearUiState(telemetry, nowEpochMs)
-    val burnInOffset = if (ambientDetails?.isBurnInProtectionRequired == true) {
+    val burnInOffset = if (ambient && burnInRequired) {
         ambientBurnInOffset(ambientFrame)
     } else {
         0 to 0
