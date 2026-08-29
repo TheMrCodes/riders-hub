@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "at.themrcodes.ridershub"
-        minSdk = 30
+        minSdk = 26
         targetSdk = 36
         versionCode = 600_019
         versionName = "0.6.0"
