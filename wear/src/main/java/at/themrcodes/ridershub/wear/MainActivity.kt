@@ -182,8 +182,66 @@ private val RidersAmbient = Color(0xFF707070)
 private val RidersLine = Color(0xFF292929)
 private val RidersMono = FontFamily.Monospace
 
+private val isAmbientSupported: Boolean by lazy {
+    if (Build.VERSION.SDK_INT < 30) return@lazy false
+    try {
+        Class.forName("com.google.wear.services.ambient.AmbientComponentState")
+        true
+    } catch (_: Throwable) {
+        false
+    }
+}
+
 @Composable
 private fun RidersHubWearApp(
+    telemetry: WearTelemetryState?,
+    onAmbientFrame: () -> Unit,
+) {
+    if (isAmbientSupported) {
+        AmbientRidersHubWearApp(telemetry, onAmbientFrame)
+    } else {
+        StandardRidersHubWearApp(telemetry)
+    }
+}
+
+@Composable
+private fun StandardRidersHubWearApp(
+    telemetry: WearTelemetryState?,
+) {
+    var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(Unit) {
+        WearTelemetryStore.setAmbient(false)
+        while (true) {
+            delay(15_000)
+            nowEpochMs = System.currentTimeMillis()
+        }
+    }
+    val uiState = wearUiState(telemetry, nowEpochMs)
+
+    MaterialTheme {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(RidersBlack),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Top,
+            ) {
+                InteractiveDashboard(uiState)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AmbientRidersHubWearApp(
     telemetry: WearTelemetryState?,
     onAmbientFrame: () -> Unit,
 ) {
