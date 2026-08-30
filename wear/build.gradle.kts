@@ -50,6 +50,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.core:core:1.18.0")
     implementation("androidx.fragment:fragment:1.9.0")
+    implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.wear.compose:compose-foundation:1.6.2")

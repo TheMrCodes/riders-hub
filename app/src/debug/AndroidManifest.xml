@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug-only Data Layer smoke-test sender; only ADB/system callers hold DUMP. -->
+        <receiver
+            android:name=".WearDataLayerTestReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="at.themrcodes.ridershub.DEBUG_WEAR_TELEMETRY" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

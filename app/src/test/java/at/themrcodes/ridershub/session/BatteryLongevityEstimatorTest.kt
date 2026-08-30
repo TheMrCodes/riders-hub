@@ -1,12 +1,73 @@
 package at.themrcodes.ridershub.session
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
 import java.time.ZoneId
 
 class BatteryLongevityEstimatorTest {
+    @Test
+    fun excludesInitialObservationUntilARechargeIsInferred() {
+        val initial = cycle(
+            id = "initial",
+            observedAt = "2030-01-02T10:00:00Z",
+            distanceKm = 10.0,
+            depletion = 20,
+            buckets = mapOf(15 to 10.0),
+        ).copy(
+            startReason = ChargeCycleStartReason.FIRST_OBSERVATION,
+            inferredRechargeIncreasePercent = null,
+        )
+
+        val snapshot = BatteryLongevityEstimator.estimate(
+            ChargeCycleStoreSnapshot(
+                activeCycles = listOf(initial),
+                completedCycles = emptyList(),
+            ),
+        )
+
+        assertEquals(BatteryLongevityStatus.COLLECTING_DATA, snapshot.status)
+        assertEquals(0, snapshot.observedCycleCount)
+        assertEquals(0, snapshot.usableCycleCount)
+        assertTrue(snapshot.observations.isEmpty())
+        assertNull(snapshot.currentFullRangeKm)
+        assertTrue(snapshot.message.contains("battery rises by at least 5%"))
+    }
+
+    @Test
+    fun firstInferredRechargeCreatesFirstVisibleCycle() {
+        val baseline = cycle(
+            id = "baseline",
+            observedAt = "2030-01-02T10:00:00Z",
+            distanceKm = 10.0,
+            depletion = 20,
+            buckets = mapOf(15 to 10.0),
+        ).copy(
+            startReason = ChargeCycleStartReason.FIRST_OBSERVATION,
+            inferredRechargeIncreasePercent = null,
+        )
+        val confirmed = cycle(
+            id = "confirmed",
+            observedAt = "2030-01-03T10:00:00Z",
+            distanceKm = 10.0,
+            depletion = 20,
+            buckets = mapOf(15 to 10.0),
+        )
+
+        val snapshot = BatteryLongevityEstimator.estimate(
+            ChargeCycleStoreSnapshot(
+                activeCycles = listOf(confirmed),
+                completedCycles = listOf(baseline),
+            ),
+        )
+
+        assertEquals(1, snapshot.observedCycleCount)
+        assertEquals(1, snapshot.usableCycleCount)
+        assertEquals(listOf("confirmed"), snapshot.observations.map { it.cycleId })
+    }
+
     @Test
     fun normalizesDifferentSpeedProfilesBeforeComparingCapacity() {
         val snapshot = BatteryLongevityEstimator.estimate(

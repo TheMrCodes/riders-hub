@@ -11,8 +11,7 @@ import java.util.Locale
 class SyntheticTelemetryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.getBooleanExtra(EXTRA_CLEAR, false)) {
-            WearTelemetryStore.update(null)
-            WearOngoingActivity.sync(context, null, System.currentTimeMillis())
+            WearTelemetryRepository.accept(context, null)
             return
         }
         val ageMs = intent.getLongExtra(EXTRA_AGE_MS, 0L).coerceAtLeast(0L)
@@ -31,8 +30,7 @@ class SyntheticTelemetryReceiver : BroadcastReceiver() {
                 mode = intent.getStringExtra(EXTRA_MODE),
             )
         }.getOrNull() ?: return
-        WearTelemetryStore.update(state)
-        WearOngoingActivity.sync(context, state, System.currentTimeMillis())
+        WearTelemetryRepository.accept(context, state)
     }
 
     companion object {

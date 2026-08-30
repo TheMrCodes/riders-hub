@@ -18,6 +18,7 @@ internal object WearOngoingActivity {
     private var visible = false
     private var lastPostAtEpochMs = 0L
 
+    @Synchronized
     fun sync(context: Context, telemetry: WearTelemetryState?, nowEpochMs: Long) {
         if (!shouldKeepRideVisible(telemetry, nowEpochMs)) {
             NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID)

@@ -52,13 +52,16 @@ object BatteryLongevityEstimator {
         val boardCycles = (cycles.completedCycles + cycles.activeCycles)
             .filter { it.localBoardId == selectedBoard }
             .distinctBy { it.id }
-        val qualified = boardCycles.mapNotNull(::qualify)
-        if (qualified.isEmpty()) return collecting(boardCycles.size)
+        val confirmedCycles = boardCycles.filter {
+            it.startReason == ChargeCycleStartReason.INFERRED_RECHARGE
+        }
+        val qualified = confirmedCycles.mapNotNull(::qualify)
+        if (qualified.isEmpty()) return collecting(confirmedCycles.size)
 
         val aggregatePercentPerKm = qualified.sumOf { it.depletionPercent } /
             qualified.sumOf { it.cycle.recordedDistanceKm }
         if (!aggregatePercentPerKm.isFinite() || aggregatePercentPerKm <= 0.0) {
-            return collecting(boardCycles.size)
+            return collecting(confirmedCycles.size)
         }
         val costs = fitPercentPerKmBySpeed(qualified, aggregatePercentPerKm)
         val referenceProfile = mergeProfiles(qualified.map { it.cycle.speedBucketDistancesKm })
@@ -99,7 +102,7 @@ object BatteryLongevityEstimator {
             }
         }.sortedBy { it.observedAt }
 
-        if (observations.isEmpty()) return collecting(boardCycles.size)
+        if (observations.isEmpty()) return collecting(confirmedCycles.size)
         val recent = observations.takeLast(CURRENT_WINDOW_SIZE)
         val recentWeight = recent.sumOf { it.observedDepletionPercent }
         val current = recent.sumOf {
@@ -113,7 +116,7 @@ object BatteryLongevityEstimator {
         return BatteryLongevitySnapshot(
             status = status,
             currentFullRangeKm = current,
-            observedCycleCount = boardCycles.size,
+            observedCycleCount = confirmedCycles.size,
             usableCycleCount = observations.size,
             observations = observations,
             allTimeHighKm = observations.maxOf { it.normalizedFullRangeKm },
@@ -132,7 +135,11 @@ object BatteryLongevityEstimator {
         usableCycleCount = 0,
         observations = emptyList(),
         allTimeHighKm = null,
-        message = "Use at least 5% battery with recorded speed data to create a capacity point",
+        message = if (observedCycles == 0) {
+            "A charge observation starts after battery rises by at least 5% between rides"
+        } else {
+            "Use at least 5% battery with recorded speed data to create a capacity point"
+        },
     )
 
     private fun qualify(cycle: ChargeCycleSummary): QualifiedCycle? {

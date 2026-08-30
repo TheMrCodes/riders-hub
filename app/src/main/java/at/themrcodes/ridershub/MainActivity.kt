@@ -18,6 +18,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,11 +40,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.TextButton
@@ -102,6 +106,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var state: AppStateStore
     private lateinit var rideStore: RideStore
     private lateinit var homeAssistant: HomeAssistantIntegration
+    private lateinit var generalSettings: GeneralSettingsStore
     private var associationRequestedAfterPermission = false
     private var handledAssociationId: Int? = null
     private var associationInProgress by mutableStateOf(false)
@@ -146,6 +151,7 @@ class MainActivity : ComponentActivity() {
         state = AppStateStore(this)
         rideStore = RideStore.get(this)
         homeAssistant = HomeAssistantIntegration.get(this)
+        generalSettings = GeneralSettingsStore(this)
         expertControlsUnlocked = getSharedPreferences("app_settings", MODE_PRIVATE)
             .getBoolean(KEY_EXPERT_CONTROLS_UNLOCKED, false)
         dashboard = loadDashboard()
@@ -168,6 +174,7 @@ class MainActivity : ComponentActivity() {
                     onOpenSettings = ::openPermissionSettings,
                     onVersionTap = ::onVersionTapped,
                     onSetChildLimiter = ::requestChildLimiter,
+                    onSetLowBatteryWarningPercent = ::setLowBatteryWarningPercent,
                     onSetHomeAssistantEnabled = ::setHomeAssistantEnabled,
                     onConnectHomeAssistant = homeAssistant::connect,
                     onSaveHomeAssistantWebhook = ::saveHomeAssistantWebhook,
@@ -186,8 +193,14 @@ class MainActivity : ComponentActivity() {
         return DashboardState(
             app = app,
             rides = rideStore.snapshot(app.boardBatteryPercent, restingVoltage),
+            generalSettings = generalSettings.snapshot(),
             homeAssistant = homeAssistant.snapshot(),
         )
+    }
+
+    private fun setLowBatteryWarningPercent(percent: Int) {
+        generalSettings.setLowBatteryWarningPercent(percent)
+        dashboard = loadDashboard()
     }
 
     private fun setHomeAssistantEnabled(enabled: Boolean) {
@@ -331,6 +344,7 @@ class MainActivity : ComponentActivity() {
 private data class DashboardState(
     val app: AppSnapshot,
     val rides: RideStoreSnapshot,
+    val generalSettings: GeneralSettingsSnapshot,
     val homeAssistant: HomeAssistantSnapshot,
 )
 
@@ -372,6 +386,7 @@ private fun RidersHubDashboard(
     onOpenSettings: () -> Unit,
     onVersionTap: () -> Unit,
     onSetChildLimiter: (Boolean) -> Unit,
+    onSetLowBatteryWarningPercent: (Int) -> Unit,
     onSetHomeAssistantEnabled: (Boolean) -> Unit,
     onConnectHomeAssistant: (String, String) -> Unit,
     onSaveHomeAssistantWebhook: (String) -> Unit,
@@ -416,7 +431,13 @@ private fun RidersHubDashboard(
                 DashboardPage.OVERVIEW -> {
                     item { NothingHeader(app, onOpenDevice = { page = DashboardPage.DEVICE }) }
                     app.error?.let { message -> item { ErrorWidget(message) } }
-                    item { CurrentTripWidget(app, rides.currentTripDisplay) }
+                    item {
+                        CurrentTripWidget(
+                            app = app,
+                            ride = rides.currentTripDisplay,
+                            lowBatteryWarningPercent = dashboard.generalSettings.lowBatteryWarningPercent,
+                        )
+                    }
                     item { RangeWidget(rides.rangeEstimate, Modifier.padding(top = 12.dp)) }
                     item {
                         BatteryLongevitySection(
@@ -440,6 +461,12 @@ private fun RidersHubDashboard(
                             app = app,
                             associationInProgress = associationInProgress,
                             onAssociate = onAssociate,
+                        )
+                    }
+                    item {
+                        GeneralSettingsSection(
+                            lowBatteryWarningPercent = dashboard.generalSettings.lowBatteryWarningPercent,
+                            onSetLowBatteryWarningPercent = onSetLowBatteryWarningPercent,
                         )
                     }
                     if (expertControlsUnlocked) {
@@ -579,7 +606,11 @@ private fun BackIconButton(onClick: () -> Unit) {
 }
 
 @Composable
-private fun CurrentTripWidget(app: AppSnapshot, ride: RideSummary?) {
+private fun CurrentTripWidget(
+    app: AppSnapshot,
+    ride: RideSummary?,
+    lowBatteryWarningPercent: Int,
+) {
     val listening = app.serviceActive && app.connection.contains("Listening", ignoreCase = true)
     val rideOpen = ride?.active == true
     val telemetryActive = rideOpen && listening
@@ -653,12 +684,13 @@ private fun CurrentTripWidget(app: AppSnapshot, ride: RideSummary?) {
             BatteryMeter(
                 percent = batteryPercent,
                 active = telemetryActive,
+                lowBatteryWarningPercent = lowBatteryWarningPercent,
                 modifier = Modifier.align(Alignment.TopEnd),
             )
         }
         Spacer(Modifier.height(20.dp))
         SpeedScale(app.speedKmh)
-        if ((app.boardBatteryPercent ?: 101) <= BatteryWarningNotifier.WARNING_PERCENT) {
+        if (isLowBoardBattery(app.boardBatteryPercent, lowBatteryWarningPercent)) {
             Spacer(Modifier.height(20.dp))
             Column(
                 Modifier
@@ -1076,6 +1108,81 @@ private fun ExperimentalControl(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GeneralSettingsSection(
+    lowBatteryWarningPercent: Int,
+    onSetLowBatteryWarningPercent: (Int) -> Unit,
+) {
+    val sliderColors = SliderDefaults.colors(
+        thumbColor = NothingWhite,
+        activeTrackColor = NothingRed,
+        inactiveTrackColor = NothingRaised,
+        activeTickColor = NothingWhite,
+        inactiveTickColor = NothingLine,
+    )
+    val sliderInteractionSource = remember { MutableInteractionSource() }
+
+    Column {
+        SectionTitle("General", "App-wide adjustments")
+        Spacer(Modifier.height(30.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Column(Modifier.weight(1f)) {
+                NothingText("Low battery warning", size = 16, weight = FontWeight.Bold)
+                Spacer(Modifier.height(7.dp))
+                NothingText(
+                    "Show the warning and send one notification per ride at or below this level.",
+                    color = NothingMuted,
+                    size = 10,
+                    lineHeight = 16,
+                )
+            }
+            Spacer(Modifier.width(20.dp))
+            NothingText(
+                "$lowBatteryWarningPercent%",
+                color = NothingRed,
+                size = 24,
+                weight = FontWeight.Black,
+            )
+        }
+        Spacer(Modifier.height(18.dp))
+        Slider(
+            value = lowBatteryWarningPercent.toFloat(),
+            onValueChange = { value ->
+                val percent = normalizeLowBatteryWarningPercent(value.roundToInt())
+                if (percent != lowBatteryWarningPercent) onSetLowBatteryWarningPercent(percent)
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics {
+                    contentDescription = "Low battery warning threshold, $lowBatteryWarningPercent percent"
+                },
+            valueRange = MIN_LOW_BATTERY_WARNING_PERCENT.toFloat()..
+                MAX_LOW_BATTERY_WARNING_PERCENT.toFloat(),
+            steps = (MAX_LOW_BATTERY_WARNING_PERCENT - MIN_LOW_BATTERY_WARNING_PERCENT) /
+                LOW_BATTERY_WARNING_STEP_PERCENT - 1,
+            colors = sliderColors,
+            interactionSource = sliderInteractionSource,
+            thumb = {
+                Box(
+                    Modifier
+                        .width(5.dp)
+                        .height(24.dp)
+                        .background(NothingWhite, RoundedCornerShape(3.dp)),
+                )
+            },
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            NothingText("$MIN_LOW_BATTERY_WARNING_PERCENT%", color = NothingMuted, size = 9)
+            NothingText("$MAX_LOW_BATTERY_WARNING_PERCENT%", color = NothingMuted, size = 9)
+        }
+    }
+}
+
 @Composable
 private fun HomeAssistantSection(
     state: HomeAssistantSnapshot,
@@ -1420,11 +1527,16 @@ private fun QuietMetric(
 }
 
 @Composable
-private fun BatteryMeter(percent: Int?, active: Boolean, modifier: Modifier = Modifier) {
+private fun BatteryMeter(
+    percent: Int?,
+    active: Boolean,
+    lowBatteryWarningPercent: Int,
+    modifier: Modifier = Modifier,
+) {
     val fraction = (percent ?: 0).coerceIn(0, 100) / 100f
     val markerColor = when {
         !active -> NothingInactive
-        (percent ?: 101) <= BatteryWarningNotifier.WARNING_PERCENT -> NothingRed
+        isLowBoardBattery(percent, lowBatteryWarningPercent) -> NothingRed
         else -> NothingWhite
     }
     Box(

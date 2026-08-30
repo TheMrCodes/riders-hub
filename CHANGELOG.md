@@ -16,6 +16,12 @@ Notable changes to Riders Hub are documented here.
 - Added a one-update-per-minute ambient ride dashboard with burn-in shifting,
   large trip distance, board battery, estimated range remaining, and a
   ride-scoped Ongoing Activity that keeps the dashboard visible.
+- Added a swipe-accessible Wear display setting that switches active rides
+  between the battery-friendly ambient dashboard and an always-awake live view.
+- Made Wear telemetry survive process recreation and continue arriving while
+  the dashboard is backgrounded through a filtered Data Layer listener.
+- Added a persisted General setting for the shared dashboard and notification
+  low-battery threshold, adjustable from 5% to 50% in five-point steps.
 
 ## 0.6.0 - 2026-08-28
 

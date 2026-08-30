@@ -27,7 +27,8 @@ respective owners.
   without a permanent foreground service or continuous custom scanning.
 - Short-disconnect continuity: reconnecting within two minutes resumes the
   same logical ride and telemetry log.
-- A low-board-battery notification at 20% or below.
+- A configurable low-board-battery warning and notification, with a 20%
+  default and five-point adjustment steps.
 - Local ride archives that preserve decoded telemetry and original BLE frames
   in compact, verified files.
 - Battery Longevity tracking with a speed-normalized full-charge estimate,
@@ -219,6 +220,14 @@ the system's second inactivity timeout. Ambient mode redraws only on the Wear OS
 minute tick, buffers faster phone updates between ticks, and shows only current
 trip kilometres, board battery, and estimated kilometres remaining. Devices
 that request burn-in protection receive a small four-position layout shift.
+Swipe sideways to the gear page to optionally keep the live dashboard awake
+during active rides instead; this uses more battery and does not enter ambient
+mode until the ride is no longer active.
+
+The watch listens for telemetry through a narrowly filtered Data Layer service
+and stores only the latest privacy-minimized payload. Phone updates can wake the
+watch app while its dashboard is backgrounded, and a recreated dashboard
+restores that last state without a continuously running foreground service.
 
 ### Wear emulator telemetry
 
@@ -241,6 +250,21 @@ adb -s WATCH_SERIAL shell am broadcast \
 Use `RECONNECTING` for `connection` to verify retained-but-dimmed values, add
 `--el age_ms 60000` to a `LIVE` sample to verify the stale-update state, or
 send `--ez clear true` to restore the waiting-for-phone state.
+
+### Phone-to-watch Data Layer smoke test
+
+Debug phone APKs also include an ADB-only sender for checking the real paired
+device Data Layer without producing a ride record:
+
+```bash
+adb -s PHONE_SERIAL shell am broadcast \
+  -n at.themrcodes.ridershub/at.themrcodes.ridershub.WearDataLayerTestReceiver \
+  -a at.themrcodes.ridershub.DEBUG_WEAR_TELEMETRY
+```
+
+It publishes fixed synthetic values through the production telemetry path. To
+remove the test item afterward, repeat the command with `--ez clear true`.
+The receiver and sample values are absent from release builds.
 
 ## Repository layout
 

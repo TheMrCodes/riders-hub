@@ -4,10 +4,29 @@ import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WearUiStateTest {
+    @Test
+    fun persistedTelemetryRoundTripsThroughTheProductionContract() {
+        val telemetry = telemetry(WearConnectionStatus.RECONNECTING, updatedAt = 100_000)
+
+        assertEquals(telemetry, decodePersistedTelemetry(encodePersistedTelemetry(telemetry)))
+        assertNull(decodePersistedTelemetry("not-valid-base64"))
+    }
+
+    @Test
+    fun olderBootstrapPayloadCannotReplaceNewerBackgroundState() {
+        val newer = telemetry(WearConnectionStatus.LIVE, updatedAt = 200_000)
+        val older = telemetry(WearConnectionStatus.RECONNECTING, updatedAt = 100_000)
+
+        assertFalse(shouldReplaceTelemetry(newer, older))
+        assertTrue(shouldReplaceTelemetry(older, newer))
+        assertTrue(shouldReplaceTelemetry(null, older))
+    }
+
     @Test
     fun recentLiveTelemetryIsFormattedForAGlance() {
         val ui = wearUiState(
@@ -98,6 +117,40 @@ class WearUiStateTest {
             shouldKeepRideVisible(
                 telemetry(WearConnectionStatus.LIVE, updatedAt = 100_000),
                 nowEpochMs = 220_001,
+            ),
+        )
+    }
+
+    @Test
+    fun screenWakeLockRequiresTheUserSettingAndARecentRide() {
+        val active = telemetry(WearConnectionStatus.LIVE, updatedAt = 100_000)
+
+        assertFalse(
+            shouldKeepScreenOn(
+                enabled = false,
+                telemetry = active,
+                nowEpochMs = 105_000,
+            ),
+        )
+        assertTrue(
+            shouldKeepScreenOn(
+                enabled = true,
+                telemetry = active,
+                nowEpochMs = 105_000,
+            ),
+        )
+        assertFalse(
+            shouldKeepScreenOn(
+                enabled = true,
+                telemetry = active,
+                nowEpochMs = 220_001,
+            ),
+        )
+        assertFalse(
+            shouldKeepScreenOn(
+                enabled = true,
+                telemetry = telemetry(WearConnectionStatus.STANDBY, updatedAt = 100_000),
+                nowEpochMs = 105_000,
             ),
         )
     }

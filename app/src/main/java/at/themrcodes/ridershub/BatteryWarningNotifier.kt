@@ -12,9 +12,11 @@ import java.util.Locale
 
 class BatteryWarningNotifier(private val context: Context) {
     private val preferences = context.getSharedPreferences("battery_warnings", Context.MODE_PRIVATE)
+    private val generalSettings = GeneralSettingsStore(context)
 
     fun maybeNotifyBoard(sessionId: String, batteryPercent: Int, packVoltageV: Double) {
-        if (batteryPercent > WARNING_PERCENT || packVoltageV <= 10.0) return
+        val warningPercent = generalSettings.snapshot().lowBatteryWarningPercent
+        if (!shouldNotifyLowBoardBattery(batteryPercent, packVoltageV, warningPercent)) return
         if (preferences.getString(KEY_LAST_BOARD_SESSION, null) == sessionId) return
         if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -40,7 +42,6 @@ class BatteryWarningNotifier(private val context: Context) {
     }
 
     companion object {
-        const val WARNING_PERCENT = 20
         private const val CHANNEL_ID = "battery_warning"
         private const val KEY_LAST_BOARD_SESSION = "last_board_warning_session"
         private const val BOARD_NOTIFICATION_ID = 2001
@@ -51,7 +52,7 @@ class BatteryWarningNotifier(private val context: Context) {
                 "Board battery warnings",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
-                description = "Warns when a supported board battery reading reaches 20% or below"
+                description = "Warns when the board battery reaches the configured limit"
             }
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }

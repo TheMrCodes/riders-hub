@@ -1,14 +1,16 @@
 package at.themrcodes.ridershub.wear
 
 import android.Manifest
-import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +24,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -31,10 +36,12 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -44,18 +51,17 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.wear.ambient.AmbientModeSupport
+import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
-import com.google.android.gms.wearable.DataClient
-import com.google.android.gms.wearable.DataEvent
-import com.google.android.gms.wearable.DataEventBuffer
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 
-class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, AmbientModeSupport.AmbientCallbackProvider {
+class MainActivity : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvider {
     private val dataClient by lazy { Wearable.getDataClient(this) }
     private lateinit var ambientController: AmbientModeSupport.AmbientController
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -66,6 +72,7 @@ class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, Ambie
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WearTelemetryRepository.restore(this)
         ambientController = AmbientModeSupport.attach(this)
         setContent {
             RidersHubWearApp(
@@ -109,40 +116,24 @@ class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, Ambie
 
     override fun onStart() {
         super.onStart()
-        dataClient.addListener(this)
+        val repositoryRevision = WearTelemetryRepository.currentRevision()
         dataClient.getDataItems().addOnSuccessListener { items ->
             try {
                 items.asSequence()
                     .filter { it.uri.path == WearTelemetryState.DATA_PATH }
                     .mapNotNull { item -> decodePayload(item.data) }
                     .maxByOrNull { it.updatedAtEpochMs }
-                    ?.let(::updateTelemetry)
+                    ?.let { telemetry ->
+                        WearTelemetryRepository.acceptBootstrap(
+                            context = this,
+                            telemetry = telemetry,
+                            expectedRevision = repositoryRevision,
+                        )
+                    }
             } finally {
                 items.release()
             }
         }
-    }
-
-    override fun onStop() {
-        dataClient.removeListener(this)
-        super.onStop()
-    }
-
-    override fun onDataChanged(events: DataEventBuffer) {
-        events.forEach { event ->
-            if (event.dataItem.uri.path != WearTelemetryState.DATA_PATH) return@forEach
-            val updated = if (event.type == DataEvent.TYPE_DELETED) {
-                null
-            } else {
-                decodePayload(event.dataItem.data) ?: WearTelemetryStore.latest()
-            }
-            updateTelemetry(updated)
-        }
-    }
-
-    private fun updateTelemetry(value: WearTelemetryState?) {
-        WearTelemetryStore.update(value)
-        WearOngoingActivity.sync(this, value, System.currentTimeMillis())
     }
 
     private fun syncOngoingActivity() {
@@ -153,9 +144,7 @@ class MainActivity : FragmentActivity(), DataClient.OnDataChangedListener, Ambie
         )
     }
 
-    private fun decodePayload(bytes: ByteArray?): WearTelemetryState? = bytes?.let { payload ->
-        runCatching { WearTelemetryState.decode(payload) }.getOrNull()
-    }
+    private fun decodePayload(bytes: ByteArray?): WearTelemetryState? = decodeWearTelemetry(bytes)
 }
 
 internal object WearTelemetryStore {
@@ -219,17 +208,38 @@ internal object WearAmbientState {
     var ambientFrame by mutableIntStateOf(0)
 }
 
+internal object WearDisplayPreferences {
+    fun keepScreenAwake(context: Context): Boolean = preferences(context)
+        .getBoolean(KEY_KEEP_SCREEN_AWAKE, false)
+
+    fun setKeepScreenAwake(context: Context, enabled: Boolean) {
+        preferences(context).edit().putBoolean(KEY_KEEP_SCREEN_AWAKE, enabled).apply()
+    }
+
+    private fun preferences(context: Context) = context.applicationContext.getSharedPreferences(
+        PREFERENCES_NAME,
+        Context.MODE_PRIVATE,
+    )
+
+    private const val PREFERENCES_NAME = "wear_display_preferences"
+    private const val KEY_KEEP_SCREEN_AWAKE = "keep_screen_awake_during_ride"
+}
+
 @Composable
 private fun RidersHubWearApp(
     telemetry: WearTelemetryState?,
 ) {
+    val context = LocalContext.current
+    val activity = LocalActivity.current
     val ambient = WearAmbientState.isAmbient
     val burnInRequired = WearAmbientState.isBurnInProtectionRequired
     val ambientFrame = WearAmbientState.ambientFrame
     var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var keepScreenAwake by remember {
+        mutableStateOf(WearDisplayPreferences.keepScreenAwake(context))
+    }
 
-    val keepScreenOn = shouldKeepRideVisible(telemetry, nowEpochMs)
-    val activity = LocalContext.current as? Activity
+    val keepScreenOn = shouldKeepScreenOn(keepScreenAwake, telemetry, nowEpochMs)
     DisposableEffect(keepScreenOn) {
         if (keepScreenOn) {
             activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -255,6 +265,12 @@ private fun RidersHubWearApp(
     } else {
         0 to 0
     }
+    val pagerState = rememberPagerState(pageCount = { 2 })
+    val pagerScope = rememberCoroutineScope()
+
+    LaunchedEffect(ambient) {
+        if (ambient) pagerState.scrollToPage(DASHBOARD_PAGE)
+    }
 
     MaterialTheme {
         Box(
@@ -263,21 +279,158 @@ private fun RidersHubWearApp(
                 .background(RidersBlack),
             contentAlignment = Alignment.Center,
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .offset(x = burnInOffset.first.dp, y = burnInOffset.second.dp)
-                    .padding(horizontal = 24.dp, vertical = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = if (ambient) Arrangement.Center else Arrangement.Top,
-            ) {
-                if (ambient) {
-                    AmbientDashboard(uiState)
+            if (ambient) {
+                DashboardPage(uiState, ambient = true, burnInOffset)
+            } else {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxSize(),
+                ) { page ->
+                    when (page) {
+                        DASHBOARD_PAGE -> DashboardPage(uiState, ambient = false, 0 to 0)
+                        else -> DisplaySettingsPage(
+                            keepScreenAwake = keepScreenAwake,
+                            onToggle = { enabled ->
+                                keepScreenAwake = enabled
+                                WearDisplayPreferences.setKeepScreenAwake(context, enabled)
+                            },
+                        )
+                    }
+                }
+                if (pagerState.currentPage == DASHBOARD_PAGE) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .size(38.dp)
+                            .clickable {
+                                pagerScope.launch { pagerState.animateScrollToPage(SETTINGS_PAGE) }
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_settings),
+                            contentDescription = "Display settings",
+                            tint = RidersMuted,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
                 } else {
-                    InteractiveDashboard(uiState)
+                    PageIndicator(
+                        selectedPage = pagerState.currentPage,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 8.dp),
+                    )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun DashboardPage(
+    uiState: WearUiState,
+    ambient: Boolean,
+    burnInOffset: Pair<Int, Int>,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .offset(x = burnInOffset.first.dp, y = burnInOffset.second.dp)
+            .padding(horizontal = 24.dp, vertical = 14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = if (ambient) Arrangement.Center else Arrangement.Top,
+    ) {
+        if (ambient) {
+            AmbientDashboard(uiState)
+        } else {
+            InteractiveDashboard(uiState)
+        }
+    }
+}
+
+@Composable
+private fun DisplaySettingsPage(
+    keepScreenAwake: Boolean,
+    onToggle: (Boolean) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 30.dp, vertical = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_settings),
+            contentDescription = null,
+            tint = RidersMuted,
+            modifier = Modifier.size(26.dp),
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            text = "RIDE DISPLAY",
+            color = RidersMuted,
+            fontFamily = RidersMono,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.2.sp,
+        )
+        Spacer(Modifier.height(13.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(RidersLine, RoundedCornerShape(18.dp))
+                .clickable { onToggle(!keepScreenAwake) }
+                .padding(horizontal = 18.dp, vertical = 13.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = if (keepScreenAwake) "LIVE SCREEN" else "AMBIENT",
+                color = if (keepScreenAwake) RidersWhite else RidersAmbient,
+                fontFamily = RidersMono,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Black,
+                letterSpacing = 0.8.sp,
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = if (keepScreenAwake) {
+                    "LIVE DATA STAYS ON\nUSES MORE BATTERY"
+                } else {
+                    "DIMS AFTER TIMEOUT\nUPDATES EACH MINUTE"
+                },
+                color = RidersMuted,
+                fontFamily = RidersMono,
+                fontSize = 8.sp,
+                lineHeight = 11.sp,
+                letterSpacing = 0.6.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PageIndicator(
+    selectedPage: Int,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        repeat(2) { page ->
+            Box(
+                Modifier
+                    .size(if (page == selectedPage) 5.dp else 4.dp)
+                    .background(
+                        if (page == selectedPage) RidersMuted else RidersLine,
+                        CircleShape,
+                    ),
+            )
         }
     }
 }
@@ -384,6 +537,12 @@ internal fun ambientBurnInOffset(frame: Int): Pair<Int, Int> = when (Math.floorM
     else -> -2 to 2
 }
 
+internal fun shouldKeepScreenOn(
+    enabled: Boolean,
+    telemetry: WearTelemetryState?,
+    nowEpochMs: Long,
+): Boolean = enabled && shouldKeepRideVisible(telemetry, nowEpochMs)
+
 @Composable
 private fun WearMetric(
     label: String,
@@ -452,3 +611,5 @@ internal fun wearUiState(telemetry: WearTelemetryState?, nowEpochMs: Long): Wear
 }
 
 private const val LIVE_FRESHNESS_MS = 30_000L
+private const val DASHBOARD_PAGE = 0
+private const val SETTINGS_PAGE = 1
