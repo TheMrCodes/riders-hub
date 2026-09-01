@@ -37,7 +37,7 @@ permission or foreground-service type, and the app never calls
 The Ongoing Activity exists only while telemetry describes a recent active
 ride:
 
-- `LIVE` and `RECONNECTING` states are eligible;
+- `CONNECTING`, `LIVE`, and `RECONNECTING` states are eligible;
 - `STANDBY`, missing telemetry, and telemetry older than two minutes are not;
 - notification updates are limited to once per minute;
 - the notification has a 150-second timeout as a final stale-state safeguard.
@@ -83,6 +83,24 @@ discard an older bootstrap result if a newer listener update already arrived
 This design also lets a phone update reach the listener while the dashboard is
 backgrounded. The watch stores only the latest privacy-minimized payload, not a
 second telemetry history.
+
+### Optional automatic trip opening
+
+The side settings page includes **Auto open**, enabled by default. The watch
+publishes this one boolean setting to the paired phone through a separate Data
+Layer path. When enabled, the phone requests the watch dashboard on the first
+CRC-valid `LIVE` frame of each new logical ride using AndroidX
+`RemoteActivityHelper` and the app's browsable `ridershub://ride` deep link.
+
+The phone stores only a truncated hash of the local session reference to ensure
+that one ride cannot open the dashboard twice. It also marks the first live
+frame as seen while Auto open is disabled, so enabling the setting during a ride
+applies to the next ride instead of interrupting the current one.
+
+Remote opening is an initial convenience, not lifecycle protection. If the
+watch is unreachable or the platform declines the request, telemetry still
+arrives normally and the Ongoing Activity remains the reliable, one-tap return
+surface. No foreground service is introduced.
 
 ### When to revisit the decision
 
@@ -164,6 +182,14 @@ The decisions above rely on these components:
   prevents older bootstrap data from replacing it.
 - `WearOngoingActivity` owns the recent-ride eligibility and notification
   lifecycle.
+- `WearSettingsPublisher` sends the Auto open preference to the phone, and the
+  phone's `WearSettingsListenerService` stores it locally.
+- `WearRemoteLauncher` recognizes the first valid live frame once per ride and
+  requests the dashboard through the platform remote-activity API.
+
+The dashboard and settings remain two horizontally swiped pages. A compact page
+indicator is shown on both pages; the old tappable settings icon overlay was
+removed from the dashboard so it cannot cover ride information.
 
 Unit tests should continue to cover ambient buffering, burn-in offset rotation,
 recent-ride eligibility, keep-screen-on gating, persistence round-trips, and
@@ -176,3 +202,4 @@ facility and must not be present in release artifacts.
 - [Always-on apps and system ambient mode](https://developer.android.com/training/wearables/always-on)
 - [Foreground services overview](https://developer.android.com/develop/background-work/services/fgs)
 - [Restrictions on starting a foreground service from the background](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)
+- [RemoteActivityHelper](https://developer.android.com/reference/androidx/wear/remote/interactions/RemoteActivityHelper)

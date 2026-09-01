@@ -15,30 +15,37 @@ internal class WearTelemetryPublisher(
     private val applicationContext = context.applicationContext
     private val dataClient by lazy { Wearable.getDataClient(applicationContext) }
     private val rideStore by lazy { RideStore.get(applicationContext) }
+    private val remoteLauncher by lazy { WearRemoteLauncher(applicationContext) }
     private var lastLivePublishAtMs = 0L
 
     @Synchronized
     fun publish(snapshot: AppSnapshot, force: Boolean) {
         val now = clock()
+        val telemetryWithoutRange = snapshot.toWearTelemetryState(now)
+        remoteLauncher.onTelemetry(snapshot, telemetryWithoutRange)
         if (!force && lastLivePublishAtMs != 0L && now - lastLivePublishAtMs < LIVE_UPDATE_INTERVAL_MS) {
             return
         }
         lastLivePublishAtMs = now
-        val restingVoltage = snapshot.packVoltageV
-            ?.takeIf { (snapshot.speedKmh ?: Float.MAX_VALUE) <= 0.5f }
-            ?.toDouble()
-        val estimatedRangeKm = runCatching {
-            rideStore.snapshot(snapshot.boardBatteryPercent, restingVoltage)
-                .rangeEstimate
-                .remainingKm
-        }.getOrNull()
+        val telemetry = telemetryWithoutRange.copy(estimatedRangeKm = estimatedRangeKm(snapshot))
         val request = PutDataRequest.create(WearTelemetryState.DATA_PATH)
-            .setData(snapshot.toWearTelemetryState(now, estimatedRangeKm).encode())
+            .setData(telemetry.encode())
             .setUrgent()
         runCatching { dataClient.putDataItem(request) }
             // A phone without the Wearable Play services API remains fully supported.
             .getOrNull()
             ?.addOnFailureListener { /* The next state change retries synchronization. */ }
+    }
+
+    private fun estimatedRangeKm(snapshot: AppSnapshot): Double? {
+        val restingVoltage = snapshot.packVoltageV
+            ?.takeIf { (snapshot.speedKmh ?: Float.MAX_VALUE) <= 0.5f }
+            ?.toDouble()
+        return runCatching {
+            rideStore.snapshot(snapshot.boardBatteryPercent, restingVoltage)
+                .rangeEstimate
+                .remainingKm
+        }.getOrNull()
     }
 
     companion object {

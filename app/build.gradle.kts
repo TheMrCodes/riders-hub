@@ -61,6 +61,7 @@ dependencies {
 
     implementation(project(":wear-shared"))
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
+    implementation("androidx.wear:wear-remote-interactions:1.2.0")
 
     // Home Assistant mobile_app webhook payload encryption (XSalsa20-Poly1305).
     implementation("com.goterl:lazysodium-android:5.2.0@aar")

@@ -2,7 +2,9 @@ package at.themrcodes.ridershub
 
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WearTelemetryPublisherTest {
@@ -51,6 +53,55 @@ class WearTelemetryPublisherTest {
         ).toWearTelemetryState(nowEpochMs = 123_000)
 
         assertEquals(WearConnectionStatus.RECONNECTING, payload.connection)
+    }
+
+    @Test
+    fun autoOpenRequiresTheFirstValidLiveFrameOfANewSession() {
+        assertTrue(
+            shouldAutoOpenWearDashboard(
+                enabled = true,
+                connection = WearConnectionStatus.LIVE,
+                hasValidFrame = true,
+                sessionToken = "new-session",
+                lastSeenLiveSession = "old-session",
+            ),
+        )
+        assertFalse(
+            shouldAutoOpenWearDashboard(
+                enabled = false,
+                connection = WearConnectionStatus.LIVE,
+                hasValidFrame = true,
+                sessionToken = "new-session",
+                lastSeenLiveSession = "old-session",
+            ),
+        )
+        assertFalse(
+            shouldAutoOpenWearDashboard(
+                enabled = true,
+                connection = WearConnectionStatus.CONNECTING,
+                hasValidFrame = true,
+                sessionToken = "new-session",
+                lastSeenLiveSession = "old-session",
+            ),
+        )
+        assertFalse(
+            shouldAutoOpenWearDashboard(
+                enabled = true,
+                connection = WearConnectionStatus.LIVE,
+                hasValidFrame = false,
+                sessionToken = "new-session",
+                lastSeenLiveSession = "old-session",
+            ),
+        )
+        assertFalse(
+            shouldAutoOpenWearDashboard(
+                enabled = true,
+                connection = WearConnectionStatus.LIVE,
+                hasValidFrame = true,
+                sessionToken = "same-session",
+                lastSeenLiveSession = "same-session",
+            ),
+        )
     }
 
     private fun snapshot(

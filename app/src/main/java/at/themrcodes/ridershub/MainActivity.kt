@@ -710,9 +710,9 @@ private fun CurrentTripWidget(
 private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) {
     val collecting = estimate.status == RangeEstimateStatus.COLLECTING_DATA
     val subtitle = when (estimate.status) {
-        RangeEstimateStatus.COLLECTING_DATA -> "A short ride is enough to get started"
-        RangeEstimateStatus.PROVISIONAL -> "An early estimate from your rides"
-        RangeEstimateStatus.CALIBRATED -> "Calibrated to your riding"
+        RangeEstimateStatus.COLLECTING_DATA -> "Building a 5% battery-use window"
+        RangeEstimateStatus.PROVISIONAL -> "Based on your recent riding pattern"
+        RangeEstimateStatus.CALIBRATED -> "Calibrated to your latest 100 km"
     }
     Column(modifier) {
         SectionTitle("Range", subtitle)
@@ -736,12 +736,7 @@ private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) 
         Spacer(Modifier.height(16.dp))
         RangeScale(estimate.confidencePercent / 100f)
         Spacer(Modifier.height(16.dp))
-        val explanation = if (collecting) {
-            "Ride 1 km and use 2% battery to unlock an estimate."
-        } else {
-            estimate.message
-        }
-        NothingText(explanation, color = NothingMuted, size = 11, lineHeight = 17)
+        NothingText(estimate.message, color = NothingMuted, size = 11, lineHeight = 17)
     }
 }
 

@@ -27,6 +27,7 @@ data class RideSummary(
     val logFile: String,
     val active: Boolean,
     val speedBucketDistancesKm: Map<Int, Double> = emptyMap(),
+    val localBoardId: String? = null,
 ) {
     val isTrack: Boolean
         get() = distanceKm >= 0.02 || movingSeconds >= 10.0
@@ -89,4 +90,6 @@ data class RangeEstimate(
     val observedDistanceKm: Double,
     val observedDepletionPercent: Double,
     val message: String,
+    val bucketBatteryPercentPer100Km: Map<Int, Double> = emptyMap(),
+    val commonSpeedBucketDistributionPercent: Map<Int, Double> = emptyMap(),
 )

@@ -29,4 +29,24 @@ class GeneralSettingsTest {
         assertFalse(shouldNotifyLowBoardBattery(21, 40.0, 20))
         assertFalse(shouldNotifyLowBoardBattery(20, 0.0, 20))
     }
+
+    @Test
+    fun rideEndReminderUsesATwoHourCooldown() {
+        val now = 10 * LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS
+
+        assertTrue(shouldNotifyLowBatteryRideEndReminder(null, now))
+        assertFalse(
+            shouldNotifyLowBatteryRideEndReminder(
+                now - LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS + 1,
+                now,
+            ),
+        )
+        assertTrue(
+            shouldNotifyLowBatteryRideEndReminder(
+                now - LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS,
+                now,
+            ),
+        )
+        assertFalse(shouldNotifyLowBatteryRideEndReminder(now + 1, now))
+    }
 }

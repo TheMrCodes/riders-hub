@@ -82,4 +82,23 @@ class WearTelemetryContractTest {
         assertEquals(null, decoded.estimatedRangeKm)
         assertEquals(4.25, decoded.tripKm!!, 0.001)
     }
+
+    @Test
+    fun wearSettingsRoundTrip() {
+        assertEquals(
+            WearSettingsState(autoOpenOnLive = true),
+            WearSettingsState.decode(WearSettingsState(autoOpenOnLive = true).encode()),
+        )
+        assertEquals(
+            WearSettingsState(autoOpenOnLive = false),
+            WearSettingsState.decode(WearSettingsState(autoOpenOnLive = false).encode()),
+        )
+    }
+
+    @Test
+    fun invalidWearSettingsAreRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            WearSettingsState.decode(byteArrayOf(1, 2))
+        }
+    }
 }

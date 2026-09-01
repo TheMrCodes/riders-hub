@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
+import at.themrcodes.ridershub.BatteryWarningNotifier
 import at.themrcodes.ridershub.homeassistant.HomeAssistantIntegration
 import at.themrcodes.ridershub.log.JsonlSessionLog
 import at.themrcodes.ridershub.log.TelemetryArchive
@@ -40,6 +41,10 @@ class RideStore private constructor(private val context: Context) {
             }
         }
     private var history: MutableList<RideSummary> = readSummaryArray(KEY_HISTORY)
+    private var activeRangeWindows: MutableMap<String, RangeDepletionWindow> =
+        readRangeWindowArray(KEY_ACTIVE_RANGE_WINDOWS).associateBy { it.localBoardId }.toMutableMap()
+    private var completedRangeWindows: MutableList<RangeDepletionWindow> =
+        readRangeWindowArray(KEY_COMPLETED_RANGE_WINDOWS)
     private var lastCompletedRide: RideSummary? = preferences.getString(KEY_LAST_COMPLETED_RIDE, null)
         ?.let { encoded -> runCatching { summaryFromJson(JSONObject(encoded)) }.getOrNull() }
     private var calibrationPoints: MutableList<CalibrationPoint> = readCalibrationPoints()
@@ -70,6 +75,7 @@ class RideStore private constructor(private val context: Context) {
         }
         stored.pendingFinalizeAtMs = null
         stored.segmentOpen = true
+        seedRangeCalibrationHistoryLocked(stored.localBoardId)
         if (resumable) {
             stored.summary = stored.summary.copy(
                 segmentCount = stored.summary.segmentCount + 1,
@@ -107,6 +113,8 @@ class RideStore private constructor(private val context: Context) {
             var distance = summary.distanceKm
             var movingSeconds = summary.movingSeconds
             var speedBucketDistances = summary.speedBucketDistancesKm
+            var intervalDistanceKm = 0.0
+            var intervalSpeedKmh: Double? = null
             val previousAt = stored.lastFrameEpochMs
             val previousSpeed = stored.lastSpeedKmh
             if (previousAt != null && previousSpeed != null) {
@@ -114,7 +122,8 @@ class RideStore private constructor(private val context: Context) {
                 if (elapsedMs in 1..MAX_DISTANCE_INTEGRATION_GAP_MS) {
                     val elapsedSeconds = elapsedMs / 1000.0
                     val averageSpeedKmh = (previousSpeed + frame.speedKmh) / 2.0
-                    val intervalDistanceKm = averageSpeedKmh * elapsedSeconds / 3600.0
+                    intervalDistanceKm = averageSpeedKmh * elapsedSeconds / 3600.0
+                    intervalSpeedKmh = averageSpeedKmh
                     distance += intervalDistanceKm
                     speedBucketDistances = addSpeedBucketDistance(
                         distancesKm = speedBucketDistances,
@@ -171,6 +180,16 @@ class RideStore private constructor(private val context: Context) {
             if (battery != null && restingVoltage != null) {
                 maybeAddCalibrationPointLocked(wallTime, battery, restingVoltage, stored)
             }
+            if (boardTelemetryValid) {
+                recordRangeCalibrationLocked(
+                    localBoardId = stored.localBoardId,
+                    batteryPercent = requireNotNull(battery),
+                    observedAt = wallTime.toString(),
+                    distanceKm = intervalDistanceKm,
+                    speedKmh = intervalSpeedKmh,
+                    allowRechargeReset = firstBoardFrame,
+                )
+            }
         }
 
         stored.summary = summary
@@ -183,7 +202,15 @@ class RideStore private constructor(private val context: Context) {
                 RangeEstimator.estimate(
                     currentBatteryPercent = summary.boardBatteryEnd,
                     currentRestingVoltageV = summary.restingVoltageEnd,
-                    sessions = rangeEstimationSessions(history.filter { it.isTrack }, summary),
+                    depletionWindows = completedRangeWindows.filter {
+                        it.localBoardId == stored.localBoardId
+                    },
+                    profileSessions = rangeEstimationSessions(
+                        history.filter {
+                            it.isTrack && it.localBoardId == stored.localBoardId
+                        },
+                        summary,
+                    ),
                     calibrationPoints = calibrationPoints,
                 )
             }
@@ -222,7 +249,16 @@ class RideStore private constructor(private val context: Context) {
     ): RideStoreSnapshot = synchronized(LOCK) {
         finalizeExpiredLocked(System.currentTimeMillis())
         val tracks = history.filter { it.isTrack }.sortedByDescending { it.startedAt }
-        val rangeSessions = rangeEstimationSessions(tracks, active?.summary)
+        val rangeBoardId = active?.localBoardId
+            ?: lastCompletedRide?.localBoardId
+            ?: completedRangeWindows.maxByOrNull { it.lastObservedAt }?.localBoardId
+            ?: activeRangeWindows.values.maxByOrNull { it.lastObservedAt }?.localBoardId
+        val scopedTracks = rangeBoardId?.let { boardId ->
+            tracks.filter { it.localBoardId == boardId }.ifEmpty {
+                tracks.filter { it.localBoardId == null }
+            }
+        } ?: tracks
+        val rangeSessions = rangeEstimationSessions(scopedTracks, active?.summary)
         val chargeCycleSnapshot = ChargeCycleStoreSnapshot(
             activeCycles = activeChargeCycles.values.sortedByDescending { it.lastObservedAt },
             completedCycles = completedChargeCycles.sortedByDescending { it.closedAt },
@@ -234,7 +270,8 @@ class RideStore private constructor(private val context: Context) {
             rangeEstimate = RangeEstimator.estimate(
                 currentBatteryPercent = currentBatteryPercent,
                 currentRestingVoltageV = currentRestingVoltageV,
-                sessions = rangeSessions,
+                depletionWindows = completedRangeWindows.filter { it.localBoardId == rangeBoardId },
+                profileSessions = rangeSessions,
                 calibrationPoints = calibrationPoints.toList(),
             ),
             reconnectGraceEndsAt = active?.pendingFinalizeAtMs?.let {
@@ -254,7 +291,11 @@ class RideStore private constructor(private val context: Context) {
     private fun finalizeLocked(reason: String, nowEpochMs: Long): RideSummary? {
         val stored = active ?: return null
         val endedAt = stored.summary.lastFrameAt ?: Instant.ofEpochMilli(nowEpochMs).toString()
-        var completed = stored.summary.copy(endedAt = endedAt, active = false)
+        var completed = stored.summary.copy(
+            endedAt = endedAt,
+            active = false,
+            localBoardId = stored.localBoardId,
+        )
         val jsonlFile = File(completed.logFile)
         JsonlSessionLog.appendSessionEnd(
             file = jsonlFile,
@@ -274,7 +315,11 @@ class RideStore private constructor(private val context: Context) {
         var chargeCycleId = activeChargeCycles[stored.localBoardId]?.id
         if (completed.isTrack) {
             history.add(0, completed)
-            history = history.distinctBy { it.id }.take(MAX_STORED_TRACKS).toMutableList()
+            history = retainRangeProfileHistory(
+                newestFirst = history.distinctBy { it.id },
+                targetDistanceKm = RANGE_PROFILE_DISTANCE_KM,
+                maxCount = MAX_STORED_TRACKS,
+            ).toMutableList()
             chargeCycleId = recordChargeCycleLocked(completed, stored.localBoardId) ?: chargeCycleId
             voltageHistory.recordRide(
                 localBoardId = stored.localBoardId,
@@ -287,11 +332,24 @@ class RideStore private constructor(private val context: Context) {
         active = null
         cancelFinalizationAlarm()
         persistLocked(force = true)
+        if (completed.boardBatteryEnd != null && completed.packVoltageEnd != null) {
+            BatteryWarningNotifier(context).maybeNotifyBoardAtRideEnd(
+                sessionId = completed.id,
+                batteryPercent = completed.boardBatteryEnd,
+                packVoltageV = completed.packVoltageEnd,
+                nowEpochMs = nowEpochMs,
+            )
+        }
         if (completed.boardBatteryStart != null && completed.packVoltageStart != null) {
             val rangeEstimate = RangeEstimator.estimate(
                 currentBatteryPercent = completed.boardBatteryEnd,
                 currentRestingVoltageV = completed.restingVoltageEnd,
-                sessions = history.filter { it.isTrack },
+                depletionWindows = completedRangeWindows.filter {
+                    it.localBoardId == stored.localBoardId
+                },
+                profileSessions = history.filter {
+                    it.isTrack && it.localBoardId == stored.localBoardId
+                },
                 calibrationPoints = calibrationPoints,
             )
             HomeAssistantIntegration.get(context).onRideEnded(completed, rangeEstimate)
@@ -330,6 +388,67 @@ class RideStore private constructor(private val context: Context) {
                 .toMutableList()
         }
         return update.activeCycle.id
+    }
+
+    private fun recordRangeCalibrationLocked(
+        localBoardId: String,
+        batteryPercent: Int,
+        observedAt: String,
+        distanceKm: Double,
+        speedKmh: Double?,
+        allowRechargeReset: Boolean,
+    ) {
+        val speedBuckets = if (speedKmh != null && distanceKm > 0.0) {
+            mapOf(speedBucketStartKmh(speedKmh) to distanceKm)
+        } else {
+            emptyMap()
+        }
+        val update = RangeCalibrationTracker.observe(
+            current = activeRangeWindows[localBoardId],
+            localBoardId = localBoardId,
+            batteryPercent = batteryPercent,
+            observedAt = observedAt,
+            distanceKm = distanceKm,
+            speedBucketDistancesKm = speedBuckets,
+            allowRechargeReset = allowRechargeReset,
+        ) ?: return
+        activeRangeWindows[localBoardId] = update.activeWindow
+        update.completedWindow?.let { completed ->
+            completedRangeWindows.add(0, completed)
+            completedRangeWindows = completedRangeWindows
+                .distinctBy { it.id }
+                .take(MAX_STORED_RANGE_WINDOWS)
+                .toMutableList()
+        }
+    }
+
+    private fun seedRangeCalibrationHistoryLocked(localBoardId: String) {
+        if (
+            activeRangeWindows.containsKey(localBoardId) ||
+            completedRangeWindows.any { it.localBoardId == localBoardId }
+        ) return
+        val knownBoardIds = activeChargeCycles.keys + completedChargeCycles.map { it.localBoardId }
+        if (knownBoardIds.isNotEmpty() && localBoardId !in knownBoardIds) return
+        if (knownBoardIds.isEmpty() || knownBoardIds.all { it == localBoardId }) {
+            history = history.map { ride ->
+                if (ride.localBoardId == null) ride.copy(localBoardId = localBoardId) else ride
+            }.toMutableList()
+        }
+        val seedHistory = history.filter { it.localBoardId == localBoardId }
+        if (seedHistory.isEmpty()) return
+
+        var current: RangeDepletionWindow? = null
+        seedHistory.asReversed().filter { it.isTrack }.forEach { ride ->
+            val update = RangeCalibrationTracker.observeRide(current, localBoardId, ride)
+                ?: return@forEach
+            current = update.activeWindow
+            update.completedWindow?.let { completedRangeWindows.add(0, it) }
+        }
+        current?.let { activeRangeWindows[localBoardId] = it }
+        completedRangeWindows = completedRangeWindows
+            .distinctBy { it.id }
+            .take(MAX_STORED_RANGE_WINDOWS)
+            .toMutableList()
     }
 
     private fun archivePreviouslyFinalizedLogs() {
@@ -387,6 +506,7 @@ class RideStore private constructor(private val context: Context) {
         val directory = (context.getExternalFilesDir("telemetry")
             ?: File(context.filesDir, "telemetry")).also { it.mkdirs() }
         val path = File(directory, "${id}_${identity}.jsonl").absolutePath
+        val localBoardId = pseudonymousBoardId(address)
         return StoredRide(
             summary = RideSummary(
                 id = id,
@@ -414,10 +534,11 @@ class RideStore private constructor(private val context: Context) {
                 modes = emptySet(),
                 logFile = path,
                 active = true,
+                localBoardId = localBoardId,
             ),
             deviceAddress = address,
             deviceName = name,
-            localBoardId = pseudonymousBoardId(address),
+            localBoardId = localBoardId,
             startedAtEpochMs = now,
             segmentOpen = true,
         )
@@ -437,6 +558,14 @@ class RideStore private constructor(private val context: Context) {
             }
             .putString(KEY_HISTORY, JSONArray(history.map { it.toJson() }).toString())
             .putString(KEY_CALIBRATION, JSONArray(calibrationPoints.map { it.toJson() }).toString())
+            .putString(
+                KEY_ACTIVE_RANGE_WINDOWS,
+                JSONArray(activeRangeWindows.values.map { it.toJson() }).toString(),
+            )
+            .putString(
+                KEY_COMPLETED_RANGE_WINDOWS,
+                JSONArray(completedRangeWindows.map { it.toJson() }).toString(),
+            )
             .putString(
                 KEY_ACTIVE_CHARGE_CYCLES,
                 JSONArray(activeChargeCycles.values.map { it.toJson() }).toString(),
@@ -462,6 +591,13 @@ class RideStore private constructor(private val context: Context) {
                 batteryPercent = value.getInt("battery_percent"),
                 restingVoltageV = value.getDouble("resting_voltage_v"),
             )
+        }
+    }.getOrDefault(mutableListOf())
+
+    private fun readRangeWindowArray(key: String): MutableList<RangeDepletionWindow> = runCatching {
+        val array = JSONArray(preferences.getString(key, "[]") ?: "[]")
+        MutableList(array.length()) { index ->
+            rangeDepletionWindowFromJson(array.getJSONObject(index))
         }
     }.getOrDefault(mutableListOf())
 
@@ -549,6 +685,8 @@ class RideStore private constructor(private val context: Context) {
         private const val KEY_LAST_COMPLETED_RIDE = "last_completed_ride"
         private const val KEY_HISTORY = "ride_history"
         private const val KEY_CALIBRATION = "calibration_points"
+        private const val KEY_ACTIVE_RANGE_WINDOWS = "active_range_windows_v1"
+        private const val KEY_COMPLETED_RANGE_WINDOWS = "completed_range_windows_v1"
         private const val KEY_ACTIVE_CHARGE_CYCLES = "active_charge_cycles_v1"
         private const val KEY_COMPLETED_CHARGE_CYCLES = "completed_charge_cycles_v1"
         private const val MAX_DISTANCE_INTEGRATION_GAP_MS = 2_000L
@@ -557,7 +695,9 @@ class RideStore private constructor(private val context: Context) {
         private const val PERSIST_INTERVAL_MS = 5_000L
         private const val CALIBRATION_INTERVAL_MS = 10 * 60_000L
         private const val MAX_CALIBRATION_POINTS = 500
-        private const val MAX_STORED_TRACKS = 100
+        private const val MAX_STORED_TRACKS = 1_000
+        private const val RANGE_PROFILE_DISTANCE_KM = 100.0
+        private const val MAX_STORED_RANGE_WINDOWS = 500
         private const val MAX_STORED_CHARGE_CYCLES = 500
         private const val MAX_VISIBLE_TRACKS = 30
         private const val FINALIZATION_REQUEST_CODE = 8102
@@ -571,6 +711,22 @@ class RideStore private constructor(private val context: Context) {
             instance ?: RideStore(context.applicationContext).also { instance = it }
         }
     }
+}
+
+internal fun retainRangeProfileHistory(
+    newestFirst: List<RideSummary>,
+    targetDistanceKm: Double = 100.0,
+    maxCount: Int = 1_000,
+): List<RideSummary> {
+    if (targetDistanceKm <= 0.0 || maxCount <= 0) return emptyList()
+    val retained = mutableListOf<RideSummary>()
+    var retainedDistanceKm = 0.0
+    newestFirst.forEach { ride ->
+        if (retained.size >= maxCount || retainedDistanceKm >= targetDistanceKm) return@forEach
+        retained += ride
+        retainedDistanceKm += ride.distanceKm.coerceAtLeast(0.0)
+    }
+    return retained
 }
 
 internal fun rangeEstimationSessions(
@@ -628,6 +784,7 @@ private fun RideSummary.toJson(): JSONObject = JSONObject()
     )
     .put("log_file", logFile)
     .put("active", active)
+    .putNullable("local_board_id", localBoardId)
 
 private fun summaryFromJson(value: JSONObject): RideSummary = RideSummary(
     id = value.getString("id"),
@@ -665,6 +822,7 @@ private fun summaryFromJson(value: JSONObject): RideSummary = RideSummary(
     } ?: emptyMap(),
     logFile = value.getString("log_file"),
     active = value.optBoolean("active", false),
+    localBoardId = value.optNullableString("local_board_id"),
 )
 
 private fun CalibrationPoint.toJson(): JSONObject = JSONObject()

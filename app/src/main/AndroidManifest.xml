@@ -63,6 +63,18 @@
                 android:value="true" />
         </service>
 
+        <service
+            android:name=".WearSettingsListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
+                <data
+                    android:host="*"
+                    android:path="/riders-hub/wear-settings"
+                    android:scheme="wear" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".session.RideFinalizationReceiver"
             android:exported="false" />

@@ -96,9 +96,10 @@ lock, or permanent foreground notification running in the background.
 
 **Range** estimates the kilometres remaining at the current battery level. Its
 bar shows how much useful ride data supports the estimate—not battery level or
-distance. An estimate appears after 1 km and 2% battery use and becomes
-**Ready** after 5 km and 10%. Speed buckets help adapt it to the current riding
-style.
+distance. An estimate appears after a usable 5% battery-depletion window and at
+least 1 km, and becomes **Ready** after 20 km and 10%. Between rides it uses the
+common speed-bucket distribution of the latest 100 km; during a ride it adapts
+to that ride's accumulated speed mix.
 
 **Battery Longevity** compares speed-normalized kilometres per full charge over
 inferred charging cycles. It needs at least 0.5 km and 5% battery use for a data

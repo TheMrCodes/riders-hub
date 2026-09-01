@@ -7,11 +7,12 @@ import org.junit.Test
 
 class RangeEstimatorTest {
     @Test
-    fun collectsDataWithoutEnoughDepletion() {
+    fun collectsDataUntilTheFirstFivePercentWindowCompletes() {
         val result = RangeEstimator.estimate(
             currentBatteryPercent = 80,
-            currentRestingVoltageV = 40.0,
-            sessions = listOf(summary(distance = 0.5, startPercent = 80, endPercent = 79)),
+            currentRestingVoltageV = null,
+            depletionWindows = emptyList(),
+            profileSessions = listOf(summary(2.0, mapOf(20 to 2.0))),
             calibrationPoints = emptyList(),
         )
 
@@ -20,64 +21,99 @@ class RangeEstimatorTest {
     }
 
     @Test
-    fun estimatesFromAccumulatedPercentageDrop() {
-        val sessions = listOf(
-            summary(distance = 3.0, startPercent = 90, endPercent = 80),
-            summary(distance = 2.0, startPercent = 80, endPercent = 70),
+    fun estimatesFromCompletedDepletionWindows() {
+        val windows = listOf(
+            window("b", "2030-01-02T10:00:00Z", 3.0, 10, mapOf(20 to 3.0)),
+            window("a", "2030-01-01T10:00:00Z", 2.0, 10, mapOf(20 to 2.0)),
         )
 
-        val result = RangeEstimator.estimate(50, null, sessions, emptyList())
+        val result = RangeEstimator.estimate(
+            currentBatteryPercent = 50,
+            currentRestingVoltageV = null,
+            depletionWindows = windows,
+            profileSessions = listOf(summary(5.0, mapOf(20 to 5.0))),
+            calibrationPoints = emptyList(),
+        )
 
-        assertEquals(RangeEstimateStatus.CALIBRATED, result.status)
+        assertEquals(RangeEstimateStatus.PROVISIONAL, result.status)
         assertEquals(0.25, result.kmPerPercent!!, 0.0001)
         assertEquals(12.5, result.remainingKm!!, 0.0001)
     }
 
     @Test
-    fun restingVoltageCanResolveSubPercentDepletion() {
-        val points = listOf(
-            CalibrationPoint("a", 20, 36.0),
-            CalibrationPoint("b", 40, 37.0),
-            CalibrationPoint("c", 60, 38.0),
-            CalibrationPoint("d", 80, 39.0),
+    fun newestHundredKilometresDetermineTheCommonSpeedMix() {
+        val windows = listOf(
+            window("fast", "2030-01-02T10:00:00Z", 2.0, 5, mapOf(30 to 2.0)),
+            window("slow", "2030-01-01T10:00:00Z", 4.0, 5, mapOf(10 to 4.0)),
         )
         val sessions = listOf(
-            summary(
-                distance = 2.0,
-                startPercent = 60,
-                endPercent = 60,
-                restStart = 38.0,
-                restEnd = 37.5,
-            ),
+            summary(60.0, mapOf(10 to 60.0), id = "new-slow"),
+            summary(80.0, mapOf(30 to 80.0), id = "old-fast"),
         )
 
-        val result = RangeEstimator.estimate(50, 37.5, sessions, points)
+        val result = RangeEstimator.estimate(50, null, windows, sessions, emptyList())
 
-        assertTrue(result.status != RangeEstimateStatus.COLLECTING_DATA)
-        assertEquals(0.2, result.kmPerPercent!!, 0.0001)
+        assertEquals(60.0, result.commonSpeedBucketDistributionPercent.getValue(10), 0.0001)
+        assertEquals(40.0, result.commonSpeedBucketDistributionPercent.getValue(30), 0.0001)
+        val slowUse = result.bucketBatteryPercentPer100Km.getValue(10)
+        val fastUse = result.bucketBatteryPercentPer100Km.getValue(30)
+        assertTrue(fastUse > slowUse)
+        val expectedKmPerPercent = 1.0 / (slowUse / 100.0 * 0.6 + fastUse / 100.0 * 0.4)
+        assertEquals(expectedKmPerPercent, result.kmPerPercent!!, 0.0001)
     }
 
     @Test
-    fun estimatesFromCurrentVisibleRide() {
-        val active = summary(distance = 1.0, startPercent = 80, endPercent = 75)
-            .copy(id = "active", endedAt = null, active = true)
+    fun activeRideSpeedMixAdjustsTheCrossTripBaseline() {
+        val windows = listOf(
+            window("fast", "2030-01-02T10:00:00Z", 2.0, 5, mapOf(30 to 2.0)),
+            window("slow", "2030-01-01T10:00:00Z", 4.0, 5, mapOf(10 to 4.0)),
+        )
+        val historical = summary(20.0, mapOf(10 to 20.0), id = "history")
+        val activeFast = summary(1.0, mapOf(30 to 1.0), id = "active")
+            .copy(active = true, endedAt = null)
+
+        val betweenTrips = RangeEstimator.estimate(
+            50,
+            null,
+            windows,
+            listOf(historical),
+            emptyList(),
+        )
+        val duringFastTrip = RangeEstimator.estimate(
+            50,
+            null,
+            windows,
+            listOf(activeFast, historical),
+            emptyList(),
+        )
+
+        assertTrue(duringFastTrip.remainingKm!! < betweenTrips.remainingKm!!)
+        assertTrue(duringFastTrip.message.startsWith("Adjusted to this trip"))
+    }
+
+    @Test
+    fun depletionModelIsLimitedToNewestHundredKilometres() {
+        val windows = listOf(
+            window("new", "2030-01-02T10:00:00Z", 60.0, 30, mapOf(20 to 60.0)),
+            window("old", "2030-01-01T10:00:00Z", 80.0, 40, mapOf(20 to 80.0)),
+        )
 
         val result = RangeEstimator.estimate(
-            currentBatteryPercent = 75,
-            currentRestingVoltageV = null,
-            sessions = rangeEstimationSessions(emptyList(), active),
-            calibrationPoints = emptyList(),
+            50,
+            null,
+            windows,
+            listOf(summary(100.0, mapOf(20 to 100.0))),
+            emptyList(),
         )
 
-        assertEquals(RangeEstimateStatus.PROVISIONAL, result.status)
-        assertEquals(0.2, result.kmPerPercent!!, 0.0001)
-        assertEquals(15.0, result.remainingKm!!, 0.0001)
+        assertEquals(100.0, result.observedDistanceKm, 0.0001)
+        assertEquals(50.0, result.observedDepletionPercent, 0.0001)
     }
 
     @Test
-    fun currentRideIsNotCountedTwice() {
-        val active = summary(distance = 1.0, startPercent = 80, endPercent = 75)
-            .copy(id = "same-ride", endedAt = null, active = true)
+    fun currentRideIsNotCountedTwiceInSpeedProfile() {
+        val active = summary(1.0, mapOf(20 to 1.0), id = "same-ride")
+            .copy(endedAt = null, active = true)
         val sessions = rangeEstimationSessions(
             completedTracks = listOf(active.copy(active = false)),
             activeRide = active,
@@ -87,72 +123,58 @@ class RangeEstimatorTest {
     }
 
     @Test
-    fun currentHighSpeedMixProducesShorterRangeThanLowSpeedMix() {
-        val history = listOf(
-            summary(
-                distance = 4.0,
-                startPercent = 100,
-                endPercent = 92,
-                speedBuckets = mapOf(10 to 4.0),
-            ),
-            summary(
-                distance = 4.0,
-                startPercent = 92,
-                endPercent = 76,
-                speedBuckets = mapOf(30 to 4.0),
-            ),
-        )
-        val lowSpeedProfile = summary(
-            distance = 0.2,
-            startPercent = 50,
-            endPercent = 50,
-            speedBuckets = mapOf(10 to 0.2),
-        ).copy(id = "active-low", active = true, endedAt = null)
-        val highSpeedProfile = lowSpeedProfile.copy(
-            id = "active-high",
-            speedBucketDistancesKm = mapOf(30 to 0.2),
-        )
+    fun historyRetentionKeepsEnoughRidesForHundredKilometres() {
+        val rides = (1..150).map { index ->
+            summary(1.0, mapOf(20 to 1.0), id = "ride-$index")
+        }
 
-        val lowSpeedRange = RangeEstimator.estimate(
-            50,
-            null,
-            history + lowSpeedProfile,
-            emptyList(),
-        ).remainingKm!!
-        val highSpeedRange = RangeEstimator.estimate(
-            50,
-            null,
-            history + highSpeedProfile,
-            emptyList(),
-        ).remainingKm!!
+        val retained = retainRangeProfileHistory(rides)
 
-        assertTrue(highSpeedRange < lowSpeedRange)
+        assertEquals(100, retained.size)
+        assertEquals("ride-1", retained.first().id)
+        assertEquals("ride-100", retained.last().id)
     }
+
+    private fun window(
+        id: String,
+        closedAt: String,
+        distance: Double,
+        depletion: Int,
+        buckets: Map<Int, Double>,
+    ) = RangeDepletionWindow(
+        id = id,
+        localBoardId = "board-a",
+        startedAt = closedAt,
+        lastObservedAt = closedAt,
+        closedAt = closedAt,
+        startBatteryPercent = 90,
+        endBatteryPercent = 90 - depletion,
+        minBatteryPercent = 90 - depletion,
+        recordedDistanceKm = distance,
+        speedBucketDistancesKm = buckets,
+    )
 
     private fun summary(
         distance: Double,
-        startPercent: Int,
-        endPercent: Int,
-        restStart: Double? = null,
-        restEnd: Double? = null,
-        speedBuckets: Map<Int, Double> = emptyMap(),
+        speedBuckets: Map<Int, Double>,
+        id: String = "ride-$distance",
     ) = RideSummary(
-        id = "ride-$distance-$startPercent",
+        id = id,
         startedAt = "2030-01-01T10:00:00Z",
         endedAt = "2030-01-01T11:00:00Z",
         lastFrameAt = "2030-01-01T11:00:00Z",
         distanceKm = distance,
         movingSeconds = 600.0,
         maxSpeedKmh = 25.0,
-        boardBatteryStart = startPercent,
-        boardBatteryEnd = endPercent,
-        boardBatteryMin = endPercent,
-        packVoltageStart = restStart,
-        packVoltageEnd = restEnd,
-        packVoltageMin = restEnd,
-        packVoltageMax = restStart,
-        restingVoltageStart = restStart,
-        restingVoltageEnd = restEnd,
+        boardBatteryStart = 90,
+        boardBatteryEnd = 85,
+        boardBatteryMin = 85,
+        packVoltageStart = 40.0,
+        packVoltageEnd = 39.0,
+        packVoltageMin = 39.0,
+        packVoltageMax = 40.0,
+        restingVoltageStart = null,
+        restingVoltageEnd = null,
         odometerStartKm = 0.0,
         odometerEndKm = distance,
         frameCount = 100,

@@ -18,6 +18,30 @@ class BatteryWarningNotifier(private val context: Context) {
         val warningPercent = generalSettings.snapshot().lowBatteryWarningPercent
         if (!shouldNotifyLowBoardBattery(batteryPercent, packVoltageV, warningPercent)) return
         if (preferences.getString(KEY_LAST_BOARD_SESSION, null) == sessionId) return
+        notifyBoard(sessionId, batteryPercent, packVoltageV)
+    }
+
+    fun maybeNotifyBoardAtRideEnd(
+        sessionId: String,
+        batteryPercent: Int,
+        packVoltageV: Double,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ) {
+        val warningPercent = generalSettings.snapshot().lowBatteryWarningPercent
+        if (!shouldNotifyLowBoardBattery(batteryPercent, packVoltageV, warningPercent)) return
+        val lastNotificationAtEpochMs = preferences
+            .takeIf { it.contains(KEY_LAST_BOARD_NOTIFICATION_AT) }
+            ?.getLong(KEY_LAST_BOARD_NOTIFICATION_AT, 0L)
+        if (!shouldNotifyLowBatteryRideEndReminder(lastNotificationAtEpochMs, nowEpochMs)) return
+        notifyBoard(sessionId, batteryPercent, packVoltageV, nowEpochMs)
+    }
+
+    private fun notifyBoard(
+        sessionId: String,
+        batteryPercent: Int,
+        packVoltageV: Double,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ) {
         if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) return
@@ -38,12 +62,16 @@ class BatteryWarningNotifier(private val context: Context) {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .build()
         context.getSystemService(NotificationManager::class.java).notify(BOARD_NOTIFICATION_ID, notification)
-        preferences.edit().putString(KEY_LAST_BOARD_SESSION, sessionId).apply()
+        preferences.edit()
+            .putString(KEY_LAST_BOARD_SESSION, sessionId)
+            .putLong(KEY_LAST_BOARD_NOTIFICATION_AT, nowEpochMs)
+            .apply()
     }
 
     companion object {
         private const val CHANNEL_ID = "battery_warning"
         private const val KEY_LAST_BOARD_SESSION = "last_board_warning_session"
+        private const val KEY_LAST_BOARD_NOTIFICATION_AT = "last_board_warning_at"
         private const val BOARD_NOTIFICATION_ID = 2001
 
         fun createChannel(context: Context) {
@@ -58,3 +86,11 @@ class BatteryWarningNotifier(private val context: Context) {
         }
     }
 }
+
+internal fun shouldNotifyLowBatteryRideEndReminder(
+    lastNotificationAtEpochMs: Long?,
+    nowEpochMs: Long,
+): Boolean = lastNotificationAtEpochMs == null ||
+    nowEpochMs - lastNotificationAtEpochMs >= LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS
+
+internal const val LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS = 2 * 60 * 60 * 1_000L

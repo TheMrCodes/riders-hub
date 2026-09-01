@@ -330,25 +330,32 @@ JSONL but do not clutter ride history.
 - Motion time uses those safe intervals with a 1 km/h threshold.
 - Stationary voltage points are sampled at 0.5 km/h or below when percentage
   changes or every ten minutes.
-- A personal voltage-versus-percentage regression can resolve useful depletion
-  below the telemetry field's one-percent resolution.
-- While the dashboard is open, the current logical ride contributes to the
-  provisional range estimate before that ride is finalized.
-- Tracks with complete bucket coverage form equations relating battery
-  depletion to distance in each speed bucket. A regularized non-negative model
-  estimates percentage use per kilometre for each bucket; the active track's
-  speed mix is used for live range, with the aggregate recorded mix as the
-  fallback. Legacy tracks without buckets still contribute to the aggregate
-  fallback and confidence thresholds.
-- The estimate remains **Collecting data** until at least 1 km and 2% useful
-  depletion exist. It is **Calibrated** only after at least 5 km and 10%;
-  between those thresholds it is labelled **Provisional**.
+- Range calibration is board-scoped and accumulates distance across rides until
+  the rounded board battery has fallen by at least five percentage points. A
+  short ride with no displayed percentage change therefore remains part of the
+  active window instead of being discarded. A battery increase of at least five
+  points at the start of a new logical ride resets an incomplete window as an
+  inferred recharge; voltage rebound during one ride does not.
+- Completed 5% windows form equations relating battery depletion to distance in
+  each speed bucket. A regularized non-negative model expresses each bucket as
+  battery percentage consumed per 100 km. This is a percentage-based empirical
+  measure, not measured Wh or battery capacity.
+- The common riding profile is the distance-weighted 5 km/h bucket distribution
+  of the newest 100 km. The remaining-range estimate weights the learned bucket
+  consumption rates by that profile between rides. During an active ride, the
+  forecast instead uses that ride's accumulated bucket mix so it can adapt to
+  the current pace. The oldest boundary ride and depletion window are
+  proportionally trimmed when the rolling window crosses 100 km.
+- Ride retention is distance-based: enough newest tracks to cover 100 km are
+  kept, with a 1,000-track safety cap. Existing history is assigned to a board
+  and used to seed 5% windows only when that association is unambiguous.
+- The estimate remains **Collecting data** until the first usable 5% window and
+  at least 1 km exist. It is **Calibrated** after at least 20 km and 10% observed
+  depletion; between those thresholds it is labelled **Provisional**.
 - The bar below the Range value visualizes estimator readiness, not battery or
   remaining distance. Before an estimate exists, distance progress toward 1 km
-  and depletion progress toward 2% each contribute half. Afterwards, observed
-  distance up to 20 km and depletion up to 30% each contribute half. The status
-  becomes **Ready** at 5 km and 10%, while the bar can continue filling as the
-  evidence base grows.
+  and depletion progress toward 5% each contribute half. Afterwards, observed
+  distance up to 100 km contributes 60% and depletion up to 20% contributes 40%.
 - Efficiencies outside 0.03–1.5 km per percentage point are rejected rather
   than displayed.
 
@@ -411,11 +418,14 @@ a depletion-weighted average when it contains more than one observation.
 ## Battery warnings
 
 With notification permission granted, the app sends one board warning per
-logical session when `board_battery_percent <= 20` and the frame also contains
-a plausible live pack voltage. The known G3 telemetry/API does not expose a
-separately identified remote-battery field, so remote battery is shown as **Not
-decoded** and no remote warning is fabricated. Raw captures should identify
-that field before such an alert is added.
+logical ride when `board_battery_percent` is at or below the configured warning
+threshold and the frame also contains a plausible live pack voltage. When the
+ride is finalized after the reconnect grace period, the final valid board frame
+can produce a second recharge reminder if no board warning was delivered in the
+previous two hours. The known G3 telemetry/API does not expose a separately
+identified remote-battery field, so remote battery is shown as **Not decoded**
+and no remote warning is fabricated. Raw captures should identify that field
+before such an alert is added.
 
 ## Hidden child-limiter control
 

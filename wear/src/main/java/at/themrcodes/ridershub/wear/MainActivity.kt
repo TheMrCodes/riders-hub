@@ -36,7 +36,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,7 +57,6 @@ import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import java.util.Locale
 
 class MainActivity : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvider {
@@ -238,6 +236,13 @@ private fun RidersHubWearApp(
     var keepScreenAwake by remember {
         mutableStateOf(WearDisplayPreferences.keepScreenAwake(context))
     }
+    var autoOpenOnLive by remember {
+        mutableStateOf(WearSettingsPreferences.autoOpenOnLive(context))
+    }
+
+    LaunchedEffect(autoOpenOnLive) {
+        WearSettingsPublisher.publish(context, autoOpenOnLive)
+    }
 
     val keepScreenOn = shouldKeepScreenOn(keepScreenAwake, telemetry, nowEpochMs)
     DisposableEffect(keepScreenOn) {
@@ -266,7 +271,6 @@ private fun RidersHubWearApp(
         0 to 0
     }
     val pagerState = rememberPagerState(pageCount = { 2 })
-    val pagerScope = rememberCoroutineScope()
 
     LaunchedEffect(ambient) {
         if (ambient) pagerState.scrollToPage(DASHBOARD_PAGE)
@@ -290,38 +294,24 @@ private fun RidersHubWearApp(
                         DASHBOARD_PAGE -> DashboardPage(uiState, ambient = false, 0 to 0)
                         else -> DisplaySettingsPage(
                             keepScreenAwake = keepScreenAwake,
-                            onToggle = { enabled ->
+                            autoOpenOnLive = autoOpenOnLive,
+                            onToggleKeepScreenAwake = { enabled ->
                                 keepScreenAwake = enabled
                                 WearDisplayPreferences.setKeepScreenAwake(context, enabled)
                             },
-                        )
-                    }
-                }
-                if (pagerState.currentPage == DASHBOARD_PAGE) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.CenterEnd)
-                            .size(38.dp)
-                            .clickable {
-                                pagerScope.launch { pagerState.animateScrollToPage(SETTINGS_PAGE) }
+                            onToggleAutoOpen = { enabled ->
+                                autoOpenOnLive = enabled
+                                WearSettingsPreferences.setAutoOpenOnLive(context, enabled)
                             },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_settings),
-                            contentDescription = "Display settings",
-                            tint = RidersMuted,
-                            modifier = Modifier.size(17.dp),
                         )
                     }
-                } else {
-                    PageIndicator(
-                        selectedPage = pagerState.currentPage,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 8.dp),
-                    )
                 }
+                PageIndicator(
+                    selectedPage = pagerState.currentPage,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 8.dp),
+                )
             }
         }
     }
@@ -353,7 +343,9 @@ private fun DashboardPage(
 @Composable
 private fun DisplaySettingsPage(
     keepScreenAwake: Boolean,
-    onToggle: (Boolean) -> Unit,
+    autoOpenOnLive: Boolean,
+    onToggleKeepScreenAwake: (Boolean) -> Unit,
+    onToggleAutoOpen: (Boolean) -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -371,7 +363,7 @@ private fun DisplaySettingsPage(
         )
         Spacer(Modifier.height(7.dp))
         Text(
-            text = "RIDE DISPLAY",
+            text = "RIDE SETTINGS",
             color = RidersMuted,
             fontFamily = RidersMono,
             fontSize = 9.sp,
@@ -379,37 +371,61 @@ private fun DisplaySettingsPage(
             letterSpacing = 1.2.sp,
         )
         Spacer(Modifier.height(13.dp))
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(RidersLine, RoundedCornerShape(18.dp))
-                .clickable { onToggle(!keepScreenAwake) }
-                .padding(horizontal = 18.dp, vertical = 13.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = if (keepScreenAwake) "LIVE SCREEN" else "AMBIENT",
-                color = if (keepScreenAwake) RidersWhite else RidersAmbient,
-                fontFamily = RidersMono,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Black,
-                letterSpacing = 0.8.sp,
-            )
-            Spacer(Modifier.height(5.dp))
-            Text(
-                text = if (keepScreenAwake) {
-                    "LIVE DATA STAYS ON\nUSES MORE BATTERY"
-                } else {
-                    "DIMS AFTER TIMEOUT\nUPDATES EACH MINUTE"
-                },
-                color = RidersMuted,
-                fontFamily = RidersMono,
-                fontSize = 8.sp,
-                lineHeight = 11.sp,
-                letterSpacing = 0.6.sp,
-                textAlign = TextAlign.Center,
-            )
-        }
+        SettingsChoice(
+            selected = keepScreenAwake,
+            selectedLabel = "LIVE SCREEN",
+            unselectedLabel = "AMBIENT",
+            selectedDescription = "LIVE DATA STAYS ON\nUSES MORE BATTERY",
+            unselectedDescription = "DIMS AFTER TIMEOUT\nUPDATES EACH MINUTE",
+            onClick = { onToggleKeepScreenAwake(!keepScreenAwake) },
+        )
+        Spacer(Modifier.height(8.dp))
+        SettingsChoice(
+            selected = autoOpenOnLive,
+            selectedLabel = "AUTO OPEN",
+            unselectedLabel = "MANUAL OPEN",
+            selectedDescription = "OPENS ON FIRST\nLIVE FRAME",
+            unselectedDescription = "ONGOING ACTIVITY\nONLY",
+            onClick = { onToggleAutoOpen(!autoOpenOnLive) },
+        )
+    }
+}
+
+@Composable
+private fun SettingsChoice(
+    selected: Boolean,
+    selectedLabel: String,
+    unselectedLabel: String,
+    selectedDescription: String,
+    unselectedDescription: String,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(RidersLine, RoundedCornerShape(18.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 11.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = if (selected) selectedLabel else unselectedLabel,
+            color = if (selected) RidersWhite else RidersAmbient,
+            fontFamily = RidersMono,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Black,
+            letterSpacing = 0.8.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = if (selected) selectedDescription else unselectedDescription,
+            color = RidersMuted,
+            fontFamily = RidersMono,
+            fontSize = 8.sp,
+            lineHeight = 10.sp,
+            letterSpacing = 0.6.sp,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -612,4 +628,3 @@ internal fun wearUiState(telemetry: WearTelemetryState?, nowEpochMs: Long): Wear
 
 private const val LIVE_FRESHNESS_MS = 30_000L
 private const val DASHBOARD_PAGE = 0
-private const val SETTINGS_PAGE = 1
