@@ -14,7 +14,7 @@ data class StoredVoltageCorrelationBin(
     val bin: VoltageCorrelationBin,
 )
 
-/** Local-only durable voltage statistics. Nothing in this database is exported to Home Assistant. */
+/** Local-only durable voltage statistics. Detailed samples are absent from decoded API payloads. */
 class VoltageHistoryStore(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     DATABASE_NAME,

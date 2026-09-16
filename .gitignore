@@ -32,3 +32,6 @@ riders-hub-telemetry/
 local.properties
 *.apk
 *.aab
+
+# Local Python tooling
+__pycache__/

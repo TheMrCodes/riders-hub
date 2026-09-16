@@ -27,6 +27,7 @@ class SyntheticTelemetryReceiver : BroadcastReceiver() {
                 boardBatteryPercent = intent.optionalInt(EXTRA_BATTERY_PERCENT),
                 tripKm = intent.optionalDouble(EXTRA_TRIP_KM),
                 estimatedRangeKm = intent.optionalDouble(EXTRA_ESTIMATED_RANGE_KM),
+                estimatedBatteryPercent = intent.optionalDouble("estimated_battery_percent"),
                 mode = intent.getStringExtra(EXTRA_MODE),
             )
         }.getOrNull() ?: return

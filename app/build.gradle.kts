@@ -1,5 +1,7 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+val oidcRedirectUri = "at.themrcodes.ridershub:/oauth2redirect"
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -14,10 +16,12 @@ android {
         applicationId = "at.themrcodes.ridershub"
         minSdk = 34
         targetSdk = 36
-        versionCode = 19
-        versionName = "0.6.0"
+        versionCode = 23
+        versionName = "0.7.3-test"
 
         testInstrumentationRunner = "android.app.Instrumentation"
+        manifestPlaceholders["appAuthRedirectScheme"] = oidcRedirectUri.substringBefore(':')
+        buildConfigField("String", "OIDC_REDIRECT_URI", "\"$oidcRedirectUri\"")
     }
 
     buildFeatures {
@@ -63,10 +67,15 @@ dependencies {
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
     implementation("androidx.wear:wear-remote-interactions:1.2.0")
 
-    // Home Assistant mobile_app webhook payload encryption (XSalsa20-Poly1305).
-    implementation("com.goterl:lazysodium-android:5.2.0@aar")
-    implementation("net.java.dev.jna:jna:5.17.0@aar")
+    implementation("com.squareup.okhttp3:okhttp:5.3.0")
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
+    implementation("net.openid:appauth:0.11.1")
+    // AppAuth's old transitive browser pin is overridden with the current AndroidX line.
+    implementation("androidx.browser:browser:1.10.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20260719")
+    testImplementation("com.squareup.okhttp3:mockwebserver:5.3.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:5.3.0")
+    testImplementation("org.robolectric:robolectric:4.16.1")
 }

@@ -17,6 +17,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.Base64
 import java.util.zip.CRC32
 import java.util.zip.Deflater
 import java.util.zip.DeflaterOutputStream
@@ -36,6 +37,15 @@ data class TelemetryArchiveReference(
     val encoded: String
         get() = "rha:${File(archiveDirectory, partitionBaseName(partitionSequence)).absolutePath}#$entryId"
 }
+
+data class TelemetryPartitionUpload(
+    val partitionSequence: Int,
+    val generation: Int,
+    val final: Boolean,
+    val file: File,
+    val compressedDigestBase64: String,
+    val uncompressedDigestBase64: String,
+)
 
 /**
  * Direct append-only telemetry partitions with immutable compressed analytics packages.
@@ -142,6 +152,145 @@ class TelemetryArchive(
                 copyEntryPayload(entry, destination)
         } finally {
             temporary.delete()
+        }
+    }
+
+    /** Read verified finalized records without repairing or modifying source partitions. */
+    internal fun forEachFinalizedRecord(directory: File, scratch: File, consume: (JSONObject) -> Unit) =
+        forEachFinalizedRecordLine(directory, scratch) { _, record -> consume(record) }
+
+    /** As above, retaining the exact JSONL bytes for a deterministic replay-source digest. */
+    internal fun forEachFinalizedRecordLine(
+        directory: File,
+        scratch: File,
+        consume: (String, JSONObject) -> Unit,
+    ) =
+        synchronized(ARCHIVE_LOCK) {
+            scratch.mkdirs()
+            val seen = mutableMapOf<String, Pair<Long, Long>>()
+            val files = (packageFiles(directory) + workingFiles(directory)).sortedBy { it.name }
+            files.forEach { source ->
+                val temporary = File.createTempFile("analytics-read-", ".rhp", scratch)
+                try {
+                    val packaged = source.extension == "rha"
+                    val info = if (packaged) requireNotNull(extractAndVerifyPackage(source, temporary)) {
+                        "Invalid telemetry package"
+                    } else null
+                    val file = if (packaged) temporary else source
+                    val scan = scanWorkingPartition(file, null, false, repairTail = false)
+                    require(scan.structurallyValid && scan.fileLength == file.length()) { "Incomplete telemetry partition" }
+                    require(info == null || info.entryCount == scan.entryCount) { "Archive entry count mismatch" }
+                    RandomAccessFile(file, "r").use { input ->
+                        input.seek(WORKING_HEADER_SIZE.toLong())
+                        repeat(scan.entryCount) {
+                            val offset = input.filePointer
+                            val header = ByteArray(ENTRY_HEADER_SIZE).also(input::readFully)
+                            val entry = requireNotNull(parseEntryHeader(file, offset, header))
+                            require(verifyEntryPayload(entry)) { "Invalid telemetry payload" }
+                            val fingerprint = entry.payloadBytes to entry.sourceCrc32
+                            val prior = seen.putIfAbsent(entry.entryId.toHex(), fingerprint)
+                            require(prior == null || prior == fingerprint) { "Conflicting duplicate telemetry entry" }
+                            if (prior == null) {
+                                FileInputStream(file).use { raw ->
+                                    raw.channel.position(entry.payloadOffset)
+                                    BoundedInputStream(raw, entry.payloadBytes).bufferedReader().use { reader ->
+                                        var previousSeq = -1L
+                                        var first = true
+                                        var lastType = ""
+                                        reader.forEachLine { line ->
+                                            val record = JSONObject(line)
+                                            val seq = record.getLong("seq")
+                                            require(seq > previousSeq) { "Unordered telemetry entry" }
+                                            previousSeq = seq
+                                            lastType = record.getString("type")
+                                            if (first) {
+                                                require(lastType == "session_start") { "Missing session start" }
+                                                require(parseRemoteAddress(record.getString("device_address"))
+                                                    .contentEquals(scan.remoteAddress)) { "Archive board mismatch" }
+                                            }
+                                            first = false
+                                            consume(line, record)
+                                        }
+                                        require(lastType == "session_end") { "Missing session end" }
+                                    }
+                                }
+                            }
+                            input.seek(entry.payloadOffset + entry.payloadBytes + ENTRY_COMMIT_SIZE)
+                        }
+                    }
+                } finally { temporary.delete() }
+            }
+        }
+
+    /**
+     * Produces stable upload candidates without sealing or mutating a live working partition.
+     * Only the quick committed-byte copy is made under [ARCHIVE_LOCK]; compression and digesting
+     * happen afterwards so producers are not blocked by export work.
+     */
+    fun prepareUploads(
+        archiveDirectory: File,
+        exportDirectory: File,
+        onInvalidPartition: (Int) -> Unit = {},
+    ): List<TelemetryPartitionUpload> {
+        exportDirectory.mkdirs()
+        data class Candidate(val sequence: Int, val entries: Int, val final: Boolean, val source: File)
+        val candidates = synchronized(ARCHIVE_LOCK) {
+            val sealed = packageFiles(archiveDirectory).map { file ->
+                Candidate(file.name.partitionSequence(), 0, true, file)
+            }
+            val working = workingFiles(archiveDirectory).mapNotNull { file ->
+                val scan = runCatching { scanWorkingPartition(file, null, false, repairTail = false) }.getOrNull()
+                if (scan == null || !scan.structurallyValid) {
+                    onInvalidPartition(file.name.partitionSequence())
+                    return@mapNotNull null
+                }
+                if (scan.entryCount == 0) return@mapNotNull null
+                val copy = File.createTempFile("snapshot-${scan.sequence}-", ".rhp", exportDirectory)
+                FileInputStream(file).use { input ->
+                    FileOutputStream(copy).use { output ->
+                        BoundedInputStream(input, scan.fileLength).use { it.copyTo(output, BUFFER_SIZE) }
+                        output.flush()
+                        output.fd.sync()
+                    }
+                }
+                Candidate(scan.sequence, scan.entryCount, false, copy)
+            }
+            (sealed + working).sortedBy { it.sequence }
+        }
+
+        return candidates.mapNotNull { candidate ->
+            try {
+            if (candidate.final) {
+                val unpacked = File.createTempFile("rha-logical-", ".rhp", exportDirectory)
+                try {
+                    val info = extractAndVerifyPackage(candidate.source, unpacked)
+                        ?: error("Invalid sealed partition")
+                    TelemetryPartitionUpload(
+                        info.sequence, info.entryCount, true, candidate.source,
+                        sha256Base64(candidate.source), sha256Base64(unpacked),
+                    )
+                } finally {
+                    unpacked.delete()
+                }
+            } else {
+                val scan = scanWorkingPartition(candidate.source, null, false)
+                if (!scan.structurallyValid || scan.entryCount != candidate.entries) {
+                    candidate.source.delete()
+                    onInvalidPartition(candidate.sequence)
+                    return@mapNotNull null
+                }
+                val logicalDigest = sha256Base64(candidate.source)
+                val packaged = packagePartition(candidate.source, scan)
+                TelemetryPartitionUpload(
+                    packaged.sequence, packaged.entryCount, false, packaged.file,
+                    sha256Base64(packaged.file), logicalDigest,
+                )
+            }
+            } catch (_: Exception) {
+                if (!candidate.final) candidate.source.delete()
+                onInvalidPartition(candidate.sequence)
+                null
+            }
         }
     }
 
@@ -350,10 +499,11 @@ class TelemetryArchive(
         file: File,
         targetEntryId: ByteArray?,
         verifyTargetPayload: Boolean,
+        repairTail: Boolean = true,
     ): WorkingScan {
         if (!file.isFile || file.length() < WORKING_HEADER_SIZE) return WorkingScan.invalid(file)
         return runCatching {
-            RandomAccessFile(file, "rw").use { input ->
+            RandomAccessFile(file, if (repairTail) "rw" else "r").use { input ->
                 if (input.readInt() != WORKING_MAGIC ||
                     input.readInt() != FORMAT_VERSION ||
                     input.readInt() != WORKING_HEADER_SIZE
@@ -365,28 +515,29 @@ class TelemetryArchive(
                 input.readUnsignedShort()
                 var target: ArchiveEntry? = null
                 var entryCount = 0
+                var committedLength = input.filePointer
                 while (input.filePointer < input.length()) {
                     val headerOffset = input.filePointer
                     if (input.length() - headerOffset < ENTRY_HEADER_SIZE) {
-                        input.setLength(headerOffset)
+                        if (repairTail) input.setLength(headerOffset)
                         break
                     }
                     val header = ByteArray(ENTRY_HEADER_SIZE).also(input::readFully)
                     val entry = parseEntryHeader(file, headerOffset, header)
                     if (entry == null) {
-                        input.setLength(headerOffset)
+                        if (repairTail) input.setLength(headerOffset)
                         break
                     }
                     val footerOffset = entry.payloadOffset + entry.payloadBytes
                     if (footerOffset < entry.payloadOffset ||
                         input.length() - footerOffset < ENTRY_COMMIT_SIZE
                     ) {
-                        input.setLength(headerOffset)
+                        if (repairTail) input.setLength(headerOffset)
                         break
                     }
                     input.seek(footerOffset)
                     if (input.readInt() != ENTRY_COMMIT_MAGIC) {
-                        input.setLength(headerOffset)
+                        if (repairTail) input.setLength(headerOffset)
                         break
                     }
                     val committedId = ByteArray(ENTRY_ID_BYTES).also(input::readFully)
@@ -396,18 +547,19 @@ class TelemetryArchive(
                         committedBytes != ENTRY_HEADER_SIZE + entry.payloadBytes ||
                         crcOfRange(file, headerOffset, committedBytes) != storedCrc
                     ) {
-                        input.setLength(headerOffset)
+                        if (repairTail) input.setLength(headerOffset)
                         break
                     }
                     val isTarget = targetEntryId != null && entry.entryId.contentEquals(targetEntryId)
                     if (isTarget) {
                         if (verifyTargetPayload && !verifyEntryPayload(entry)) {
-                            input.setLength(headerOffset)
+                            if (repairTail) input.setLength(headerOffset)
                             break
                         }
                         target = entry
                     }
                     entryCount += 1
+                    committedLength = input.filePointer
                 }
                 WorkingScan(
                     file = file,
@@ -415,7 +567,7 @@ class TelemetryArchive(
                     sequence = sequence,
                     remoteAddress = remoteAddress,
                     entryCount = entryCount,
-                    fileLength = file.length(),
+                    fileLength = committedLength,
                     target = target,
                 )
             }
@@ -844,6 +996,19 @@ class TelemetryArchive(
         private val REMOTE_ADDRESS_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
         private val ARCHIVE_LOCK = Any()
     }
+}
+
+private fun sha256Base64(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    FileInputStream(file).use { input ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return Base64.getEncoder().encodeToString(digest.digest())
 }
 
 private fun partitionBaseName(sequence: Int): String =

@@ -2,12 +2,25 @@ package at.themrcodes.ridershub.session
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.json.JSONObject
 
 class ChargeCycleTrackerTest {
+    @Test fun tenPointChargeThresholdIsInclusive() {
+        val before = ChargeCycleTracker.recordRide(
+            null, ride("before", 70, 50, 3.0), "board_local_one",
+        )!!.activeCycle
+        for (rise in 0..11) {
+            val after = ChargeCycleTracker.recordRide(
+                before, ride("after", 50 + rise, 45, 2.0), "board_local_one",
+            )!!
+            assertEquals(rise >= 10, after.completedCycle != null)
+        }
+    }
+
     @Test
     fun aggregatesRidesAndSpeedProfileUntilRecharge() {
         val first = ChargeCycleTracker.recordRide(
@@ -133,6 +146,26 @@ class ChargeCycleTrackerTest {
             pseudonymousBoardId("02:AB:00:CD:00:01"),
             pseudonymousBoardId(" 02:ab:00:cd:00:01 "),
         )
+    }
+
+    @Test
+    fun liveCycleUsesDetectorEventInsteadOfRideBoundaryAndDoesNotDoubleCountFrames() {
+        val initial = ride("first", 40, 40, 0.0)
+        val cycle = ChargeCycleTracker.recordFrame(null, initial, "board_local_one", null, true).activeCycle
+        val high = initial.copy(id = "next", boardBatteryStart = 80, boardBatteryEnd = 80,
+            boardBatteryMin = 80)
+        val stillSame = ChargeCycleTracker.recordFrame(cycle, high, "board_local_one", null, true)
+        assertNull(stillSame.completedCycle)
+        assertEquals(2, stillSame.activeCycle.rideCount)
+        val nextFrame = ChargeCycleTracker.recordFrame(
+            stillSame.activeCycle, high, "board_local_one", null, false,
+        )
+        assertEquals(2, nextFrame.activeCycle.rideCount)
+        val confirmed = ChargeCycleTracker.recordFrame(
+            nextFrame.activeCycle, high, "board_local_one", 40, false,
+        )
+        assertNotNull(confirmed.completedCycle)
+        assertEquals(40, confirmed.activeCycle.inferredRechargeIncreasePercent)
     }
 
     private fun ride(

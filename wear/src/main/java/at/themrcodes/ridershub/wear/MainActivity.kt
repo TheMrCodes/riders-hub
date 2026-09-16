@@ -22,10 +22,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.Composable
@@ -57,6 +55,9 @@ import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.delay
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 class MainActivity : FragmentActivity(), AmbientModeSupport.AmbientCallbackProvider {
@@ -284,14 +285,24 @@ private fun RidersHubWearApp(
             contentAlignment = Alignment.Center,
         ) {
             if (ambient) {
-                DashboardPage(uiState, ambient = true, burnInOffset)
+                DashboardPage(
+                    uiState = uiState,
+                    clockText = wearClockText(nowEpochMs),
+                    ambient = true,
+                    burnInOffset = burnInOffset,
+                )
             } else {
                 HorizontalPager(
                     state = pagerState,
                     modifier = Modifier.fillMaxSize(),
                 ) { page ->
                     when (page) {
-                        DASHBOARD_PAGE -> DashboardPage(uiState, ambient = false, 0 to 0)
+                        DASHBOARD_PAGE -> DashboardPage(
+                            uiState = uiState,
+                            clockText = wearClockText(nowEpochMs),
+                            ambient = false,
+                            burnInOffset = 0 to 0,
+                        )
                         else -> DisplaySettingsPage(
                             keepScreenAwake = keepScreenAwake,
                             autoOpenOnLive = autoOpenOnLive,
@@ -306,12 +317,6 @@ private fun RidersHubWearApp(
                         )
                     }
                 }
-                PageIndicator(
-                    selectedPage = pagerState.currentPage,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 8.dp),
-                )
             }
         }
     }
@@ -320,22 +325,21 @@ private fun RidersHubWearApp(
 @Composable
 private fun DashboardPage(
     uiState: WearUiState,
+    clockText: String,
     ambient: Boolean,
     burnInOffset: Pair<Int, Int>,
 ) {
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .offset(x = burnInOffset.first.dp, y = burnInOffset.second.dp)
             .padding(horizontal = 24.dp, vertical = 14.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = if (ambient) Arrangement.Center else Arrangement.Top,
+        contentAlignment = Alignment.Center,
     ) {
         if (ambient) {
-            AmbientDashboard(uiState)
+            AmbientDashboard(uiState, clockText)
         } else {
-            InteractiveDashboard(uiState)
+            InteractiveDashboard(uiState, clockText)
         }
     }
 }
@@ -350,7 +354,6 @@ private fun DisplaySettingsPage(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .padding(horizontal = 30.dp, vertical = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -405,7 +408,7 @@ private fun SettingsChoice(
             .fillMaxWidth()
             .background(RidersLine, RoundedCornerShape(18.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 11.dp),
+            .padding(horizontal = 18.dp, vertical = 5.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
@@ -430,121 +433,149 @@ private fun SettingsChoice(
 }
 
 @Composable
-private fun PageIndicator(
-    selectedPage: Int,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-    ) {
-        repeat(2) { page ->
-            Box(
-                Modifier
-                    .size(if (page == selectedPage) 5.dp else 4.dp)
-                    .background(
-                        if (page == selectedPage) RidersMuted else RidersLine,
-                        CircleShape,
-                    ),
+private fun AmbientDashboard(uiState: WearUiState, clockText: String) {
+    Box(Modifier.fillMaxSize()) {
+        Text(
+            text = clockText,
+            modifier = Modifier.align(Alignment.TopCenter),
+            color = RidersAmbient,
+            fontFamily = RidersMono,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        Column(
+            modifier = Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = uiState.tripValue,
+                color = RidersAmbient,
+                fontFamily = RidersMono,
+                fontSize = 42.sp,
+                fontWeight = FontWeight.Black,
+                lineHeight = 43.sp,
             )
+            Text(
+                text = "TRIP KM",
+                color = RidersAmbient,
+                fontFamily = RidersMono,
+                fontSize = 8.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.5.sp,
+            )
+            Spacer(Modifier.height(18.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                WearMetric("BATTERY", uiState.battery, RidersAmbient, RidersAmbient)
+                WearMetric("KM LEFT", uiState.rangeValue, RidersAmbient, RidersAmbient)
+            }
         }
     }
 }
 
 @Composable
-private fun AmbientDashboard(uiState: WearUiState) {
-    Text(
-        text = uiState.tripValue,
-        color = RidersAmbient,
-        fontFamily = RidersMono,
-        fontSize = 42.sp,
-        fontWeight = FontWeight.Black,
-        lineHeight = 43.sp,
-    )
-    Text(
-        text = "TRIP KM",
-        color = RidersAmbient,
-        fontFamily = RidersMono,
-        fontSize = 8.sp,
-        fontWeight = FontWeight.Bold,
-        letterSpacing = 1.5.sp,
-    )
-    Spacer(Modifier.height(18.dp))
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-    ) {
-        WearMetric("BATTERY", uiState.battery, RidersAmbient, RidersAmbient)
-        WearMetric("KM LEFT", uiState.rangeValue, RidersAmbient, RidersAmbient)
+private fun InteractiveDashboard(
+    uiState: WearUiState,
+    clockText: String,
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .height(18.dp)
+                .offset(y = (-6).dp),
+        ) {
+            Box(
+                Modifier
+                    .align(Alignment.Center)
+                    .offset(x = (-27).dp)
+                    .size(6.dp)
+                    .background(if (uiState.live) RidersRed else RidersMuted, CircleShape),
+            )
+            Text(
+                text = clockText,
+                modifier = Modifier.align(Alignment.Center),
+                color = RidersWhite,
+                fontFamily = RidersMono,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.6.sp,
+            )
+        }
+        Column(
+            modifier = Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = uiState.speed,
+                color = uiState.valueColor,
+                fontFamily = RidersMono,
+                fontSize = 42.sp,
+                fontWeight = FontWeight.Black,
+                lineHeight = 43.sp,
+            )
+            Text(
+                text = "KM/H",
+                color = RidersMuted,
+                fontFamily = RidersMono,
+                fontSize = 8.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.5.sp,
+            )
+            Spacer(Modifier.height(6.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth(0.72f)
+                    .height(1.dp)
+                    .background(RidersLine),
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                WearMetric("BATTERY", uiState.battery, uiState.valueColor)
+                WearMetric("TRIP", uiState.trip, uiState.valueColor)
+            }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = uiState.mode,
+                color = RidersMuted,
+                fontFamily = RidersMono,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (shouldShowStatusMessage(uiState)) {
+            Text(
+                text = uiState.statusLabel,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
+                color = RidersMuted,
+                fontFamily = RidersMono,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.sp,
+            )
+        }
     }
 }
 
-@Composable
-private fun InteractiveDashboard(uiState: WearUiState) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            Modifier
-                .size(6.dp)
-                .background(if (uiState.live) RidersRed else RidersMuted, CircleShape),
-        )
-        Text(
-            text = uiState.statusLabel,
-            modifier = Modifier.padding(start = 7.dp),
-            color = RidersMuted,
-            fontFamily = RidersMono,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 1.sp,
-        )
-    }
-    Spacer(Modifier.height(10.dp))
-    Text(
-        text = uiState.speed,
-        color = uiState.valueColor,
-        fontFamily = RidersMono,
-        fontSize = 42.sp,
-        fontWeight = FontWeight.Black,
-        lineHeight = 43.sp,
-    )
-    Text(
-        text = "KM/H",
-        color = RidersMuted,
-        fontFamily = RidersMono,
-        fontSize = 8.sp,
-        fontWeight = FontWeight.Bold,
-        letterSpacing = 1.5.sp,
-    )
-    Spacer(Modifier.height(12.dp))
-    Box(
-        Modifier
-            .fillMaxWidth(0.72f)
-            .height(1.dp)
-            .background(RidersLine),
-    )
-    Spacer(Modifier.height(10.dp))
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-    ) {
-        WearMetric("BATTERY", uiState.battery, uiState.valueColor)
-        WearMetric("TRIP", uiState.trip, uiState.valueColor)
-    }
-    Spacer(Modifier.height(10.dp))
-    Text(
-        text = uiState.mode,
-        color = RidersMuted,
-        fontFamily = RidersMono,
-        fontSize = 10.sp,
-        fontWeight = FontWeight.Bold,
-        letterSpacing = 1.sp,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-    )
-}
+internal fun shouldShowStatusMessage(uiState: WearUiState): Boolean = !uiState.live
+
+internal fun wearClockText(
+    nowEpochMs: Long,
+    zoneId: ZoneId = ZoneId.systemDefault(),
+): String = WearClockFormatter.format(Instant.ofEpochMilli(nowEpochMs).atZone(zoneId))
+
+private val WearClockFormatter = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
 
 internal fun ambientBurnInOffset(frame: Int): Pair<Int, Int> = when (Math.floorMod(frame, 4)) {
     0 -> -2 to -2
@@ -615,7 +646,8 @@ internal fun wearUiState(telemetry: WearTelemetryState?, nowEpochMs: Long): Wear
         live = live,
         statusLabel = status,
         speed = telemetry?.speedKmh?.let { String.format(Locale.US, "%.1f", it) } ?: "--.-",
-        battery = telemetry?.boardBatteryPercent?.let { "$it%" } ?: "--%",
+        battery = telemetry?.estimatedBatteryPercent?.let { "~${String.format(Locale.US, "%.1f", it)}%" }
+            ?: telemetry?.boardBatteryPercent?.let { "$it%" } ?: "--%",
         trip = "$tripValue KM",
         tripValue = tripValue,
         rangeValue = telemetry?.estimatedRangeKm?.let {

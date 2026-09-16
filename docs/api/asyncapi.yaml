@@ -1,0 +1,80 @@
+asyncapi: 3.0.0
+info:
+  title: Riders Hub realtime API
+  version: 1.0.0
+  description: Device-bearer-authenticated, server-silent application stream using subprotocol riders-hub.realtime.v1.
+defaultContentType: application/json
+servers:
+  selfHosted:
+    host: api.example.test
+    pathname: /prefix
+    protocol: wss
+    security: [{ $ref: '#/components/securitySchemes/deviceBearer' }]
+channels:
+  realtime:
+    address: /v1/realtime
+    servers: [{ $ref: '#/servers/selfHosted' }]
+    bindings:
+      ws:
+        method: GET
+        headers:
+          type: object
+          required: [Sec-WebSocket-Protocol]
+          properties:
+            Sec-WebSocket-Protocol: { type: string, const: riders-hub.realtime.v1 }
+        bindingVersion: 0.1.0
+    messages:
+      streamOpened: { $ref: '#/components/messages/StreamOpened' }
+      telemetry: { $ref: '#/components/messages/Telemetry' }
+operations:
+  sendRealtime:
+    action: send
+    channel: { $ref: '#/channels/realtime' }
+    messages:
+      - { $ref: '#/channels/realtime/messages/streamOpened' }
+      - { $ref: '#/channels/realtime/messages/telemetry' }
+components:
+  securitySchemes:
+    deviceBearer:
+      type: http
+      scheme: bearer
+      description: Source-bound device credential, or the deployment's legacy migration key.
+  messages:
+    StreamOpened:
+      payload:
+        type: object
+        required: [schema_version, type, source_id, board_id, ride_id, stream_id, opened_at]
+        properties:
+          schema_version: { const: 1 }
+          type: { const: stream.opened }
+          source_id: { type: string, format: uuid }
+          board_id: { type: string, format: uuid }
+          ride_id: { type: string, format: uuid }
+          stream_id: { type: string, format: uuid, description: New for every connection. }
+          opened_at: { type: string, format: date-time }
+    Telemetry:
+      payload:
+        type: object
+        required: [schema_version, type, source_id, board_id, ride_id, stream_id, capture_segment_id, stream_sequence, frame_number, frame_at, segment_elapsed_ms, speed_kmh]
+        properties:
+          schema_version: { const: 1 }
+          type: { const: telemetry }
+          source_id: { type: string, format: uuid }
+          board_id: { type: string, format: uuid }
+          ride_id: { type: string, format: uuid }
+          stream_id: { type: string, format: uuid }
+          capture_segment_id: { type: string, format: uuid, description: BLE capture segment identity. }
+          stream_sequence: { type: integer, minimum: 1 }
+          frame_number: { type: integer, minimum: 1 }
+          frame_at: { type: string, format: date-time }
+          segment_elapsed_ms: { type: integer, minimum: 0, description: Android monotonic elapsed time within this capture segment. }
+          speed_kmh: { type: number, minimum: 0 }
+          location:
+            type: object
+            required: [fix_at, latitude, longitude]
+            description: Omitted when no precise fix is at most five monotonic seconds old.
+            properties:
+              fix_at: { type: string, format: date-time }
+              latitude: { type: number, minimum: -90, maximum: 90 }
+              longitude: { type: number, minimum: -180, maximum: 180 }
+              altitude_m: { type: number }

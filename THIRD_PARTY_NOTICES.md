@@ -1,15 +1,16 @@
 # Third-party notices
 
-Riders Hub uses the following unmodified libraries for Home Assistant's
-application-level webhook encryption:
+Riders Hub uses the following unmodified libraries for the optional self-hosted
+API integration:
 
-- [Lazysodium Android 5.2.0](https://github.com/terl/lazysodium-android),
-  Mozilla Public License 2.0. Its corresponding source is available from the
-  linked project at tag `v5.2.0`.
-- [JNA 5.17.0](https://github.com/java-native-access/jna), Apache License 2.0
-  or LGPL 2.1.
-- [libsodium 1.0.20](https://github.com/jedisct1/libsodium), ISC license,
-  distributed inside Lazysodium Android.
+- [OkHttp 5.3.0](https://square.github.io/okhttp/), Apache License 2.0, for
+  authenticated HTTP and WebSocket transport.
+- [AndroidX WorkManager 2.11.2](https://developer.android.com/jetpack/androidx/releases/work),
+  Apache License 2.0, for persistent lifecycle and archive delivery work.
+- [AppAuth for Android 0.11.1](https://github.com/openid/AppAuth-Android),
+  Apache License 2.0, for native browser Authorization Code + PKCE.
+- [AndroidX Browser 1.10.0](https://developer.android.com/jetpack/androidx/releases/browser),
+  Apache License 2.0, for the Custom Tabs browser handoff used by AppAuth.
 
 These components retain their respective licenses. Riders Hub's own source
 remains licensed under the MIT License.

@@ -33,8 +33,10 @@ respective owners.
   in compact, verified files.
 - Battery Longevity tracking with a speed-normalized full-charge estimate,
   observed charge windows, and an adaptive daily-to-yearly capacity chart.
-- Optional Home Assistant export for battery, estimated range, current-trip
-  distance, last update, and in-use state—never live speed.
+- Optional self-hosted API channels for core metrics, one-hertz live speed/GPS,
+  and consent-gated raw archive synchronization.
+- Optional Shelly Plus Plug S Gen2 observation with confirmation-only charger
+  start/stop, power-based safety cutoffs, and a separate local evidence archive.
 - A Wear OS companion dashboard for live speed, board battery, trip distance,
   estimated remaining range, and ride mode, with clearly subdued last-known
   values while disconnected.
@@ -60,6 +62,11 @@ The current adapter connects to the remote, not directly to the skateboard
 ESC. The remote must already be connected to the board and advertising with a
 name beginning with `BF_`.
 
+Charger observation is a separate integration for a stock Shelly Plus Plug S
+Gen2 with BLE RPC enabled. Presence alone never energizes the outlet. This
+first test version still requires physical validation with the intended plug
+and charger before its automatic completion behavior should be relied on.
+
 The Backfire G3 is the only board tested so far, which is why the UI displays
 `G3`; Riders Hub should also work with boards using second-generation or newer
 black-plastic remotes with the index-finger opening, but those combinations
@@ -75,6 +82,11 @@ confidence levels, and known unknowns.
 Riders Hub's normal operation subscribes to telemetry notifications from the
 paired remote.
 
+Charger control is experimental. Keep the charger and board on a nonflammable,
+well-ventilated surface and do not leave the first physical tests unattended.
+The app uses a 12-hour plug-side automatic-off request as a backstop, not as a
+substitute for the charger's own protections or supervision.
+
 This project is experimental and is based on community and independent reverse
 engineering. Keep the board's drive wheels clear of the ground during physical
 testing.
@@ -89,8 +101,9 @@ testing.
    continues the same ride; otherwise Android finalizes it with a one-shot
    alarm.
 
-Riders Hub does not keep an activity, periodic worker, custom BLE scanner, wake
-lock, or permanent foreground notification running in the background.
+BLE detection does not require an activity, custom BLE scanner, wake lock, or
+permanent foreground notification. Opt-in API GPS uses a location foreground
+service during the logical ride, and durable API uploads use WorkManager.
 
 ## Range and battery longevity
 
@@ -119,46 +132,47 @@ Archives contain ride data and a device identifier, so exported files are
 sensitive. See the [Android app guide](docs/android-logger.md#rhprha-archive-format-version-1)
 for the technical format.
 
-## Home Assistant
+## Self-hosted API
 
-The optional Home Assistant connection uses its official `mobile_app` webhook
-interface. In **Device → Home Assistant**:
+The optional integration targets any server implementing the published v1
+contract. Configure one base URL and sign in through the server's OIDC provider under
+**Device → Self-hosted API**. The app uses browser Authorization Code + PKCE and exchanges the
+short-lived access token for a source-bound device credential. A legacy bearer key remains
+available for migration. Capability discovery enables metrics, realtime, and analytics
+independently. HTTPS/WSS is preferred; HTTP/WS requires explicit confirmation
+and remains visibly marked as unencrypted.
 
-1. Enable Home Assistant export.
-2. In the Home Assistant Companion app, navigate to **Sidebar → Profile →
-   Security → Long-Lived Access Tokens → Create Token**, then copy the token.
-3. Enter the Home Assistant URL and token, then tap **Connect**. They are used
-   once for registration and are not saved.
-4. Keep the supplied webhook URL or replace it with a Nabu Casa cloudhook, local
-   URL, or HTTPS proxy such as `https://ha.example.com/api/webhook/…`.
+Core snapshots are best-effort every ten seconds while riding, while ride start
+and end events use a durable SQLite outbox. Realtime sends only the newest frame
+at most once per second. Optional precise GPS follows the logical ride through
+the reconnect grace period. Raw RHA and charger-observation synchronization
+share separate explicit consent scoped to both the URL and authenticated server
+identity. Charger COA files use their own endpoint and durable delivery ledger;
+they are never mixed into ride archives.
 
-Riders Hub creates entities for battery, estimated range, trip distance, last
-update, and in-use state. During a ride it updates every ten seconds, sends
-battery changes immediately, and emits start/end events. Payloads and stored
-webhook credentials are encrypted; remote URLs require HTTPS, while HTTP is
-accepted only on a trusted local network. Home Assistant may also create an
-empty device tracker, but Riders Hub never supplies location data.
-
-**Disconnect** removes the local webhook credentials. Remove the integration in
-Home Assistant separately if it is no longer needed.
+See the [HTTP contract](docs/api/openapi.yaml), [WebSocket contract](docs/api/asyncapi.yaml),
+and [server implementer guide](docs/api/implementer-guide.md).
 
 ## Privacy
 
-Riders Hub has Internet permission solely for its optional Home Assistant
-integration. That integration is off by default and sends only board battery,
-estimated range, current-trip distance, an in-use state, and update timestamps;
-it never sends live speed, raw telemetry, the Bluetooth address, or ride logs.
-The Home Assistant URL and long-lived token are used only during registration
-and are not persisted. The returned webhook URL and application-level
-encryption key are credentials. Riders Hub encrypts both at rest with Android
-Keystore, stores only their encrypted forms in private app preferences, and
-excludes them from backup and device transfer.
+The API integration is off until configured. Its base URL and device or legacy bearer credential
+are encrypted at rest with Android Keystore and excluded from backup. OIDC access tokens are used
+only for registration and are not persisted. Decoded API
+messages use random export identifiers and never include Bluetooth names,
+addresses, local paths, raw bytes, or non-finite measurements.
 
-The app has no location, storage, boot, wake-lock, exact-alarm, or
-foreground-service permission. Ride history and raw telemetry remain on the
-device in the app-specific external directory. Android may still require the
-device-wide Location Services switch for companion-device discovery, but the
-app is not granted location access and does not receive coordinates.
+GPS is separately off by default and requires precise foreground plus background
+location permission. While enabled for an active ride, a location foreground
+service shows a persistent notification. Full fixes enter the local raw archive;
+the realtime projection contains only fix time, coordinates, and optional
+altitude. Raw archive uploads require a separate per-destination disclosure
+because RHA data can include device identifiers, exact activity times, frames,
+diagnostics, and full GPS records.
+
+Charger COA files contain exact observation times, generated identifiers,
+decisions, relay state, power and protection evidence. They exclude BLE/Wi-Fi
+identifiers and raw Shelly RPC, remain local unless the same raw-analytics
+consent is approved, and are retained until explicitly deleted.
 
 The optional Wear OS companion receives only connection state, live speed,
 board battery, current trip distance, the phone's aggregate estimated remaining

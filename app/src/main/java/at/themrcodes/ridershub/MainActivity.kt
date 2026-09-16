@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.IntentSender
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -14,6 +15,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -59,6 +63,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -74,6 +79,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.foundation.text.KeyboardOptions
@@ -92,38 +99,93 @@ import at.themrcodes.ridershub.session.LongevityGranularity
 import at.themrcodes.ridershub.session.RideStore
 import at.themrcodes.ridershub.session.RideStoreSnapshot
 import at.themrcodes.ridershub.session.RideSummary
-import at.themrcodes.ridershub.homeassistant.HomeAssistantIntegration
-import at.themrcodes.ridershub.homeassistant.HomeAssistantSnapshot
-import at.themrcodes.ridershub.homeassistant.isValidHomeAssistantWebhookUrl
+import at.themrcodes.ridershub.session.TripHistoryGroups
+import at.themrcodes.ridershub.session.TripHistoryGroup
+import at.themrcodes.ridershub.session.BoardSpeedBucketStatistics
+import at.themrcodes.ridershub.api.ApiIntegration
+import at.themrcodes.ridershub.api.ApiSnapshot
+import at.themrcodes.ridershub.api.ApiAuthMode
+import at.themrcodes.ridershub.api.OidcAuthConfig
+import at.themrcodes.ridershub.api.apiUrls
+import at.themrcodes.ridershub.api.oidcAuthorizationRequest
+import at.themrcodes.ridershub.charger.ChargerControl
+import at.themrcodes.ridershub.charger.ChargerPhase
+import at.themrcodes.ridershub.charger.ChargerSnapshot
+import at.themrcodes.ridershub.charger.ChargerStore
 import kotlinx.coroutines.delay
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.util.Locale
 import kotlin.math.roundToInt
+import net.openid.appauth.AuthorizationException
+import net.openid.appauth.AuthorizationResponse
+import net.openid.appauth.AuthorizationService
+import net.openid.appauth.AuthorizationServiceConfiguration
 
 class MainActivity : ComponentActivity() {
     private lateinit var presenceController: PresenceController
     private lateinit var state: AppStateStore
     private lateinit var rideStore: RideStore
-    private lateinit var homeAssistant: HomeAssistantIntegration
+    private lateinit var api: ApiIntegration
+    private lateinit var authorizationService: AuthorizationService
     private lateinit var generalSettings: GeneralSettingsStore
+    private lateinit var chargerStore: ChargerStore
     private var associationRequestedAfterPermission = false
+    private var requestedAssociationRole = CompanionRole.BOARD_REMOTE
+    private var associationsBeforeChooser = emptySet<Int>()
     private var handledAssociationId: Int? = null
     private var associationInProgress by mutableStateOf(false)
     private var expertControlsUnlocked by mutableStateOf(false)
     private var developerTapCount = 0
     private var dashboard by mutableStateOf<DashboardState?>(null)
+    private var chargerPromptToken by mutableStateOf<String?>(null)
+    private var pendingOidcBaseUrl: String? = null
+
+    private val oidcAuthorizationLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val intent = result.data
+        val response = intent?.let(AuthorizationResponse::fromIntent)
+        val authorizationError = intent?.let(AuthorizationException::fromIntent)
+        if (response == null) {
+            state.setError(if (authorizationError != null) "SSO authorization failed" else "SSO sign-in was cancelled")
+            pendingOidcBaseUrl = null
+            dashboard = loadDashboard()
+            return@registerForActivityResult
+        }
+        authorizationService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenError ->
+            runOnUiThread {
+                val accessToken = tokenResponse?.accessToken
+                val baseUrl = pendingOidcBaseUrl
+                pendingOidcBaseUrl = null
+                if (accessToken == null || baseUrl == null || tokenError != null) {
+                    state.setError("SSO token exchange failed")
+                } else {
+                    runCatching { api.completeOidcEnrollment(baseUrl, accessToken) }
+                        .onFailure { state.setError(it.message ?: "Could not enroll this device") }
+                }
+                dashboard = loadDashboard()
+            }
+        }
+    }
 
     private val associationChooser = registerForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult(),
     ) { result ->
         associationInProgress = false
         if (result.resultCode == RESULT_OK) {
-            val association = presenceController.recoverAssociationAfterChooser()
-            if (association != null) onAssociationCreated(association)
+            val association = presenceController.recoverAssociationAfterChooser(requestedAssociationRole, associationsBeforeChooser)
+            if (association != null) onAssociationCreated(association, requestedAssociationRole)
             else state.setError("Android reported success but no companion association was available")
         } else {
-            state.setError("Remote association was cancelled")
+            state.setError(
+                if (requestedAssociationRole == CompanionRole.BOARD_REMOTE) {
+                    "Remote association was cancelled"
+                } else {
+                    "Charger association was cancelled"
+                },
+            )
         }
         dashboard = loadDashboard()
     }
@@ -144,19 +206,44 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { dashboard = loadDashboard() }
 
+    private val backgroundLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            api.setGpsEnabled(true)
+        } else {
+            api.reportGpsUnavailable("Background location was not granted")
+        }
+        dashboard = loadDashboard()
+    }
+
+    private val preciseLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        val precise = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (precise) backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        else api.reportGpsUnavailable("Precise location was not granted")
+        dashboard = loadDashboard()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         presenceController = PresenceController(this)
         state = AppStateStore(this)
         rideStore = RideStore.get(this)
-        homeAssistant = HomeAssistantIntegration.get(this)
+        api = ApiIntegration.get(this)
+        authorizationService = AuthorizationService(this)
+        pendingOidcBaseUrl = savedInstanceState?.getString(KEY_PENDING_OIDC_BASE_URL)
         generalSettings = GeneralSettingsStore(this)
+        chargerStore = ChargerStore(this)
         expertControlsUnlocked = getSharedPreferences("app_settings", MODE_PRIVATE)
             .getBoolean(KEY_EXPERT_CONTROLS_UNLOCKED, false)
         dashboard = loadDashboard()
         ensureExistingAssociationIsObserved()
         requestNotificationPermissionIfNeeded()
+        handleChargerPromptIntent(intent)
 
         setContent {
             RidersHubTheme {
@@ -170,16 +257,25 @@ class MainActivity : ComponentActivity() {
                     dashboard = dashboard ?: loadDashboard(),
                     associationInProgress = associationInProgress,
                     expertControlsUnlocked = expertControlsUnlocked,
-                    onAssociate = ::requestAssociationWithPermissions,
+                    onAssociate = { requestAssociationWithPermissions(CompanionRole.BOARD_REMOTE) },
+                    onAssociateCharger = { requestAssociationWithPermissions(CompanionRole.CHARGER_PLUG) },
+                    onPromptCharger = { chargerPromptToken = chargerStore.snapshot().appearanceToken },
+                    chargerPromptToken = chargerPromptToken,
+                    onChargerDecision = ::requestChargerDecision,
+                    onDismissChargerPrompt = { chargerPromptToken = null },
                     onOpenSettings = ::openPermissionSettings,
                     onVersionTap = ::onVersionTapped,
                     onSetChildLimiter = ::requestChildLimiter,
                     onSetLowBatteryWarningPercent = ::setLowBatteryWarningPercent,
-                    onSetHomeAssistantEnabled = ::setHomeAssistantEnabled,
-                    onConnectHomeAssistant = homeAssistant::connect,
-                    onSaveHomeAssistantWebhook = ::saveHomeAssistantWebhook,
-                    onDisconnectHomeAssistant = ::disconnectHomeAssistant,
-                    onSyncHomeAssistant = ::syncHomeAssistant,
+                    onSetApiEnabled = api::setEnabled,
+                    onConfigureApi = ::configureApi,
+                    onStartOidc = ::startOidcEnrollment,
+                    onDisconnectApi = api::clearConfiguration,
+                    onRefreshApi = api::refreshCapabilities,
+                    onSyncApi = api::manualSync,
+                    onSetAnalytics = api::approveAnalytics,
+                    onResyncArchives = api::resyncArchives,
+                    onSetGps = ::setGpsEnabled,
                 )
             }
         }
@@ -194,7 +290,8 @@ class MainActivity : ComponentActivity() {
             app = app,
             rides = rideStore.snapshot(app.boardBatteryPercent, restingVoltage),
             generalSettings = generalSettings.snapshot(),
-            homeAssistant = homeAssistant.snapshot(),
+            api = api.snapshot(),
+            charger = chargerStore.snapshot(),
         )
     }
 
@@ -203,39 +300,80 @@ class MainActivity : ComponentActivity() {
         dashboard = loadDashboard()
     }
 
-    private fun setHomeAssistantEnabled(enabled: Boolean) {
-        homeAssistant.setEnabled(enabled)
+    private fun configureApi(baseUrl: String, bearerKey: String, confirmHttp: Boolean) {
+        runCatching { api.configureAndTest(baseUrl, bearerKey, confirmHttp) }
+            .onFailure { state.setError(it.message ?: "Could not save API configuration") }
         dashboard = loadDashboard()
     }
 
-    private fun saveHomeAssistantWebhook(webhookUrl: String) {
-        homeAssistant.saveWebhookUrl(webhookUrl)
+    private fun startOidcEnrollment(baseUrl: String) {
+        runCatching {
+            api.prepareOidcEnrollment(baseUrl) { outcome ->
+                outcome.onSuccess { config -> discoverOidcAndAuthorize(baseUrl, config) }
+                    .onFailure { state.setError("Could not load the API SSO configuration") }
+                dashboard = loadDashboard()
+            }
+        }.onFailure { state.setError(it.message ?: "Could not start SSO enrollment") }
         dashboard = loadDashboard()
     }
 
-    private fun disconnectHomeAssistant() {
-        homeAssistant.disconnect()
+    private fun discoverOidcAndAuthorize(baseUrl: String, config: OidcAuthConfig) {
+        AuthorizationServiceConfiguration.fetchFromIssuer(Uri.parse(config.issuer)) { serviceConfig, error ->
+            runOnUiThread {
+                if (serviceConfig == null || error != null) {
+                    state.setError("Could not discover the configured identity provider")
+                    dashboard = loadDashboard()
+                    return@runOnUiThread
+                }
+                val request = oidcAuthorizationRequest(serviceConfig, config)
+                pendingOidcBaseUrl = apiUrls(baseUrl).base.toString().removeSuffix("/")
+                oidcAuthorizationLauncher.launch(authorizationService.getAuthorizationRequestIntent(request))
+            }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        pendingOidcBaseUrl?.let { outState.putString(KEY_PENDING_OIDC_BASE_URL, it) }
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onDestroy() {
+        authorizationService.dispose()
+        super.onDestroy()
+    }
+
+    private fun setGpsEnabled(enabled: Boolean) {
+        if (!enabled) {
+            api.setGpsEnabled(false)
+        } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            preciseLocationLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            ))
+        } else if (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        } else {
+            api.setGpsEnabled(true)
+        }
         dashboard = loadDashboard()
     }
 
-    private fun syncHomeAssistant() {
-        val current = loadDashboard()
-        val activeRide = current.rides.activeRide
-        val lastKnownRide = activeRide ?: current.rides.lastCompletedRide
-        homeAssistant.sync(
-            boardBatteryPercent = current.app.boardBatteryPercent
-                ?: lastKnownRide?.boardBatteryEnd,
-            estimatedRangeKm = current.rides.rangeEstimate.remainingKm,
-            currentTripKm = activeRide?.distanceKm ?: 0.0,
-            inUse = activeRide?.active == true,
-            updatedAt = activeRide?.lastFrameAt
-                ?: lastKnownRide?.lastFrameAt
-                ?: Instant.now().toString(),
-        )
-        dashboard = loadDashboard()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleChargerPromptIntent(intent)
     }
 
-    private fun requestAssociationWithPermissions() {
+    private fun handleChargerPromptIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(ChargerControl.EXTRA_OPEN_PROMPT, false) == true) {
+            val supplied = intent.getStringExtra(ChargerControl.EXTRA_APPEARANCE_TOKEN)
+            chargerPromptToken = supplied?.takeIf { it == chargerStore.snapshot().appearanceToken }
+            intent.removeExtra(ChargerControl.EXTRA_OPEN_PROMPT)
+        }
+    }
+
+    private fun requestAssociationWithPermissions(role: CompanionRole) {
+        requestedAssociationRole = role
         val missing = REQUIRED_BLUETOOTH_PERMISSIONS.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
@@ -243,16 +381,19 @@ class MainActivity : ComponentActivity() {
             associationRequestedAfterPermission = true
             bluetoothPermissionLauncher.launch(missing.toTypedArray())
         } else {
-            startAssociation()
+            startAssociation(role)
         }
     }
 
-    private fun startAssociation() {
+    private fun startAssociation(role: CompanionRole = requestedAssociationRole) {
         state.clearError()
         associationInProgress = true
+        requestedAssociationRole = role
+        associationsBeforeChooser = presenceController.existingAssociations().map { it.associationId }.toSet()
         presenceController.startAssociation(
+            role = role,
             launchChooser = ::launchAssociationChooser,
-            onCreated = ::onAssociationCreated,
+            onCreated = { onAssociationCreated(it, role) },
             onFailure = { message ->
                 state.setError(message)
                 associationInProgress = false
@@ -270,25 +411,40 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun onAssociationCreated(association: BackfireAssociation) {
+    private fun onAssociationCreated(association: BackfireAssociation, role: CompanionRole) {
         if (handledAssociationId == association.associationId) return
         handledAssociationId = association.associationId
         associationInProgress = false
-        armAssociation(association)
-        Toast.makeText(this, "Remote associated", Toast.LENGTH_SHORT).show()
+        armAssociation(association, role)
+        val label = association.displayName ?: if (role == CompanionRole.BOARD_REMOTE) "remote" else "Shelly charger"
+        Toast.makeText(this, "Associated with $label", Toast.LENGTH_SHORT).show()
         dashboard = loadDashboard()
     }
 
-    private fun armAssociation(association: BackfireAssociation) {
-        state.setAssociation(association.address, association.displayName, association.associationId)
-        presenceController.ensureObserving(association).onFailure { error ->
-            state.setError("Could not watch remote presence: ${error.message}")
+    private fun armAssociation(association: BackfireAssociation, role: CompanionRole) {
+        CompanionRoleStore(this).set(role, association.associationId)
+        if (role == CompanionRole.BOARD_REMOTE) state.setAssociation(association.address, association.displayName, association.associationId)
+        else chargerStore.setAssociation(association.associationId, association.displayName)
+        presenceController.ensureObserving(association, role).onFailure { error ->
+            state.setError("Could not watch ${if (role == CompanionRole.BOARD_REMOTE) "remote" else "charger"} presence: ${error.message}")
         }
     }
 
     private fun ensureExistingAssociationIsObserved() {
-        val association = presenceController.existingAssociations().firstOrNull() ?: return
-        armAssociation(association)
+        CompanionRole.entries.forEach { role ->
+            presenceController.association(role)?.let { armAssociation(it, role) }
+        }
+    }
+
+    private fun requestChargerDecision(start: Boolean, token: String) {
+        chargerPromptToken = null
+        sendBroadcast(
+            Intent(if (start) ChargerControl.ACTION_START else ChargerControl.ACTION_STOP)
+                .setPackage(packageName)
+                .putExtra(ChargerControl.EXTRA_APPEARANCE_TOKEN, token)
+                .putExtra(ChargerControl.EXTRA_CONFIRMED, true),
+        )
+        dashboard = loadDashboard()
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -338,6 +494,7 @@ class MainActivity : ComponentActivity() {
         )
         private const val DEVELOPER_UNLOCK_TAPS = 7
         private const val KEY_EXPERT_CONTROLS_UNLOCKED = "expert_controls_unlocked"
+        private const val KEY_PENDING_OIDC_BASE_URL = "pending_oidc_base_url"
     }
 }
 
@@ -345,7 +502,8 @@ private data class DashboardState(
     val app: AppSnapshot,
     val rides: RideStoreSnapshot,
     val generalSettings: GeneralSettingsSnapshot,
-    val homeAssistant: HomeAssistantSnapshot,
+    val api: ApiSnapshot,
+    val charger: ChargerSnapshot,
 )
 
 private val NothingRed = Color(0xFFD71921)
@@ -383,40 +541,36 @@ private fun RidersHubDashboard(
     associationInProgress: Boolean,
     expertControlsUnlocked: Boolean,
     onAssociate: () -> Unit,
+    onAssociateCharger: () -> Unit,
+    onPromptCharger: () -> Unit,
+    chargerPromptToken: String?,
+    onChargerDecision: (Boolean, String) -> Unit,
+    onDismissChargerPrompt: () -> Unit,
     onOpenSettings: () -> Unit,
     onVersionTap: () -> Unit,
     onSetChildLimiter: (Boolean) -> Unit,
     onSetLowBatteryWarningPercent: (Int) -> Unit,
-    onSetHomeAssistantEnabled: (Boolean) -> Unit,
-    onConnectHomeAssistant: (String, String) -> Unit,
-    onSaveHomeAssistantWebhook: (String) -> Unit,
-    onDisconnectHomeAssistant: () -> Unit,
-    onSyncHomeAssistant: () -> Unit,
+    onSetApiEnabled: (Boolean) -> Unit,
+    onConfigureApi: (String, String, Boolean) -> Unit,
+    onStartOidc: (String) -> Unit,
+    onDisconnectApi: () -> Unit,
+    onRefreshApi: () -> Unit,
+    onSyncApi: () -> Unit,
+    onSetAnalytics: (Boolean) -> Unit,
+    onResyncArchives: () -> Unit,
+    onSetGps: (Boolean) -> Unit,
 ) {
     val app = dashboard.app
     val rides = dashboard.rides
+    val today = LocalDate.now()
+    val historyGroups = remember(rides.recentTracks, today) {
+        TripHistoryGroups.build(rides.recentTracks, today)
+    }
+    var expandedHistoryGroups by rememberSaveable { mutableStateOf(emptyList<String>()) }
     var page by remember { mutableStateOf(DashboardPage.OVERVIEW) }
     var pendingLimiterChoice by remember { mutableStateOf<Boolean?>(null) }
-    var pendingHomeAssistantRemoval by remember { mutableStateOf(false) }
-    var leaveAfterHomeAssistantRemoval by remember { mutableStateOf(false) }
-    var webhookDraft by remember(dashboard.homeAssistant.webhookUrl) {
-        mutableStateOf(dashboard.homeAssistant.webhookUrl.orEmpty())
-    }
-    fun leaveDevicePage() {
-        if (dashboard.homeAssistant.connected && webhookDraft.isBlank()) {
-            leaveAfterHomeAssistantRemoval = true
-            pendingHomeAssistantRemoval = true
-            return
-        }
-        if (
-            dashboard.homeAssistant.connected &&
-            webhookDraft != dashboard.homeAssistant.webhookUrl &&
-            isValidHomeAssistantWebhookUrl(webhookDraft)
-        ) {
-            onSaveHomeAssistantWebhook(webhookDraft)
-        }
-        page = DashboardPage.OVERVIEW
-    }
+    var pendingApiRemoval by remember { mutableStateOf(false) }
+    fun leaveDevicePage() { page = DashboardPage.OVERVIEW }
     BackHandler(enabled = page == DashboardPage.DEVICE, onBack = ::leaveDevicePage)
     Surface(Modifier.fillMaxSize(), color = NothingBlack) {
         LazyColumn(
@@ -425,31 +579,60 @@ private fun RidersHubDashboard(
                 .statusBarsPadding()
                 .navigationBarsPadding(),
             contentPadding = PaddingValues(horizontal = 24.dp, vertical = 26.dp),
-            verticalArrangement = Arrangement.spacedBy(48.dp),
+            verticalArrangement = Arrangement.spacedBy(if (page == DashboardPage.OVERVIEW) 24.dp else 48.dp),
         ) {
             when (page) {
                 DashboardPage.OVERVIEW -> {
-                    item { NothingHeader(app, onOpenDevice = { page = DashboardPage.DEVICE }) }
-                    app.error?.let { message -> item { ErrorWidget(message) } }
                     item {
-                        CurrentTripWidget(
-                            app = app,
-                            ride = rides.currentTripDisplay,
-                            lowBatteryWarningPercent = dashboard.generalSettings.lowBatteryWarningPercent,
-                        )
+                        Box(Modifier.padding(bottom = 24.dp)) {
+                            NothingHeader(
+                                app = app,
+                                onOpenDevice = { page = DashboardPage.DEVICE },
+                            )
+                        }
                     }
-                    item { RangeWidget(rides.rangeEstimate, Modifier.padding(top = 12.dp)) }
+                    app.error?.let { message -> item {
+                        Box(Modifier.padding(bottom = 24.dp)) { ErrorWidget(message) }
+                    } }
+                    item {
+                        Box(Modifier.padding(bottom = 24.dp)) {
+                            CurrentTripWidget(
+                                app = app,
+                                ride = rides.currentTripDisplay,
+                                lowBatteryWarningPercent = dashboard.generalSettings.lowBatteryWarningPercent,
+                            )
+                        }
+                    }
+                    item { RangeWidget(rides.rangeEstimate, Modifier.padding(top = 12.dp, bottom = 24.dp)) }
+                    item { RidersProfileSection(rides.speedBucketStatistics, Modifier.padding(top = 12.dp, bottom = 24.dp)) }
                     item {
                         BatteryLongevitySection(
                             rides.batteryLongevity,
-                            Modifier.padding(top = 12.dp),
+                            Modifier.padding(top = 12.dp, bottom = 24.dp),
                         )
                     }
-                    item { RidesHeader(app.odometerKm, Modifier.padding(top = 12.dp)) }
+                    item { RidesHeader(app.odometerKm, Modifier.padding(top = 12.dp, bottom = 24.dp)) }
                     if (rides.recentTracks.isEmpty()) {
                         item { EmptyRidesWidget() }
                     } else {
-                        items(rides.recentTracks, key = { it.id }) { ride -> RideWidget(ride) }
+                        if (historyGroups.recentTrips.isNotEmpty()) {
+                            item(key = "recent-trips-label") {
+                                NothingText("Last 7 days", color = NothingMuted, size = 12)
+                            }
+                            items(historyGroups.recentTrips, key = { it.id }) { ride -> RideWidget(ride) }
+                        }
+                        historyGroups.olderGroups.forEach { group ->
+                            val expanded = group.id in expandedHistoryGroups
+                            item(key = group.id) {
+                                TripHistoryGroupHeader(group, expanded) {
+                                    expandedHistoryGroups = if (expanded) expandedHistoryGroups - group.id
+                                        else expandedHistoryGroups + group.id
+                                }
+                            }
+                            if (expanded) {
+                                items(group.trips, key = { it.id }) { ride -> RideWidget(ride) }
+                            }
+                        }
                     }
                 }
 
@@ -461,6 +644,14 @@ private fun RidersHubDashboard(
                             app = app,
                             associationInProgress = associationInProgress,
                             onAssociate = onAssociate,
+                        )
+                    }
+                    item {
+                        ChargerSection(
+                            charger = dashboard.charger,
+                            associationInProgress = associationInProgress,
+                            onAssociate = onAssociateCharger,
+                            onPrompt = onPromptCharger,
                         )
                     }
                     item {
@@ -478,18 +669,17 @@ private fun RidersHubDashboard(
                         }
                     }
                     item {
-                        HomeAssistantSection(
-                            state = dashboard.homeAssistant,
-                            onSetEnabled = onSetHomeAssistantEnabled,
-                            onConnect = onConnectHomeAssistant,
-                            webhookUrl = webhookDraft,
-                            onWebhookUrlChange = { webhookDraft = it },
-                            onSaveWebhook = onSaveHomeAssistantWebhook,
-                            onRequestRemoval = {
-                                leaveAfterHomeAssistantRemoval = false
-                                pendingHomeAssistantRemoval = true
-                            },
-                            onSync = onSyncHomeAssistant,
+                        SelfHostedApiSection(
+                            state = dashboard.api,
+                            onSetEnabled = onSetApiEnabled,
+                            onConfigure = onConfigureApi,
+                            onStartOidc = onStartOidc,
+                            onRequestRemoval = { pendingApiRemoval = true },
+                            onRefresh = onRefreshApi,
+                            onSync = onSyncApi,
+                            onSetAnalytics = onSetAnalytics,
+                            onResyncArchives = onResyncArchives,
+                            onSetGps = onSetGps,
                         )
                     }
                     item { AppSection(onOpenSettings = onOpenSettings, onVersionTap = onVersionTap) }
@@ -507,19 +697,21 @@ private fun RidersHubDashboard(
             onDismiss = { pendingLimiterChoice = null },
         )
     }
-    if (pendingHomeAssistantRemoval) {
-        HomeAssistantRemovalDialog(
+    if (pendingApiRemoval) {
+        ApiRemovalDialog(
             onConfirm = {
-                pendingHomeAssistantRemoval = false
-                onDisconnectHomeAssistant()
-                webhookDraft = ""
-                if (leaveAfterHomeAssistantRemoval) page = DashboardPage.OVERVIEW
-                leaveAfterHomeAssistantRemoval = false
+                pendingApiRemoval = false
+                onDisconnectApi()
             },
-            onDismiss = {
-                pendingHomeAssistantRemoval = false
-                leaveAfterHomeAssistantRemoval = false
-            },
+            onDismiss = { pendingApiRemoval = false },
+        )
+    }
+    chargerPromptToken?.let { token ->
+        ChargerConfirmationDialog(
+            charger = dashboard.charger,
+            onStart = { onChargerDecision(true, token) },
+            onStop = { onChargerDecision(false, token) },
+            onDismiss = onDismissChargerPrompt,
         )
     }
 }
@@ -527,7 +719,10 @@ private fun RidersHubDashboard(
 private enum class DashboardPage { OVERVIEW, DEVICE }
 
 @Composable
-private fun NothingHeader(app: AppSnapshot, onOpenDevice: () -> Unit) {
+private fun NothingHeader(
+    app: AppSnapshot,
+    onOpenDevice: () -> Unit,
+) {
     val listening = app.serviceActive && app.connection.contains("Listening", ignoreCase = true)
     val stateLabel = if (listening) "Live" else if (app.serviceActive && app.present) "Nearby" else "Standby"
     Column(Modifier.fillMaxWidth()) {
@@ -635,6 +830,7 @@ private fun CurrentTripWidget(
     } else {
         ride?.boardBatteryEnd
     }
+    val estimatedBattery = ride?.estimatedBatteryPercent
     Column {
         Box(Modifier.fillMaxWidth()) {
             Column(Modifier.fillMaxWidth()) {
@@ -673,8 +869,9 @@ private fun CurrentTripWidget(
                         valueColor = valueColor,
                     )
                     QuietMetric(
-                        "Battery",
-                        batteryPercent?.let { "$it%" } ?: "—",
+                        if (estimatedBattery != null) "Est. battery" else "Battery",
+                        estimatedBattery?.let { "${UiFormat.decimal(it, 1)}%" }
+                            ?: batteryPercent?.let { "$it%" } ?: "—",
                         Modifier.width(56.dp),
                         Alignment.CenterHorizontally,
                         valueColor,
@@ -683,6 +880,7 @@ private fun CurrentTripWidget(
             }
             BatteryMeter(
                 percent = batteryPercent,
+                estimatedPercent = estimatedBattery,
                 active = telemetryActive,
                 lowBatteryWarningPercent = lowBatteryWarningPercent,
                 modifier = Modifier.align(Alignment.TopEnd),
@@ -712,7 +910,8 @@ private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) 
     val subtitle = when (estimate.status) {
         RangeEstimateStatus.COLLECTING_DATA -> "Building a 5% battery-use window"
         RangeEstimateStatus.PROVISIONAL -> "Based on your recent riding pattern"
-        RangeEstimateStatus.CALIBRATED -> "Calibrated to your latest 100 km"
+        RangeEstimateStatus.CALIBRATED -> if (estimate.usesAccumulatedBucketConsumption)
+            "Calibrated to your board's riding profile" else "Calibrated to your latest 100 km"
     }
     Column(modifier) {
         SectionTitle("Range", subtitle)
@@ -741,22 +940,92 @@ private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) 
 }
 
 @Composable
+private fun RidersProfileSection(statistics: BoardSpeedBucketStatistics?, modifier: Modifier = Modifier) {
+    var energyUse by rememberSaveable { mutableStateOf(false) }
+    val buckets = statistics?.buckets.orEmpty().filter {
+        it.measuredDistanceKm > 0 || it.inferredDistanceKm > 0 ||
+            it.calibrationMeasuredKm > 0 || it.calibrationInferredKm > 0
+    }.sortedBy { it.startKmh }
+    val values = buckets.map {
+        (if (energyUse) it.batteryPercentPer100Km?.div(100.0).takeUnless { _ -> it.modelLimitReached } else it.distanceSharePercent)
+            ?.takeIf { value -> value.isFinite() && value >= 0 }
+    }
+    val maximum = values.filterNotNull().maxOrNull()?.coerceAtLeast(0.001) ?: 1.0
+    Column(modifier.fillMaxWidth()) {
+        NothingText("Riders Profile", size = 22, weight = FontWeight.Bold)
+        Spacer(Modifier.height(7.dp))
+        NothingText("Your riding mix and battery use by speed", color = NothingMuted, size = 11, lineHeight = 17)
+        Spacer(Modifier.height(12.dp))
+        NothingText(if (energyUse) "Energy use · % / km" else "Distance %", color = NothingMuted, size = 9)
+        Spacer(Modifier.height(8.dp))
+        if (buckets.isEmpty()) {
+            NothingText("Collecting ride data", color = NothingMuted, size = 10)
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                buckets.forEachIndexed { index, bucket ->
+                    val value = values[index]
+                    val supported = !energyUse || bucket.hasUsableConsumptionSupport
+                    val color = if (supported) NothingWhite else NothingLine
+                    Column(Modifier.weight(1f).semantics(mergeDescendants = true) {
+                        contentDescription = "${bucket.startKmh} to ${bucket.startKmh + 5} km/h, " +
+                            (value?.let { UiFormat.decimal(it, if (energyUse) 2 else 1) } ?: "no estimate") +
+                            (if (energyUse) " battery percentage points per kilometre" else " percent of distance") +
+                            if (supported) "" else ", insufficient support"
+                    }, horizontalAlignment = Alignment.CenterHorizontally) {
+                        NothingText(value?.let { UiFormat.decimal(it, if (energyUse) 2 else 0) } ?: "—",
+                            color = if (supported) NothingWhite else NothingMuted, size = 8)
+                        Spacer(Modifier.height(4.dp))
+                        Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.BottomCenter) {
+                            if (value != null && value > 0) {
+                                Box(Modifier.fillMaxWidth().height((100 * value / maximum).toFloat().dp)
+                                    .background(color))
+                            } else if (energyUse) {
+                                Box(Modifier.fillMaxWidth().height(3.dp).background(NothingLine))
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        NothingText("${bucket.startKmh}–${bucket.startKmh + 5}", color = NothingMuted, size = 8)
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                NothingText(if (energyUse) "Gray = low support · — = unavailable" else "", color = NothingMuted, size = 8)
+                NothingText("km/h", color = NothingMuted, size = 8)
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+            listOf(false to "Distribution", true to "Energy use").forEach { (mode, label) ->
+                val selected = energyUse == mode
+                Column(Modifier.weight(1f)
+                    .selectable(selected = selected, role = Role.Tab, onClick = { energyUse = mode }),
+                    horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(Modifier.fillMaxWidth().height(2.dp)
+                        .background(if (selected) NothingRed else NothingLine))
+                    Box(Modifier.fillMaxWidth().height(46.dp), contentAlignment = Alignment.Center) {
+                        NothingText(label, color = if (selected) NothingWhite else NothingMuted,
+                            size = 11, weight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun BatteryLongevitySection(
     longevity: BatteryLongevitySnapshot,
     modifier: Modifier = Modifier,
 ) {
     var granularity by remember { mutableStateOf(LongevityGranularity.DAY) }
-    var focusStart by remember { mutableStateOf<java.time.Instant?>(null) }
-    var focusEnd by remember { mutableStateOf<java.time.Instant?>(null) }
-    var selectedBarId by remember { mutableStateOf<String?>(null) }
+    var anchor by remember { mutableStateOf<java.time.Instant?>(null) }
     val bars = BatteryLongevityChart.aggregate(
         observations = longevity.observations,
         granularity = granularity,
         zoneId = ZoneId.systemDefault(),
-        focusStart = focusStart,
-        focusEndExclusive = focusEnd,
+        anchor = anchor,
     )
-    val selected = bars.firstOrNull { it.id == selectedBarId }
+    val selected = bars.lastOrNull()
     val collecting = longevity.status == BatteryLongevityStatus.COLLECTING_DATA
     val chartMaximumKm = longevity.allTimeHighKm ?: bars.maxOfOrNull { it.fullRangeKm } ?: 1.0
 
@@ -791,11 +1060,19 @@ private fun BatteryLongevitySection(
                     0.3f,
                 )
             }
-            QuietMetric(
-                label = "Observed cycles",
-                value = longevity.observedCycleCount.toString(),
-                horizontalAlignment = Alignment.End,
-            )
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                QuietMetric(
+                    label = "Observed charges",
+                    value = longevity.observedCycleCount.toString(),
+                    horizontalAlignment = Alignment.End,
+                )
+                QuietMetric(
+                    label = "Est. total charges",
+                    value = longevity.cycleAge?.let { UiFormat.decimal(it.estimatedLifetimeFullCycles, 0) } ?: "—",
+                    horizontalAlignment = Alignment.End,
+                    valueColor = if (longevity.observedCycleCount >= 10) NothingWhite else NothingMuted,
+                )
+            }
         }
         Spacer(Modifier.height(12.dp))
         NothingText(longevity.message, color = NothingMuted, size = 11, lineHeight = 17)
@@ -819,24 +1096,16 @@ private fun BatteryLongevitySection(
             BatteryLongevityChartView(
                 bars = bars,
                 allTimeHighKm = chartMaximumKm,
-                selectedBarId = selectedBarId,
+                selectedBarId = selected?.id,
                 onBarSelected = { bar ->
                     val finer = granularity.finer()
-                    if (finer == null) {
-                        selectedBarId = bar.id
-                    } else {
-                        focusStart = bar.start
-                        focusEnd = bar.endExclusive
-                        granularity = finer
-                        selectedBarId = null
-                    }
+                    anchor = bar.latestObservationAt
+                    if (finer != null) granularity = finer
                 },
                 onZoomOut = {
                     granularity.coarser()?.let { coarser ->
                         granularity = coarser
-                        focusStart = null
-                        focusEnd = null
-                        selectedBarId = null
+                        if (anchor == null) anchor = selected?.latestObservationAt
                     }
                 },
             )
@@ -876,9 +1145,9 @@ private fun BatteryLongevityChartView(
                 .height(142.dp)
                 .pointerInput(bars) {
                     detectTapGestures { offset ->
-                        val slotWidth = size.width / bars.size
-                        val index = (offset.x / slotWidth).toInt().coerceIn(0, bars.lastIndex)
-                        currentOnBarSelected(bars[index])
+                        val slotWidth = size.width / BatteryLongevityChart.DEFAULT_MAX_BARS
+                        val index = (offset.x / slotWidth).toInt() - (BatteryLongevityChart.DEFAULT_MAX_BARS - bars.size)
+                        bars.getOrNull(index)?.let { currentOnBarSelected(it) }
                     }
                 }
                 .pointerInput(Unit) {
@@ -902,12 +1171,12 @@ private fun BatteryLongevityChartView(
                 end = Offset(size.width, baseline),
                 strokeWidth = 1.dp.toPx(),
             )
-            val slotWidth = size.width / bars.size
+            val slotWidth = size.width / BatteryLongevityChart.DEFAULT_MAX_BARS
             bars.forEachIndexed { index, bar ->
                 val height = (baseline * (bar.fullRangeKm / scaleMax).coerceIn(0.0, 1.0)).toFloat()
                 val width = slotWidth * 0.56f
-                val left = index * slotWidth + (slotWidth - width) / 2f
-                val color = if (bar.id == selectedBarId || index == bars.lastIndex) {
+                val left = (index + BatteryLongevityChart.DEFAULT_MAX_BARS - bars.size) * slotWidth + (slotWidth - width) / 2f
+                val color = if (bar.id == selectedBarId) {
                     NothingRed
                 } else {
                     NothingWhite
@@ -922,6 +1191,7 @@ private fun BatteryLongevityChartView(
         }
         Spacer(Modifier.height(9.dp))
         Row(Modifier.fillMaxWidth()) {
+            repeat(BatteryLongevityChart.DEFAULT_MAX_BARS - bars.size) { Spacer(Modifier.weight(1f)) }
             bars.forEachIndexed { index, bar ->
                 NothingText(
                     text = if (bars.size <= 6 || index % 2 == 0 || index == bars.lastIndex) bar.label else "",
@@ -971,6 +1241,27 @@ private fun RidesHeader(odometerKm: Float?, modifier: Modifier = Modifier) {
 }
 
 @Composable
+private fun TripHistoryGroupHeader(group: TripHistoryGroup, expanded: Boolean, onToggle: () -> Unit) {
+    Column(Modifier.fillMaxWidth()
+        .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+        .clickable(role = Role.Button, onClickLabel = if (expanded) "Collapse trips" else "Expand trips", onClick = onToggle)
+        .padding(vertical = 6.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween) {
+            Column(Modifier.weight(1f)) {
+                NothingText(group.label, size = 18, weight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                NothingText("${group.trips.size} trips · ${UiFormat.decimal(group.trips.sumOf { it.distanceKm }, 1)} km",
+                    color = NothingMuted, size = 11)
+            }
+            NothingText(if (expanded) "−" else "+", size = 26, weight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider(color = NothingLine)
+    }
+}
+
+@Composable
 private fun RideWidget(ride: RideSummary) {
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -987,7 +1278,7 @@ private fun RideWidget(ride: RideSummary) {
             QuietMetric("Top speed", "${UiFormat.decimal(ride.maxSpeedKmh, 1)} km/h")
             QuietMetric("Battery", batteryDelta(ride))
         }
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(14.dp))
         HorizontalDivider(color = NothingLine)
     }
 }
@@ -1062,6 +1353,122 @@ private fun RemoteSection(
             )
         }
     }
+}
+
+@Composable
+private fun ChargerSection(
+    charger: ChargerSnapshot,
+    associationInProgress: Boolean,
+    onAssociate: () -> Unit,
+    onPrompt: () -> Unit,
+) {
+    val selectedDevice = charger.associatedDeviceName ?: when {
+        charger.paired -> "Shelly charger (name unavailable)"
+        else -> "No charger selected"
+    }
+    Column {
+        SectionTitle("Charger", "Shelly Plus Plug S Gen2 observation")
+        Spacer(Modifier.height(30.dp))
+        NothingText("SELECTED PLUG", color = NothingMuted, size = 9, weight = FontWeight.Bold, spacing = 1f)
+        Spacer(Modifier.height(8.dp))
+        NothingText(selectedDevice, size = 20, weight = FontWeight.Black, lineHeight = 26)
+        charger.associationId?.let { associationId ->
+            Spacer(Modifier.height(6.dp))
+            NothingText("Android association #$associationId", color = NothingMuted, size = 10)
+        }
+        Spacer(Modifier.height(10.dp))
+        NothingText(
+            if (charger.paired) {
+                "This is the exact advertised name selected in Android's chooser. Association alone does not mean it is connected."
+            } else {
+                "Choose the plug once; its advertised name will remain visible here."
+            },
+            color = NothingMuted,
+            size = 10,
+            lineHeight = 16,
+        )
+        Spacer(Modifier.height(18.dp))
+        NothingText(
+            when {
+                !charger.paired -> "No charger associated"
+                charger.rpcVerified -> charger.status
+                charger.gattConnected -> "BLE connected; verifying Shelly RPC"
+                charger.nearby -> "Plug detected; opening BLE link"
+                else -> "Waiting for Android to detect the associated plug"
+            },
+            size = 14,
+            weight = FontWeight.Bold,
+            lineHeight = 20,
+        )
+        charger.error?.let {
+            Spacer(Modifier.height(10.dp))
+            NothingText(it, color = NothingRed, size = 10, lineHeight = 15)
+        }
+        if (charger.rpcVerified) {
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                QuietMetric("Output", when (charger.outputOn) { true -> "ON"; false -> "OFF"; null -> "—" })
+                QuietMetric("Power", charger.powerWatts?.let { "${UiFormat.decimal(it, 1)} W" } ?: "—")
+                QuietMetric("Peak", charger.peakWatts?.let { "${UiFormat.decimal(it, 1)} W" } ?: "—")
+            }
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = onPrompt,
+                enabled = charger.appearanceToken != null && (charger.canPrompt || charger.canStop),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(28.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = if (charger.outputOn == true) NothingRed else NothingWhite),
+            ) {
+                NothingLabel(if (charger.outputOn == true) "REVIEW / STOP" else "START CHARGING", if (charger.outputOn == true) Color.White else NothingBlack)
+            }
+        }
+        Spacer(Modifier.height(22.dp))
+        Button(
+            onClick = onAssociate,
+            enabled = !associationInProgress,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = NothingRaised, contentColor = NothingWhite),
+        ) {
+            NothingLabel(if (charger.paired) "PAIR DIFFERENT CHARGER" else "PAIR SHELLY CHARGER", NothingWhite)
+        }
+        Spacer(Modifier.height(12.dp))
+        NothingText(
+            "Power is never enabled by presence or notification alone. START requires confirmation and uses Shelly's 12-hour automatic-off fail-safe.",
+            color = NothingMuted,
+            size = 9,
+            lineHeight = 15,
+        )
+    }
+}
+
+@Composable
+private fun ChargerConfirmationDialog(
+    charger: ChargerSnapshot,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val outputOn = charger.outputOn == true
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (outputOn) "Stop board charging?" else "Start board charging?") },
+        text = {
+            Text(
+                if (outputOn) {
+                    "This sends an OFF command and verifies the observed relay state."
+                } else {
+                    "Confirm the longboard charger is safely connected. The plug will turn on with a 12-hour fail-safe, stop if no active load appears within 5 minutes, and stop after cautious completion evidence."
+                },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = if (outputOn) onStop else onStart) {
+                Text(if (outputOn) "STOP" else "START CHARGING")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("CANCEL") } },
+    )
 }
 
 @Composable
@@ -1179,206 +1586,152 @@ private fun GeneralSettingsSection(
 }
 
 @Composable
-private fun HomeAssistantSection(
-    state: HomeAssistantSnapshot,
+private fun SelfHostedApiSection(
+    state: ApiSnapshot,
     onSetEnabled: (Boolean) -> Unit,
-    onConnect: (String, String) -> Unit,
-    webhookUrl: String,
-    onWebhookUrlChange: (String) -> Unit,
-    onSaveWebhook: (String) -> Unit,
+    onConfigure: (String, String, Boolean) -> Unit,
+    onStartOidc: (String) -> Unit,
     onRequestRemoval: () -> Unit,
+    onRefresh: () -> Unit,
     onSync: () -> Unit,
+    onSetAnalytics: (Boolean) -> Unit,
+    onResyncArchives: () -> Unit,
+    onSetGps: (Boolean) -> Unit,
 ) {
-    var instanceUrl by remember { mutableStateOf("") }
-    var accessToken by remember { mutableStateOf("") }
-    var webhookInvalid by remember { mutableStateOf(false) }
-    var webhookFocused by remember { mutableStateOf(false) }
-    LaunchedEffect(state.connected) {
-        if (state.connected) {
-            instanceUrl = ""
-            accessToken = ""
-        }
-    }
-    fun commitWebhook() {
-        when {
-            webhookUrl.isBlank() -> onRequestRemoval()
-            isValidHomeAssistantWebhookUrl(webhookUrl) -> {
-                webhookInvalid = false
-                if (webhookUrl != state.webhookUrl) onSaveWebhook(webhookUrl)
-            }
-            else -> webhookInvalid = true
-        }
-    }
-
+    var baseUrl by remember(state.baseUrl) { mutableStateOf(state.baseUrl.orEmpty()) }
+    var bearerKey by remember { mutableStateOf("") }
+    var confirmHttp by remember(state.httpConfirmed) { mutableStateOf(state.httpConfirmed) }
+    val parsed = runCatching { apiUrls(baseUrl) }.getOrNull()
+    val insecureDraft = parsed?.base?.isHttps == false
     Column {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                SectionTitle("Home Assistant", "Optional, low-frequency webhook export")
+                SectionTitle("Self-hosted API", "Metrics, realtime and raw analytics")
             }
             Spacer(Modifier.width(18.dp))
-            Switch(
-                checked = state.enabled,
-                onCheckedChange = onSetEnabled,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = Color.White,
-                    checkedTrackColor = NothingRed,
-                    uncheckedThumbColor = NothingWhite,
-                    uncheckedTrackColor = NothingRaised,
-                    uncheckedBorderColor = NothingMuted,
-                ),
-            )
+            Switch(checked = state.enabled, onCheckedChange = onSetEnabled)
         }
-
-        if (state.enabled) {
-            Spacer(Modifier.height(24.dp))
-            if (!state.connected) {
-                NothingText("Home Assistant credentials", size = 14, weight = FontWeight.Bold)
-                Spacer(Modifier.height(10.dp))
-                NothingText(
-                    "1. In the Home Assistant Companion app: Sidebar → Profile → Security → Long-Lived Access Tokens → Create Token.\n" +
-                        "2. Enter the Home Assistant base URL and token below.\n" +
-                        "3. Tap Connect. Riders Hub registers its sensors, securely keeps the webhook credentials, and forgets both entries.",
-                    color = NothingMuted,
-                    size = 10,
-                    lineHeight = 16,
-                )
-                Spacer(Modifier.height(18.dp))
-                HomeAssistantTextField(
-                    value = instanceUrl,
-                    onValueChange = { instanceUrl = it },
-                    label = "Home Assistant URL",
-                    placeholder = "https://home.example.com",
-                    enabled = !state.busy,
-                    keyboardType = KeyboardType.Uri,
-                )
-                Spacer(Modifier.height(12.dp))
-                HomeAssistantTextField(
-                    value = accessToken,
-                    onValueChange = { accessToken = it },
-                    label = "Long-lived access token",
-                    placeholder = "Token",
-                    enabled = !state.busy,
-                    keyboardType = KeyboardType.Password,
-                    password = true,
-                )
+        if (!state.enabled) return@Column
+        Spacer(Modifier.height(22.dp))
+        if (!state.configured) {
+            ApiTextField(baseUrl, { baseUrl = it; confirmHttp = false }, "API base URL",
+                "https://api.example.test/prefix", keyboardType = KeyboardType.Uri)
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = { onStartOidc(baseUrl) },
+                enabled = parsed?.base?.isHttps == true,
+                colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
+            ) { NothingLabel("SIGN IN WITH SSO", Color.White) }
+            NothingText(
+                "Uses your server's OIDC provider. The app receives a device credential after browser sign-in.",
+                color = NothingMuted,
+                size = 9,
+                lineHeight = 14,
+            )
+            Spacer(Modifier.height(20.dp))
+            NothingText("Legacy bearer key", size = 11, weight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            ApiTextField(bearerKey, { bearerKey = it }, "Bearer key", "Key",
+                keyboardType = KeyboardType.Password, password = true)
+            if (insecureDraft) {
                 Spacer(Modifier.height(14.dp))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    Button(
-                        onClick = { onConnect(instanceUrl, accessToken) },
-                        enabled = !state.busy && instanceUrl.isNotBlank() && accessToken.isNotBlank(),
-                        contentPadding = PaddingValues(horizontal = 22.dp, vertical = 10.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
-                    ) {
-                        NothingLabel(if (state.busy) "CONNECTING" else "CONNECT", Color.White)
-                    }
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    NothingText("I understand HTTP exposes the key and ride data", color = NothingRed, size = 9,
+                        lineHeight = 14, modifier = Modifier.weight(1f))
+                    Switch(checked = confirmHttp, onCheckedChange = { confirmHttp = it })
                 }
+            }
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = { onConfigure(baseUrl, bearerKey, confirmHttp) },
+                enabled = parsed != null && bearerKey.isNotBlank() && (!insecureDraft || confirmHttp),
+                colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
+            ) { NothingLabel("SAVE & TEST", Color.White) }
+        } else {
+            if (state.insecure) {
+                NothingText("UNENCRYPTED CONNECTION — bearer key and data travel in plaintext",
+                    color = NothingRed, size = 10, weight = FontWeight.Bold, lineHeight = 15)
                 Spacer(Modifier.height(12.dp))
-                NothingText(
-                    "Use HTTPS for remote addresses. Plain HTTP is accepted only for private or .local addresses on a trusted LAN.",
-                    color = NothingMuted,
-                    size = 9,
-                    lineHeight = 14,
-                )
-            } else {
-                NothingText("Webhook", size = 14, weight = FontWeight.Bold)
-                Spacer(Modifier.height(10.dp))
-                NothingText(
-                    "This route can be a local Home Assistant webhook, a Nabu Casa cloudhook, or your HTTPS proxy such as https://ha.example.com/api/webhook/…. The encryption key remains protected by Android Keystore.",
-                    color = NothingMuted,
-                    size = 10,
-                    lineHeight = 16,
-                )
-                Spacer(Modifier.height(18.dp))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    HomeAssistantTextField(
-                        value = webhookUrl,
-                        onValueChange = {
-                            webhookInvalid = false
-                            onWebhookUrlChange(it)
-                        },
-                        label = "Webhook URL",
-                        placeholder = "https://hooks.nabu.casa/…",
-                        enabled = !state.busy,
-                        keyboardType = KeyboardType.Uri,
-                        isError = webhookInvalid,
-                        modifier = Modifier
-                            .weight(1f)
-                            .onFocusChanged { focus ->
-                                val lostFocus = webhookFocused && !focus.isFocused
-                                webhookFocused = focus.isFocused
-                                if (lostFocus) commitWebhook()
-                            },
-                    )
-                    Spacer(Modifier.width(20.dp))
-                    BareHomeAssistantIconButton(
-                        label = "Remove Home Assistant integration",
-                        enabled = !state.busy,
-                        onClick = onRequestRemoval,
-                        icon = { TrashIcon() },
-                    )
-                }
-                if (webhookInvalid) {
-                    Spacer(Modifier.height(8.dp))
-                    NothingText(
-                        "Enter a valid HTTPS webhook or a trusted local HTTP URL.",
-                        color = NothingRed,
-                        size = 9,
-                        lineHeight = 14,
-                    )
-                }
             }
-
-            Spacer(Modifier.height(24.dp))
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        NothingText("Status", color = NothingMuted, size = 10)
-                        NothingText(state.status, size = 10, lineHeight = 15)
-                    }
-                    state.lastDeliveryAt?.let { lastDelivery ->
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            NothingText("Last update", color = NothingMuted, size = 10)
-                            NothingText(UiFormat.localDateTime(lastDelivery), size = 10)
-                        }
-                    }
+                    NothingText(state.baseUrl.orEmpty(), size = 10, lineHeight = 15)
+                    NothingText(
+                        if (state.authMode == ApiAuthMode.OIDC_DEVICE) "SSO-enrolled device" else "Legacy bearer key",
+                        color = NothingMuted,
+                        size = 9,
+                    )
+                    state.serverId?.let { NothingText("Server ${it.take(18)}", color = NothingMuted, size = 9) }
                 }
-                Spacer(Modifier.width(20.dp))
-                HomeAssistantSyncButton(
-                    syncing = state.syncing,
-                    enabled = state.connected && !state.busy,
-                    onClick = onSync,
-                )
+                ApiIconButton("Remove API configuration", true, onRequestRemoval) { TrashIcon() }
             }
-            state.lastRequestError?.let { error ->
-                Spacer(Modifier.height(10.dp))
-                NothingText(error, color = NothingRed, size = 9, lineHeight = 14)
+            Spacer(Modifier.height(18.dp))
+            val caps = state.capabilities
+            NothingText(
+                listOfNotNull(
+                    caps?.metrics?.let { "METRICS v${it.schemaVersion}" },
+                    caps?.realtime?.let { "REALTIME v${it.schemaVersion}" },
+                    caps?.analytics?.let { "ANALYTICS v${it.schemaVersion}" },
+                    caps?.realtime?.takeIf { it.gps }?.let { "GPS" },
+                ).ifEmpty { listOf("NO VALID CAPABILITIES") }.joinToString("  ·  "),
+                color = NothingMuted, size = 9, weight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(18.dp))
+            ApiStatusRow("Metrics", state.metricsStatus)
+            ApiStatusRow("Realtime", state.realtimeStatus)
+            ApiStatusRow("Ride archives", state.analyticsStatus)
+            ApiStatusRow("Charger observations", state.chargerAnalyticsStatus)
+            ApiStatusRow("GPS", state.gpsStatus)
+            state.lastError?.let {
+                Spacer(Modifier.height(8.dp)); NothingText(it, color = NothingRed, size = 9, lineHeight = 14)
+            }
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onRefresh, modifier = Modifier.weight(1f)) { NothingLabel("REFRESH", Color.White) }
+                Button(onClick = onSync, enabled = caps?.metrics != null, modifier = Modifier.weight(1f)) {
+                    NothingLabel("SYNC NOW", Color.White)
+                }
+            }
+            if (caps?.analytics != null) {
+                Spacer(Modifier.height(20.dp))
+                NothingText("Raw analytics consent", size = 12, weight = FontWeight.Bold)
+                NothingText(
+                    "Ride archives can contain device identifiers, exact activity times, raw frames and precise GPS. Charger observation files contain generated IDs, times, relay state and allowlisted power evidence. Approval is scoped to this URL and authenticated server identity.",
+                    color = NothingMuted, size = 9, lineHeight = 14,
+                )
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    NothingText(if (state.analyticsApproved) "Archive uploads enabled" else "Archive uploads disabled", size = 10)
+                    Switch(checked = state.analyticsApproved, onCheckedChange = onSetAnalytics)
+                }
+                if (state.analyticsApproved) TextButton(onClick = onResyncArchives) {
+                    NothingLabel("RESYNC ALL ARCHIVES", NothingRed)
+                }
+            }
+            if (caps?.realtime?.gps == true) {
+                Spacer(Modifier.height(16.dp))
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        NothingText("Live GPS", size = 12, weight = FontWeight.Bold)
+                        NothingText("Requires precise and always-allowed location", color = NothingMuted, size = 9)
+                    }
+                    Switch(checked = state.gpsEnabled, onCheckedChange = onSetGps)
+                }
             }
         }
     }
 }
 
 @Composable
-private fun HomeAssistantTextField(
+private fun ApiStatusRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+        NothingText(label, color = NothingMuted, size = 10)
+        NothingText(value, size = 10, lineHeight = 15)
+    }
+    Spacer(Modifier.height(7.dp))
+}
+
+@Composable
+private fun ApiTextField(
     value: String,
     onValueChange: (String) -> Unit,
     label: String,
@@ -1404,7 +1757,7 @@ private fun HomeAssistantTextField(
 }
 
 @Composable
-private fun BareHomeAssistantIconButton(
+private fun ApiIconButton(
     label: String,
     enabled: Boolean,
     onClick: () -> Unit,
@@ -1418,40 +1771,6 @@ private fun BareHomeAssistantIconButton(
             .semantics { contentDescription = label },
     ) {
         icon()
-    }
-}
-
-@Composable
-private fun HomeAssistantSyncButton(
-    syncing: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Button(
-        onClick = onClick,
-        enabled = enabled && !syncing,
-        modifier = Modifier
-            .width(72.dp)
-            .height(44.dp)
-            .semantics { contentDescription = "Sync Home Assistant now" },
-        shape = RoundedCornerShape(22.dp),
-        contentPadding = PaddingValues(0.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = NothingRaised,
-            contentColor = NothingWhite,
-            disabledContainerColor = NothingRaised,
-            disabledContentColor = NothingWhite,
-        ),
-    ) {
-        if (syncing) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(18.dp),
-                color = NothingWhite,
-                strokeWidth = 2.dp,
-            )
-        } else {
-            NothingLabel("SYNC", NothingWhite)
-        }
     }
 }
 
@@ -1524,11 +1843,12 @@ private fun QuietMetric(
 @Composable
 private fun BatteryMeter(
     percent: Int?,
+    estimatedPercent: Double? = null,
     active: Boolean,
     lowBatteryWarningPercent: Int,
     modifier: Modifier = Modifier,
 ) {
-    val fraction = (percent ?: 0).coerceIn(0, 100) / 100f
+    val fraction = ((estimatedPercent ?: percent?.toDouble() ?: 0.0).coerceIn(0.0, 100.0) / 100.0).toFloat()
     val markerColor = when {
         !active -> NothingInactive
         isLowBoardBattery(percent, lowBatteryWarningPercent) -> NothingRed
@@ -1640,7 +1960,7 @@ private fun RidePath() {
 }
 
 @Composable
-private fun HomeAssistantRemovalDialog(
+private fun ApiRemovalDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1648,11 +1968,11 @@ private fun HomeAssistantRemovalDialog(
         onDismissRequest = onDismiss,
         containerColor = NothingPanel,
         shape = RoundedCornerShape(22.dp),
-        title = { NothingText("Remove Home Assistant?", size = 20, weight = FontWeight.Black) },
+        title = { NothingText("Remove API configuration?", size = 20, weight = FontWeight.Black) },
         text = {
             NothingText(
-                "This resets the Home Assistant integration in Riders Hub and forgets its saved webhook credentials. " +
-                    "Remove the Riders Hub entry in Home Assistant separately if it is no longer needed there.",
+                "This disables delivery and forgets the protected base URL and bearer key. " +
+                    "Destination-scoped delivery acknowledgements are retained if you reconnect later.",
                 color = NothingMuted,
                 size = 11,
                 lineHeight = 18,

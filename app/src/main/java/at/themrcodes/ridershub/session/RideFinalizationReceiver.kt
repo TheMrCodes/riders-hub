@@ -7,7 +7,11 @@ import android.content.Intent
 class RideFinalizationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == RideStore.ACTION_FINALIZE_RIDE) {
-            RideStore.get(context).finalizeExpired()
+            val pending = goAsync()
+            Thread({
+                try { RideStore.get(context).finalizeExpired() }
+                finally { pending.finish() }
+            }, "riders-hub-ride-finalizer").start()
         }
     }
 }

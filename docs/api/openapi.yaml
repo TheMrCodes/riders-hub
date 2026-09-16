@@ -1,0 +1,236 @@
+openapi: 3.1.2
+info:
+  title: Riders Hub self-hosted API
+  version: 1.0.0
+  description: Normative HTTP contract. Unknown object fields must be ignored.
+servers:
+  - url: https://api.example.test/prefix
+security:
+  - deviceBearer: []
+paths:
+  /v1/auth/config:
+    get:
+      operationId: getAuthenticationConfig
+      description: Optional unauthenticated discovery endpoint, present only when OIDC enrollment is enabled.
+      security: []
+      responses:
+        '200':
+          description: OIDC settings required by the native client.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthConfig' }
+  /v1/devices/registrations:
+    post:
+      operationId: registerDevice
+      description: Exchange a short-lived OIDC access token for a source-bound device bearer credential.
+      security:
+        - oidcEnrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '201':
+          description: Device registered. Re-enrollment by the same identity rotates its credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceRegistrationResponse' }
+        '401': { description: 'Invalid access token, issuer, audience, authorized party, expiry, or scope.' }
+        '409': { description: The source identifier is already owned by another OIDC subject. }
+        '503': { description: OIDC verification or registration storage is temporarily unavailable. }
+  /v1/capabilities:
+    get:
+      operationId: getCapabilities
+      responses:
+        '2XX':
+          description: Supported independent data channels.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CapabilitiesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/metrics:
+    post:
+      operationId: postMetric
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MetricEnvelope' }
+      responses:
+        '2XX': { description: Accepted. Every 2xx has this meaning; 202 means durably accepted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenSource' }
+  /v1/analytics/partitions/{source_id}/{partition_sequence}:
+    put:
+      operationId: putAnalyticsPartition
+      parameters:
+        - { name: source_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: partition_sequence, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: Riders-Hub-Partition-Entries, in: header, required: true, schema: { type: integer, minimum: 1 }, description: Logical generation. }
+        - { name: Riders-Hub-Partition-Final, in: header, required: true, schema: { type: boolean } }
+        - { name: Content-Digest, in: header, required: true, schema: { type: string, pattern: '^sha-256=:[A-Za-z0-9+/]+={0,2}:$' }, description: RFC 9530 digest of the transmitted RHA bytes. }
+        - { name: Riders-Hub-Uncompressed-Digest, in: header, required: true, schema: { type: string, pattern: '^sha-256=:[A-Za-z0-9+/]+={0,2}:$' }, description: SHA-256 of the complete uncompressed RHP partition. }
+      requestBody:
+        required: true
+        content:
+          application/vnd.ridershub.rha;version=1:
+            schema: { type: string, format: binary }
+      responses:
+        '2XX': { description: Accepted or identical successful no-op. }
+        '409': { description: 'Older generation, divergent prefix, or changed final content. Existing data is preserved.' }
+        '413': { description: Exceeds advertised max_upload_bytes. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenSource' }
+  /v1/analytics/charger-files/{source_id}/{file_id}:
+    put:
+      operationId: putChargerObservationFile
+      parameters:
+        - { name: source_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: file_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Riders-Hub-Charger-Records, in: header, required: true, schema: { type: integer, minimum: 2 } }
+        - { name: Content-Digest, in: header, required: true, schema: { type: string, pattern: '^sha-256=:[A-Za-z0-9+/]+={0,2}:$' }, description: RFC 9530 digest of the transmitted COA bytes. }
+      requestBody:
+        required: true
+        content:
+          application/vnd.ridershub.coa;version=1:
+            schema: { type: string, format: binary }
+      responses:
+        '2XX': { description: Accepted or an identical successful no-op. }
+        '409': { description: A file with this identity was already stored with different bytes. Existing data is preserved. }
+        '413': { description: Exceeds advertised max_upload_bytes. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenSource' }
+components:
+  securitySchemes:
+    deviceBearer:
+      type: http
+      scheme: bearer
+      description: Source-bound credential returned during device registration, or the deployment's legacy migration key.
+    oidcEnrollmentToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived access token issued to the configured Android public client.
+  responses:
+    Unauthorized: { description: Missing or invalid device bearer credential. }
+    ForbiddenSource: { description: The device credential is valid but bound to another source_id. }
+  schemas:
+    AuthConfig:
+      type: object
+      required: [schema_version, issuer, client_id, audience, scopes]
+      properties:
+        schema_version: { const: 1 }
+        issuer: { type: string, format: uri, pattern: '^https://' }
+        client_id: { type: string, minLength: 1, description: OIDC public-client identifier. }
+        audience: { const: ridershub-api, description: Required access-token audience. }
+        scopes:
+          type: array
+          minItems: 2
+          uniqueItems: true
+          items: { type: string, minLength: 1 }
+          allOf:
+            - contains: { const: openid }
+            - contains: { const: ridershub.device.register }
+    DeviceRegistration:
+      type: object
+      required: [schema_version, source_id]
+      properties:
+        schema_version: { const: 1 }
+        source_id: { type: string, format: uuid, description: Persistent random installation identity. }
+    DeviceRegistrationResponse:
+      type: object
+      required: [schema_version, device_id, source_id, token_type, device_token]
+      properties:
+        schema_version: { const: 1 }
+        device_id: { type: string, format: uuid, description: Server-generated stable registration identity. }
+        source_id: { type: string, format: uuid }
+        token_type: { const: Bearer }
+        device_token:
+          type: string
+          pattern: '^rhd_[A-Za-z0-9_-]{43}$'
+          description: High-entropy credential returned only at registration or rotation time.
+    CapabilitiesResponse:
+      type: object
+      required: [contract_version, server_id, capabilities]
+      properties:
+        contract_version: { const: 1 }
+        server_id: { type: string, minLength: 1, description: Stable opaque identity. }
+        capabilities:
+          type: object
+          minProperties: 1
+          anyOf:
+            - required: [metrics]
+            - required: [realtime]
+            - required: [analytics]
+          properties:
+            metrics:
+              type: object
+              required: [schema_version]
+              properties: { schema_version: { const: 1 } }
+            realtime:
+              type: object
+              required: [schema_version, gps]
+              properties:
+                schema_version: { const: 1 }
+                gps: { type: boolean }
+            analytics:
+              type: object
+              required: [schema_version, rha_format_versions, max_upload_bytes]
+              properties:
+                schema_version: { const: 1 }
+                rha_format_versions:
+                  type: array
+                  items: { type: integer, minimum: 1 }
+                  contains: { const: 1 }
+                coa_format_versions:
+                  type: array
+                  description: Optional supported Charger Observation Archive formats.
+                  items: { type: integer, minimum: 1 }
+                max_upload_bytes: { type: integer, minimum: 1 }
+    MetricEnvelope:
+      type: object
+      required: [schema_version, message_id, sequence, source_id, app_version, kind, occurred_at, sent_at, board_id, data]
+      allOf:
+        - if: { properties: { kind: { const: ride.started } } }
+          then:
+            required: [ride_id]
+            properties:
+              data:
+                required: [started_at]
+                properties: { ride_active: { const: true } }
+        - if: { properties: { kind: { const: ride.ended } } }
+          then:
+            required: [ride_id]
+            properties:
+              data:
+                required: [ended_at, finalized_at]
+                properties: { ride_active: { const: false } }
+      properties:
+        schema_version: { const: 1 }
+        message_id: { type: string, format: uuid, description: Deduplication identity retained across retries. }
+        sequence: { type: integer, minimum: 1, description: Persistent per-source ordering. }
+        source_id: { type: string, format: uuid }
+        app_version: { type: string }
+        kind: { enum: [ride.started, metrics.snapshot, ride.ended] }
+        occurred_at: { type: string, format: date-time, description: Observation or lifecycle occurrence time. }
+        sent_at: { type: string, format: date-time, description: Current transmission attempt time. }
+        board_id: { type: string, format: uuid }
+        ride_id: { type: string, format: uuid }
+        data: { $ref: '#/components/schemas/MetricSnapshot' }
+    MetricSnapshot:
+      type: object
+      required: [connection, ride_active]
+      description: Complete snapshot. An omitted optional measurement is unavailable, not unchanged.
+      properties:
+        connection: { enum: [standby, connecting, live, reconnecting] }
+        ride_active: { type: boolean }
+        trip_distance_km: { type: number, minimum: 0, description: Authoritative remote trip counter in kilometres. }
+        odometer_km: { type: number, minimum: 0 }
+        battery_reported_percent: { type: integer, minimum: 0, maximum: 100 }
+        battery_estimated_percent: { type: number, minimum: 0, maximum: 100 }
+        estimated_range_km: { type: number, minimum: 0 }
+        last_board_observation_at: { type: string, format: date-time }
+        finalized_at: { type: string, format: date-time, description: Logical ride finalization after reconnect grace. }
+        started_at: { type: string, format: date-time, description: Present on ride.started. }
+        ended_at: { type: string, format: date-time, description: Present on ride.ended and equal to logical finalization time. }

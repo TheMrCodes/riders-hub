@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "device_id": "70000000-0000-4000-8000-000000000007",
+  "source_id": "20000000-0000-4000-8000-000000000002",
+  "token_type": "Bearer",
+  "device_token": "rhd_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}

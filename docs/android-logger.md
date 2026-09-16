@@ -66,83 +66,46 @@ remote is paired.
 
 ## Permissions and privacy
 
-The manifest contains six permissions:
+The manifest contains the companion/Bluetooth permissions plus:
 
 - `BLUETOOTH_SCAN`, marked `neverForLocation`
 - `BLUETOOTH_CONNECT`
 - `REQUEST_COMPANION_RUN_IN_BACKGROUND`
 - `REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE`
 - `POST_NOTIFICATIONS`, for the user-requested low-battery warning
-- `INTERNET`, used only when the optional Home Assistant export is enabled
+- `INTERNET`, for the optional self-hosted API
+- coarse, fine, and background location, requested only for opt-in ride GPS
+- foreground-service and location foreground-service permission for continuous ride fixes
 
-It contains no location, storage, boot, wake-lock, exact-alarm, or
-foreground-service permission. Backups are disabled and data-extraction rules
-exclude all app data. The app permits cleartext networking so a user-selected
-local Home Assistant instance can use its common `http://*.local:8123` address,
-but input validation rejects plain HTTP for non-local hosts.
+It contains no storage, boot, wake-lock, or exact-alarm permission. Backups are
+disabled and data-extraction rules exclude all app data. Cleartext networking is
+permitted for user-selected self-hosted servers only after explicit confirmation.
 
 Android may require the device-wide Location Services switch during companion
 device discovery. This is a system scanner prerequisite; the app is not granted
 a location permission and does not receive coordinates.
 
-## Optional Home Assistant export
+## Optional self-hosted API
 
-The Device panel contains an off-by-default Home Assistant section. Its setup
-flow is intentionally split into two states:
+The Device panel contains a self-hosted API section. For HTTPS servers it loads
+`GET /v1/auth/config`, opens the configured OIDC provider in the browser with
+Authorization Code + PKCE, and exchanges the access token at
+`POST /v1/devices/registrations`. Only the resulting source-bound device credential is persisted;
+the base URL and credential are protected using a non-exportable Android Keystore AES-GCM key.
+Legacy bearer entry remains available for migration and HTTP self-hosting. Discovery at
+`GET /v1/capabilities` enables metrics, realtime, and analytics independently. Redirects are
+disabled for API HTTP requests.
 
-1. Enable the section.
-2. In the Home Assistant Companion app, navigate to **Sidebar → Profile →
-   Security → Long-Lived Access Tokens → Create Token**, then copy the token.
-3. Enter the Home Assistant base URL and token and select **Connect**.
-4. Riders Hub sends one authenticated `POST` to
-   `/api/mobile_app/registrations`, then registers five telemetry entities
-   through the returned webhook.
-5. After success, the base URL and token disappear and are not persisted. The
-   webhook URL remains editable while the Home Assistant encryption key stays
-   hidden. Home Assistant may initially supply a Nabu Casa cloudhook, a remote
-   URL, or a local webhook; a user-managed HTTPS proxy such as
-   `https://ha.example.com/api/webhook/…` can replace it.
+Metrics snapshots run at ten-second cadence while the ride process is active;
+lifecycle events are retained in SQLite and retried with their original identity.
+The realtime socket sends `stream.opened` followed only by latest-frame telemetry
+at a maximum of one hertz. Analytics uploads complete RHA packages after a
+separate consent disclosure and retain destination-scoped acknowledgements.
 
-The registration uses a generated app-local UUID rather than a hardware or
-Android device identifier. The registered device is generically named
-**Riders Hub / Android device**. The retained webhook URL is a bearer credential.
-It and the Home Assistant encryption key are encrypted with a non-exportable
-Android Keystore key before being stored in private preferences excluded from
-backup and device transfer. The long-lived token is held only for the
-registration request and is never logged or written to preferences.
-
-Registration declares `supports_encryption: true`. Riders Hub uses Home
-Assistant's XSalsa20-Poly1305 SecretBox wire format for every webhook data
-payload and decrypts encrypted sensor responses before accepting a delivery as
-successful. The outer operation type and routing metadata are not hidden by
-this application-level encryption.
-An existing registration created by an older Riders Hub build is upgraded with
-Home Assistant's one-time `enable_encryption` command before further telemetry
-is sent. If that key cannot be retained, delivery stays paused and the UI asks
-the user to reconnect instead of falling back to plaintext.
-
-The integration exposes:
-
-- board battery percentage, also delivered immediately when its integer value
-  changes;
-- estimated remaining range in kilometres;
-- current logical-trip distance, delivered with battery and estimated range
-  every ten seconds while in use, alongside battery changes, and once more at
-  ride end;
-- the last update timestamp;
-- an in-use binary sensor plus `riders_hub_trip_started` and
-  `riders_hub_trip_ended` events.
-
-Home Assistant may also create the standard device tracker that accompanies a
-`mobile_app` registration. Riders Hub has no location permission and never
-submits coordinates, so this tracker remains without location data and is not
-one of the five telemetry entities above.
-
-It does not send speed, voltage, odometer, mode, remote name/address, ride ID,
-raw frames, or logs. Turning the section off pauses delivery without forgetting
-the connection. **Disconnect** forgets the local webhook; removing the mobile
-app registration from Home Assistant remains a separate action in Home
-Assistant because its webhook API has no registration-deletion command.
+GPS is available only when advertised by realtime capability and requires
+precise plus background access. Its foreground service starts at the first valid
+ride frame, continues through reconnect grace, and writes full `location_fix`
+records into the ride-owned serialized log. See [the public contracts](api/implementer-guide.md).
 
 ## Build and install
 
@@ -259,7 +222,7 @@ uncompressed `.rhp` bytes. The remainder is one DEFLATE stream containing that
 whole partition. The package is expanded and scanned after creation; once
 verified it becomes the immutable representation of that sequence and the next
 sequence is used for new entries. The MAC remains private local telemetry and is
-never used in the filename or a Home Assistant payload.
+never used in decoded API payloads.
 
 ## JSONL schema
 
@@ -272,11 +235,15 @@ Every line is one JSON object with this common envelope:
 | `wall_time` | UTC ISO-8601 timestamp |
 | `elapsed_realtime_ns` | Monotonic Android boot-time timestamp |
 
-For schema versions 2 and 3, the first line is `session_start`. Each technical GATT
+For schema versions 2 through 5, the first line is `session_start`. Each technical GATT
 connection is bracketed by `connection_segment_start` and
 `connection_segment_end`. The final `session_end` is appended only after the
 two-minute reconnect grace expires. Existing schema-version-1 captures remain
 valid and unchanged. Schema 3 adds the explicit child-limiter command events.
+Schema 4 adds frame-aligned battery estimation diagnostics. Schema 5 changes writer ownership
+from a BLE segment to the logical ride and adds versioned `location_fix` records. Connection starts also
+include `telemetry_schema_version`, so an older session resumed after an app update
+can identify the new per-frame format without rewriting its original start record.
 
 | Event | Important event-specific fields |
 | --- | --- |
@@ -294,7 +261,8 @@ valid and unchanged. Schema 3 adds the explicit child-limiter command events.
 | `telemetry_listening` | notification subscription is active |
 | `notification` | characteristic, byte count, exact raw `value_hex` chunk |
 | `decoder_discard` | reason and exact bytes discarded during resynchronization |
-| `telemetry_frame` | raw frame, decoded fields, unknown ranges, CRCs and validity |
+| `telemetry_frame` | raw frame, decoded fields, unknown ranges, CRCs, validity, post-frame estimated battery and diagnostic context |
+| `location_fix` | schema version, coordinates, altitude/accuracy/motion/bearing metadata when available, provider, mock flag, fix and receipt clocks |
 | `gatt_reconnect_scheduled` | reason, attempt, delay |
 | `stale_gatt_callback_ignored` | late callback from a GATT client already replaced by a retry |
 | `protocol_error` / `fatal_error` | nonrecoverable connection problem |
@@ -315,6 +283,85 @@ A typical decoded record has this shape (values are illustrative):
 preserves reconstructed bytes. Later analysis can revisit unknown fields without
 depending on the current decoder's interpretation.
 
+### Frame-aligned battery estimates (schema 4)
+
+Every `telemetry_frame` contains `estimated_battery_percent` and a
+`battery_estimation` object. The estimate is the full-precision result produced
+while processing that exact frame, before publishing its UI state. It is not a
+periodically sampled value or the previous frame's estimate. Raw BLE fields and
+the estimate share the same `seq`, `frame_number`, `wall_time`, and
+`elapsed_realtime_ns`. The two clocks are captured at decoded-frame handling entry;
+the same wall clock and monotonic milliseconds are passed into ride integration.
+They describe phone reception/processing, not an unavailable board sensor clock.
+
+The diagnostic object records:
+
+- `schema_version` (2) and `algorithm` (`persistent-observer-v2`).
+- `status`: `initialized`, `updated`, `held_discontinuity`,
+  `propagated_inferred_gap`, `invalid_crc`,
+  `invalid_board_telemetry`, `no_active_ride`, or `processing_error`.
+- `estimated_percent`, `previous_percent`, `previous_reference_percent`, and
+  the reference actually used (`reference_percent`).
+- `candidate_percent`, `candidate_seconds`, `observation_confirmed`,
+  `settled_seconds`, `settled_voltage_v`, and `settled_observation_used`.
+- `reacquiring_used` for the current update and `reacquiring_after` for the next.
+- `elapsed_seconds`, `interval_distance_km`, `speed_bucket_kmh`,
+  `base_percent_per_km`, and `applied_percent_per_km`.
+- `estimated_gap_speed_bucket_distances_km`, `inferred_gap_distance_km`,
+  `inferred_gap_base_percent_per_km`, `inferred_gap_applied_percent_per_km`,
+  and `inferred_gap_consumption_percent` for a reconstructed driving transition.
+- `consumption_percent` and signed `observation_correction_percent`: for a
+  retained valid estimate, previous minus consumption plus correction equals
+  the new estimate.
+- `learning_before` and `learning_after`: immutable snapshots of the correction
+  factor, learned fallback rate, accepted-window count and last learning error.
+
+A valid first frame after a gap does not count offline time as observation time.
+If the odometer gap is below 2 km, has no charge-sized battery change, and a
+board consumption model exists, the estimator advances through that observed
+distance using the frozen inferred speed profile. The transition applies no
+observation correction and is archived as `propagated_inferred_gap`. With no
+supported model, a hard gap, or a charge-associated gap, the estimate is held.
+Invalid or unprocessed frames record null estimated values and
+an explicit status; they do not reuse a stale estimate and label it as current.
+Unexpected processing errors preserve the raw frame with `processing_error` and
+`battery_processing_error_type` (exception class only), then retain normal error
+propagation. Missing rates are null, not zero consumption-rate measurements.
+
+The existing archive stores original JSONL bytes, so working partitions and sealed
+`.rha` packages retain all these fields without a binary archive format change.
+Final `session_end` still records the final estimate. Older captures do not contain
+these new per-frame estimates and are not backfilled. Diagnostics are stored in
+the normal private telemetry archive; no separate analytics upload is introduced.
+
+### Android emulator telemetry checks
+
+Debug phone builds include `EmulatorTelemetryReceiver`, protected by
+`android.permission.DUMP` and additionally restricted to Android emulator hardware
+(`ranchu` or `goldfish`). It is absent from release manifests. It feeds synthetic
+20+5-byte chunks through the normal notification logger, decoder, estimator and
+archive path without opening a GATT connection. This verifies application handling,
+not the Bluetooth radio or Companion Device presence callbacks.
+
+With the debug app open in a phone emulator, explicit ADB broadcasts can start a
+synthetic session and send frames. The built-in board addresses and label are
+synthetic; the optional `board=2` selects a second isolated test board.
+
+```sh
+adb -s emulator-5554 shell am broadcast -n at.themrcodes.ridershub/.EmulatorTelemetryReceiver --es command start
+adb -s emulator-5554 shell am broadcast -n at.themrcodes.ridershub/.EmulatorTelemetryReceiver --es command frames --ei count 40 --ei battery_percent 60 --ef speed_kmh 18 --ef voltage_v 44 --ei load_raw 7
+adb -s emulator-5554 shell run-as at.themrcodes.ridershub cat files/emulator-telemetry-status.json
+adb -s emulator-5554 shell am broadcast -n at.themrcodes.ridershub/.EmulatorTelemetryReceiver --es command stop
+```
+
+Frames run at approximately 100 ms intervals. Wait for `batch_complete` before
+starting another batch. `invalid_crc=true` tests rejection; `voltage_v=0` tests
+unavailable board telemetry. `stop` flushes the log and preserves reconnect grace.
+`finalize` also advances the finalization check past that grace period for testing
+the normal archive path immediately. Keep emulator captures separate from actual
+ride analysis. The inlet does not inject a learned consumption rate; a new test
+board initially has no consumption model, just like a new real board.
+
 ## Track summaries and range calibration
 
 A finalized session becomes a visible track after either 0.02 km of integrated
@@ -333,7 +380,7 @@ JSONL but do not clutter ride history.
 - Range calibration is board-scoped and accumulates distance across rides until
   the rounded board battery has fallen by at least five percentage points. A
   short ride with no displayed percentage change therefore remains part of the
-  active window instead of being discarded. A battery increase of at least five
+  active window instead of being discarded. A battery increase of at least ten
   points at the start of a new logical ride resets an incomplete window as an
   inferred recharge; voltage rebound during one ride does not.
 - Completed 5% windows form equations relating battery depletion to distance in
@@ -366,11 +413,12 @@ temperature, tires, and riding style—not a guaranteed safe range.
 
 Riders Hub also keeps local, durable charge-to-charge observation summaries for
 range-retention analysis. The **Battery Longevity** section appears between
-Range and Rides; none of this data is exported to Home Assistant.
+Range and Rides; detailed model state is not part of the metrics or realtime contract.
 
-- Charger state is not exposed by the known protocol. A new observation window
-  is therefore marked as **inferred** when the next recorded track starts at
-  least five battery percentage points above the preceding track's final value.
+- Charger state is not exposed by the known protocol. Live observation windows
+  follow the per-board continuity detector described below, independently of
+  ride boundaries. Charge inference requires a sustained rise of at least ten
+  percentage points.
 - Each window retains its first, last, minimum, and maximum battery readings;
   resting-voltage endpoints and extrema; recorded distance and motion time; the
   accumulated 5 km/h speed-bucket profile; odometer endpoints; and ride count.
@@ -408,6 +456,26 @@ window would provide under that same profile. This prevents a change in riding
 speed alone from being presented as battery degradation. The headline is a
 depletion-weighted average of the latest three usable observations; it remains
 explicitly provisional until multiple observations exist.
+
+Lifetime age is shown separately from **observed charges**, in estimated
+full-battery equivalents. For each board, the qualified windows determine an
+empirical full-charge distance: `100 × recorded km / depleted percentage
+points`. Lifetime odometer divided by that distance estimates lifetime full
+cycles; the earliest retained starting odometer estimates cycles before retained
+history. Unrecorded gaps and history removed by retention remain included in the
+lifetime odometer. Observed recharge event counts are never added to this total:
+a partial top-up is not a full cycle. Capacity observations also expose their
+estimated lifetime cycle position for later comparisons.
+
+This is a distance-based proxy, not measured energy throughput or a prediction
+of remaining battery life. It assumes the original battery and a historical
+riding profile similar to this board's recorded mix. Recalibration can revise
+historical cycle positions. Without qualified consumption data, complete finite
+odometer endpoints, or a nondecreasing counter, lifetime age remains unknown.
+The estimate is derived from the existing durable per-board summaries, so it
+survives restart without storing another mutable counter. Legacy charge windows
+with inferred rises below ten points are excluded from capacity fitting and the
+visible charge count; stored summaries and archives remain unchanged.
 
 The capacity chart starts with daily buckets and always uses zero as its minimum
 and the all-time observed high as its maximum. Pinching inward groups the data
@@ -460,7 +528,7 @@ than assumed to be 10 km/h.
 
 The debug app is covered by focused JVM tests for protocol decoding, lifecycle
 continuity, range and longevity estimation, charge-window tracking, voltage
-statistics, Home Assistant payloads and cadence, URL validation, and telemetry
+statistics, API payloads and cadence, URL validation, and telemetry
 archive recovery. Current verification uses the complete JVM test task, Android
 lint, and a debug assembly. Device testing has also covered registration,
 encrypted webhook delivery, BLE reconnection, and current Android adaptive-icon
@@ -470,3 +538,427 @@ Build and static compatibility checks do not replace physical background
 appear/disappear testing across Android versions and OEM power-management
 implementations. Battery longevity is prospective and model-based; its quality
 will improve only as representative charge observations accumulate.
+
+
+### Continuous estimated battery percentage
+
+The current-trip battery display uses a separate, locally estimated percentage,
+marked **Est. battery** on the phone and with `~` on the watch. The raw remote
+percentage is still retained in telemetry, warnings, and calibration inputs.
+
+Each board remembers its own estimate and last confirmed reference independently
+of rides. A new ride resumes that state; only a board without saved state initializes
+from its first valid reading. Legacy ride estimates seed the state only for the
+same board. Restarting the app preserves the estimate without integrating unseen
+time or carrying over observation-confirmation timers.
+
+A changed reading must persist for three seconds of contiguous telemetry before
+it becomes the reference. Consumption interpolates within 2.5 percentage points
+below that reference, tapering smoothly over the last point of this allowance.
+It cannot keep draining the estimate farther while observations disagree. This
+allowance is a conservative display policy, not a verified rounding rule or an
+accuracy bound on the actual charge.
+
+Outside reference +/-2.5 points, observations smoothly correct toward the nearest
+edge. Normal correction has a five-second time constant and a limit of one point
+per second. Three seconds of low raw input (absolute value <=50) and voltage within
+0.2 V of a fixed recent sample shorten the time constant to three seconds. These
+heuristics affect correction speed only; raw input is not a verified current
+measurement, and voltage is not converted directly into charge.
+
+After a disconnect/restart, a confirmed reading can correct obsolete saved state
+faster: one-second time constant, limited to ten points per second, until within
+2.6 points of the reference. This handles charging or use while disconnected
+without snapping on the first packet. A large difference can temporarily remain
+during confirmation and catch-up. Within the interpolation band, repeated readings
+do not pull the estimate to its centre. Missing rates prevent consumption prediction
+but not correction. Upward correction is not a measurement of recuperated energy.
+Raw percentages remain available for warnings and telemetry.
+
+Each board retains a separate adaptive model. Fully observed intervals between
+downward transitions teach an empirical percentage-per-kilometre rate and a
+correction factor for the existing speed-bucket model. The first partial plateau
+is excluded. The observer must first confirm low controller input and voltage
+stability; the transition must then remain reliable for another three seconds
+before it can form a learning boundary. Distance boundaries remain at the original transition.
+A rise or a gap discards the unfinished interval. Intervals need at least five
+points of observed depletion and plausible distance/consumption. A completed
+interval adjusts learned rates gradually (5% weight for the new observation).
+One observation can request at most a 2x upward base-model correction, and a
+standalone learned fallback rate remains inactive below three accepted intervals.
+The saved model also retains its pre-correction prediction error. Those
+parameters are initial safeguards, not a promise of monotonically improving
+real-world accuracy. Sustained sag can still look like depletion in this protocol.
+
+Only adjacent valid board observations at most two seconds apart advance the
+prediction or learning window. Disconnects, invalid frames, and process recreation
+reset coverage and the monotonic time anchor. A supported sub-2 km odometer gap
+can advance the estimate through its inferred speed profile without counting
+offline time as observation time; other gaps hold it. Estimated state and
+learned parameters persist independently per board across rides and restarts. Completed
+ride summaries and `session_end` retain the final estimated percentage. Existing
+summaries without the optional field continue to use raw percentage. Older
+smoothing recovery targets are ignored. Versioned raw-frame replay can reconstruct
+the estimator state and learned parameters without modifying the archive.
+
+Remaining range uses this same battery estimate instead of applying another raw
+percentage/voltage blend. Consumption fitting and active-trip speed weighting
+are unchanged in this increment; battery interpolation alone does not fix every
+source of range variation. Existing calibration history is retained.
+
+Legacy ride-summary fallback uses a ten-point endpoint threshold. On an idle
+startup, stale analytics/model versions rebuild from verified local archives
+using the continuous per-board detector. See historical analytics migration below.
+
+### Replay archived rides in the Android emulator
+
+The debug app can replay local `.rha` archives through the notification decoder,
+ride store, battery observer, learning, logging, and live UI. Use the standard
+library Python driver from the repository root:
+
+```sh
+# Build and install the debug APK on an already running emulator.
+./gradlew :app:assembleDebug
+adb -s emulator-5554 install -r app/build/outputs/apk/debug/app-debug.apk
+
+# Inspect anonymous session indices; nothing is sent to the emulator.
+python3 tools/replay_archive.py riders-hub-telemetry/archive --list
+
+# Replay a selected excerpt at normal speed and wait for completion.
+python3 tools/replay_archive.py riders-hub-telemetry/archive \
+  --serial emulator-5554 --session 1 --offset 60 --duration 120 --wait
+
+# Browse faster; omit --wait to return while playback continues in the app.
+python3 tools/replay_archive.py riders-hub-telemetry/archive \
+  --serial emulator-5554 --session 1 --speed 5
+
+# Stop early and finalize the replay ride.
+python3 tools/replay_archive.py --serial emulator-5554 --stop
+```
+
+Set `ANDROID_HOME` for your SDK as needed, or provide `--adb`. The driver accepts
+one archive file or a directory, validates archive and entry checksums, orders
+sessions chronologically, and defaults to the session with the most frames.
+Selection offsets and durations are in recorded seconds. It sends only frame
+bytes and relative delays to a fixed private file in the emulator app. Source
+activity timestamps, Bluetooth identities, and archive metadata are not imported.
+Real trip/odometer and telemetry values in the bytes remain local, including in
+the emulator's newly generated logs; never commit these artifacts.
+
+Playback uses a synthetic board slot (`--board 3` by default). Different slots
+keep learned battery state separate; repeated use of a slot continues its
+persisted state. Slots 1 and 2 are reserved for the synthetic smoke checks.
+Starting another replay finalizes the previous emulator session. Completion
+also finalizes the ride, making it available to history and charge-window
+analysis. No app data is cleared and no historical estimator state is restored
+from the source archive.
+
+At `--speed 1`, original frame cadence is preserved approximately. Long gaps or
+monotonic-clock resets become three-second discontinuities; original connection
+events and offline waiting are not recreated. Frames are delivered in chunks of
+at most 20 bytes through the real decoder. The app uses its current clock and
+recomputes its estimates. Accelerated replay changes integrated distance,
+settling and learning relative to the original ride; use it to inspect UI values,
+not to score estimator accuracy or reproduce historical state exactly.
+
+The receiver is debug-only, requires the system/ADB DUMP permission, and rejects
+physical hardware. The driver also verifies the explicit emulator target.
+Reader/selection regression tests use synthetic fixtures:
+
+```sh
+python3 -m unittest discover -s tools -p 'test_*.py'
+```
+
+
+### Continuous board calibration and information gaps
+
+Live calibration, charge-window collection, and transient battery observation/
+learning trackers now follow each board across UI rides. Opening or finalizing
+a ride does not itself reset a consumption window or infer charging.
+The per-board continuity checkpoint is durable; the battery estimate and learned
+parameters continue to use their existing persistence. Transient estimator
+confirmation restarts conservatively after a process restart.
+
+The detector identifies missing valid samples (over two seconds), backward
+clock intervals, invalid telemetry, odometer resets, and implausible counter
+jumps. Frames are processed in delivery order. Equal millisecond timestamps preserve
+observations and windows, adding zero elapsed time; they are not gaps. Logged
+event sequences and frame numbers record processing order, while timestamps
+supply duration. The odometer remains total-distance evidence, including unobserved
+kilometres. Its 0.1 km resolution is allowed when checking adjacent counter
+increments. Speed integration supplies the finer speed-bucket profile only
+across observed intervals; arrival speed is never assigned to missing distance.
+An interruption splits an unfinished range-calibration window when at least
+2 km of odometer change or 10 battery percentage points of change occurred while
+telemetry was missing (both thresholds inclusive). Smaller changes preserve the
+window, even if an endpoint was moving, without integrating speed or confirmation
+time across the pause. Known sub-threshold odometer distance is retained and its speed mix is estimated
+from the board's common measured distribution, as described below. Measured
+coverage remains distinct from coverage that includes inferred riding speed. Clock/counter discontinuities and missing older checkpoint
+battery values remain conservative split cases. The board's learned model and
+overall charge history remain intact.
+
+A charge requires a rise of at least ten percentage points above the local
+reference for thirty seconds of continuously observed telemetry. It can be
+detected during the same connection or across rides. Offline time never counts
+toward confirmation. A smaller rise or decrease that persists at the same reported value for thirty
+seconds becomes the new reference. This prevents brief downward sag and separate
+settled five-point rebounds from creating a charge against an old minimum. Pending charge evidence is withheld from consumption
+fitting; confirmation starts a new charge window. These remain inferred events,
+not direct charger measurements.
+
+Each valid frame's `battery_estimation.continuity` object (schema 2) separates
+the timing/validity interruption reason from the calibration-gap reason. It also
+records odometer and battery increments, profiled and unprofiled interval distance,
+pending-charge duration, and confirmed recharge increase. Ride summaries remain navigation/history units;
+they are no longer appended a second time to live charge-cycle totals.
+Old stored summaries are retained and the summary-based migration fallback
+remains available for data predating live continuity collection.
+
+
+### Estimated speed profiles for missing distance
+
+For retained odometer gaps, the app allocates distance across the same 5 km/h
+buckets using the board's most recent 100 km of measured ride profiles available
+before that gap. Allocation is distance-weighted: a 1 km gap with a 60/40 profile
+adds estimated distances of 0.6 km and 0.4 km. Different boards are filtered before
+selecting history. With no suitable measured history, the distribution stays
+unknown. Charge-associated or discarded gaps are not assigned across their
+boundaries.
+
+Range and charge summaries persist `estimated_speed_bucket_distances_km`
+separately from measured `speed_bucket_distances_km`. Existing summaries read
+with an empty estimated map. Per-frame battery diagnostics include the exact
+`estimated_gap_speed_bucket_distances_km` used at that arrival. The allocation
+is frozen at observation time, so later rides do not leak into historical
+predictions, and inferred buckets never become the source for the common
+measured profile.
+
+Range fitting uses the combined measured/inferred mix when it covers a window,
+weighting that observation by its measured-distance fraction. A wholly inferred
+window does not train per-speed costs. Total distance remains usable for the
+aggregate rate. Longevity continues to require 90% measured coverage; accepted
+observations can use the combined mix for normalization. Imputation does not
+turn missing samples into measured evidence or relax that admission criterion.
+
+The live battery twin also consumes a retained gap's observed distance. Its
+expected use is the sum of each inferred bucket distance times that bucket's
+supported rate. Buckets without a supported rate use the board aggregate; if
+neither is available, energy use remains unresolved and the SOC estimate is held.
+This state transition does not teach the bucket model from its own inferred mix.
+
+
+### Reported battery maxima and range retention over kilometres
+
+Each board now persists its highest valid reported percentage, the first
+timestamp/odometer where that maximum appeared, its highest percentage sustained
+for 30 seconds, and monthly reported maxima (up to 240 months). The all-time
+maximum remains independent of monthly/history retention. Existing saved
+charge-window maxima seed the all-time value without inventing their exact
+occurrence time, odometer, or sustained-reading evidence. Invalid telemetry or
+a gap in observations interrupts sustained-reading confirmation. These are
+remote-scale diagnostics: an observed maximum of 80% is never automatically
+mapped to true 100% charge. Monthly maxima may reflect partial charging as well
+as changes in remote calibration.
+
+The maxima remain in frame-aligned battery diagnostics; they are not shown in
+the compact Battery Longevity section. Odometer values
+are now attached to capacity observations, allowing a relative range-retention
+trend once there are six distinct, completed, usable charge windows spanning at
+least 60 days, with at least 500 km between the median odometers of the first
+three and latest three observations. These are initial data-quantity gates,
+not guarantees of accuracy. Active unfinished charge windows cannot establish
+the trend.
+
+Retention is the median normalized range of the latest three observations
+divided by the median of the first three, expressed as a percentage. The model
+also exposes signed change per 1,000 km of comparison distance; it does not
+clamp improvements to zero or assume every change is degradation. Backward
+odometer movement in the qualified observations withholds the trend.
+
+This estimates relative speed-normalized usable-range change from the earliest
+retained baseline. Temperature, terrain, load, remote-scale calibration, and
+battery replacement can affect it; odometer alone cannot isolate cell ageing or
+recover capacity lost before recording began. Existing durable charge summaries
+supply the trend after restart. The reported-percentage maxima are stored
+independently per board and do not change battery interpolation or capacity
+normalization.
+
+### Cumulative speed-bucket statistics
+
+`RideStore.speedBucketStatistics(localBoardId)` and the selected board's
+`RideStoreSnapshot.speedBucketStatistics` expose three cumulative views:
+
+- Measured kilometres and percentage of measured distance in each 5 km/h bucket.
+- Estimated battery percentage points per 100 km, the equivalent full-battery
+  range, and the modeled consumption share across measured riding. Consumption
+  shares are conditional on buckets with a fitted rate; unsupported buckets
+  remain null. These values describe reported battery depletion, not measured Wh.
+- Measured kilometres as a simple confidence proxy, with inferred gap kilometres
+  separate. Completed-window measured/inferred support and contributing-window
+  counts are available for deeper analysis. Fits at either bound are flagged.
+
+The versioned `board_speed_bucket_stats_v1` preference is saved in the same edit
+as ride, continuity, and active calibration state. Totals accumulate across rides
+and recharges and survive rolling history retention. Weighted regression cross
+products and targets preserve consumption evidence without retaining an unbounded
+list of depletion windows. Mixed windows use their measured fraction as weight;
+inferred-only or insufficiently covered windows cannot teach bucket costs.
+Range forecasts, gap state transitions, and capacity normalization consume only
+supported rates from this shared per-board model
+and measured-distance distribution. The active trip can change the range forecast's
+speed mix without refitting its consumption costs. The recent-100-km range fit and
+charge-cycle fit remain fallbacks where cumulative rates are unavailable. A
+full-battery equivalent still uses the remote's percentage scale.
+
+On first use, each board is seeded once from its retained, board-identified ride
+summaries and calibration windows, including an active ride. Duplicate retained
+IDs are counted once; subsequent restarts do not repeat migration or count ride
+finalization as additional distance. Unknown-board history is not pooled into
+another board. The migration flag denotes a partial historical baseline: already
+trimmed records and archives outside app storage are not silently reconstructed.
+New measured distance comes from valid continuous-stream intervals; retained gap
+allocations remain inferred, and unassignable retained distance is kept separately.
+No confidence percentage is inferred from kilometres.
+
+
+### Bucket statistics linked to analytics
+
+The same board-scoped snapshot is passed to dashboard range, the live battery
+observer's base consumption model, API telemetry/end-of-ride range,
+and capacity normalization. Range remains available from persisted sufficient
+statistics even after individual calibration windows are trimmed. Both range and
+capacity results expose the backing statistics, including measured confidence
+kilometres, inferred distance, support counts, and model-limit flags. Statistics
+whose board ID does not match the selected board are ignored.
+
+Gap allocation uses the accumulated measured distribution available before the
+arrival's inferred kilometres are added; it falls back to retained measured ride
+profiles for uninitialized boards. Inferred kilometres never enter this reference
+distribution. Capacity still requires a confirmed charge observation and sufficient
+measured coverage; shared bucket statistics cannot turn incomplete cycles into
+capacity evidence. Odometer-derived cycle age continues to use observed cycle
+consumption rather than a normalized speed-bucket range.
+
+Per-frame `battery_estimation` diagnostics include `bucket_model_source`
+(`cumulative`, `retained_windows`, or `unavailable`) and `bucket_model_evidence`.
+The latter preserves the selected bucket's measured confidence kilometres,
+inferred kilometres, calibration support, window count, and limit flag from the
+model used for that frame. The existing base/applied rates retain the actual
+consumption calculation, including the observer's learned correction. New completed
+windows invalidate the cached base model immediately; otherwise the model and its
+evidence refresh at the existing ten-second cadence. Invalid frames carry null
+bucket evidence.
+
+### Collapsible trip history
+
+The Rides list keeps today and the previous six local calendar days visible at
+the top. Older trips start collapsed into day, Monday-based week, month, or year
+sections. A section splits into finer calendar groups only when every resulting
+group contains at least five trips. Sparse adjacent years combine; an older
+history with fewer than five trips remains accessible as one smaller section.
+Unparseable timestamps remain accessible under Undated trips.
+
+Section headers show trip count and summed recorded trip distance. Expanded rows
+remain lazy list items, and expansion state survives activity recreation. All
+retained trips are available, replacing the former 30-row presentation limit;
+this does not change history retention or any range/capacity calculation.
+
+### Historical analytics migration
+
+The evidence and uncertainty contract for subsequent estimators is defined in
+[Board digital twin](digital-twin.md).
+
+Analytics projections rebuild in the background on an idle startup, after finalized
+JSONL logs have been archived. `analytics_history_version = "4"` identifies the
+stored projection shape and `analytics_model_version` identifies the formulas that
+produced it. A change to either value replays available raw archives from empty
+state. Fresh installations without archive data receive both markers without
+replay. A failed or deferred rebuild retains the old data and can retry later.
+
+The reader validates RHA packages and RHP entry checksums, commit records, record
+order and board identity without repairing source files. It rejects incomplete
+partitions, missing retained trips and uncovered legacy analytics intervals.
+Frames retain delivery order within each session; sessions replay chronologically
+and boards remain isolated. Replay first confirms sustained rises of at least ten
+percentage points, then places the charge boundary at the first elevated frame so
+confirmation time is retained in the new cycle. Missing intervals below 2 km retain
+their odometer distance with an inferred speed profile; intervals at or above 2 km
+split calibration evidence. Odometer distance spanning a confirmed charge remains
+stored as known but unattributed distance because its speed mix and position relative
+to the charge are not observable. Rebuilt charge cycles, depletion windows,
+cumulative bucket statistics, continuity, reported maxima, adaptive-learning
+parameters and the final continuous battery estimate are replaced together.
+Saved trip totals remain presentation history and are not rewritten.
+
+`analytics_replay_manifest_v1` binds each installed projection to its model
+version and a SHA-256 fingerprint of the exact verified JSONL records, plus source
+record/session/frame counts. Prior derived values are comparison inputs only; they
+never seed replayed estimates. A model-only change can therefore use the same raw
+frames as a deterministic data migration without changing the stored schema.
+
+A private versioned `files/analytics-migration/before-v*-*.json` backup and
+`comparison-v*-*.json` report precede replacement. The comparison filename includes
+the model version so successive formula iterations remain inspectable. The worker rechecks that no ride
+is active and preferences still match its input snapshot, then commits the derived
+state and version marker together. Archive errors or concurrent changes cannot
+silently apply a partial rebuild. These private diagnostics must not be published.
+
+### Battery Longevity presentation
+
+The range estimate sits beside Observed charges and Est. total charges. The latter
+is rounded to whole equivalent cycles and stays gray below ten observed charges;
+unavailable values show an em dash. The status sentence remains below this row.
+Highest-battery, lifetime-explanation and range-trend text blocks are omitted.
+
+The chart reserves eight positions, ending at the selected populated period and
+filling from earlier populated periods at the same granularity. Missing periods
+are skipped; insufficient history leaves blank positions on the left. Tapping
+drills into the selected period's latest observation, while pinching inward groups
+time without losing the anchor. Only the selected bar is red. Weighted capacity
+aggregation and the historical maximum scale are retained.
+
+### Riders Profile
+
+Riders Profile sits between Range and Battery Longevity. A compact vertical bar
+chart offers Distribution (percentage of measured distance) and Energy use
+(estimated battery percentage points consumed per kilometre, displayed as % / km).
+Empty buckets are omitted.
+Two tabs sit below the histogram, with 48 dp touch targets and indicator lines
+above their titles. The selected tab's line is red. Bars use grayscale only. Energy-use bars
+are dimmed until their bucket has at least 1 km measured, positive measured
+calibration support and a contributing window, a finite positive consumption
+estimate, and no model-limit flag. Inferred distance does not satisfy this gate.
+This is a presentation threshold, not a confidence probability, and does not
+alter the underlying consumption estimator.
+Each energy bar displays that bucket's estimated consumption with two decimal
+places, independently of the current battery level or riding mix. Taller bars
+mean more battery consumed per kilometre.
+Model-limit results appear as unavailable rather than displaying the fit limit
+as a consumption prediction.
+
+## Shelly charger observation
+
+The optional charger digital twin uses a second, role-tagged companion-device
+association for a Shelly Plus Plug S Gen2. A fresh BLE appearance may surface an
+in-app chip and notification, but neither path turns on the relay. Both open the
+same confirmation dialog. A confirmed start uses `Switch.Set` for switch `0`
+with `toggle_after=43200`; the app then verifies the reported output state.
+
+Observed power at or above 10 W must remain fresh for 30 seconds before charging
+is considered active. An output that does not develop active load within five
+minutes is turned off. After active charging, completion requires 20 continuous
+minutes of fresh observations at or below both 5 W and 10 percent of the recorded
+peak. Observation gaps reset completion evidence. Protection errors request an
+immediate best-effort OFF, and manual STOP also requires confirmation. These
+rules use Shelly power evidence only and do not modify board-battery charge
+inference or its inclusive ten-point, 30-second confirmation rule.
+
+Each appearance or charging episode is retained locally as append-only Charger
+Observation Archive (`COA v1`) JSONL. It contains generated export identities,
+timestamps, allowlisted relay/power/protection evidence, decisions and outcomes;
+it excludes BLE addresses, Wi-Fi details, Shelly source identifiers and raw RPC.
+COA is not mixed into ride RHA files. A server can opt into uploads with
+`coa_format_versions: [1]` and receives files at
+`PUT /v1/analytics/charger-files/{source_id}/{file_id}` under the same explicit
+raw-analytics consent, with independent durable acknowledgement state.

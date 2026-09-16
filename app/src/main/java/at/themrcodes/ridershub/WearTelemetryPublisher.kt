@@ -27,7 +27,12 @@ internal class WearTelemetryPublisher(
             return
         }
         lastLivePublishAtMs = now
-        val telemetry = telemetryWithoutRange.copy(estimatedRangeKm = estimatedRangeKm(snapshot))
+        val rides = rideSnapshot(snapshot)
+        val telemetry = telemetryWithoutRange.copy(
+            estimatedRangeKm = rides?.rangeEstimate?.remainingKm,
+            estimatedBatteryPercent = (rides?.activeRide ?: rides?.lastCompletedRide)
+                ?.takeIf { it.boardBatteryEnd == snapshot.boardBatteryPercent }?.estimatedBatteryPercent,
+        )
         val request = PutDataRequest.create(WearTelemetryState.DATA_PATH)
             .setData(telemetry.encode())
             .setUrgent()
@@ -37,14 +42,12 @@ internal class WearTelemetryPublisher(
             ?.addOnFailureListener { /* The next state change retries synchronization. */ }
     }
 
-    private fun estimatedRangeKm(snapshot: AppSnapshot): Double? {
+    private fun rideSnapshot(snapshot: AppSnapshot): at.themrcodes.ridershub.session.RideStoreSnapshot? {
         val restingVoltage = snapshot.packVoltageV
             ?.takeIf { (snapshot.speedKmh ?: Float.MAX_VALUE) <= 0.5f }
             ?.toDouble()
         return runCatching {
             rideStore.snapshot(snapshot.boardBatteryPercent, restingVoltage)
-                .rangeEstimate
-                .remainingKm
         }.getOrNull()
     }
 

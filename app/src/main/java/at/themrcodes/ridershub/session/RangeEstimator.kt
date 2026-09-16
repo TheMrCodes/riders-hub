@@ -12,17 +12,28 @@ object RangeEstimator {
     private const val BUCKET_PRIOR_STRENGTH_KM_SQUARED = 1.0
     private const val BUCKET_MODEL_ITERATIONS = 40
 
+    @JvmOverloads
     fun estimate(
         currentBatteryPercent: Int?,
         currentRestingVoltageV: Double?,
         depletionWindows: List<RangeDepletionWindow>,
         profileSessions: List<RideSummary>,
         calibrationPoints: List<CalibrationPoint>,
+        estimatedBatteryPercent: Double? = null,
+        selectedBoardId: String? = null,
+        speedBucketStatistics: BoardSpeedBucketStatistics? = null,
     ): RangeEstimate {
         val voltageModel = fitVoltageModel(calibrationPoints)
+        val boardStats = speedBucketStatistics?.takeIf { it.localBoardId == selectedBoardId }
+        val accumulatedRates = boardStats?.consumptionRates().orEmpty()
+        val useAccumulated = accumulatedRates.isNotEmpty() && boardStats != null &&
+            boardStats.observedDistanceKm.isFinite() && boardStats.observedDistanceKm >= MIN_DISTANCE_KM &&
+            boardStats.observedDepletionPercent.isFinite() && boardStats.observedDepletionPercent >= MIN_DEPLETION_PERCENT
         val observations = recentObservations(depletionWindows, PROFILE_DISTANCE_KM)
-        val observedDistance = observations.sumOf { it.distanceKm }
-        val observedDepletion = observations.sumOf { it.depletionPercent }
+        val observedDistance = if (useAccumulated) requireNotNull(boardStats).observedDistanceKm
+            else observations.sumOf { it.distanceKm }
+        val observedDepletion = if (useAccumulated) requireNotNull(boardStats).observedDepletionPercent
+            else observations.sumOf { it.depletionPercent }
 
         if (
             currentBatteryPercent == null ||
@@ -40,6 +51,7 @@ object RangeEstimator {
                 observedDistanceKm = observedDistance,
                 observedDepletionPercent = observedDepletion,
                 message = "Collecting the first 5% battery-use window",
+                speedBucketStatistics = boardStats,
             )
         }
 
@@ -53,12 +65,15 @@ object RangeEstimator {
                 observedDistanceKm = observedDistance,
                 observedDepletionPercent = observedDepletion,
                 message = "More complete 5% battery-use windows are required",
+                speedBucketStatistics = boardStats,
             )
         }
 
         val aggregatePercentPerKm = 1.0 / aggregateKmPerPercent
-        val bucketPercentPerKm = fitBucketConsumption(observations, aggregatePercentPerKm)
-        val commonProfile = recentSpeedProfile(profileSessions, PROFILE_DISTANCE_KM)
+        val bucketPercentPerKm = if (useAccumulated) accumulatedRates
+            else fitBucketConsumption(observations, aggregatePercentPerKm)
+        val commonProfile = boardStats?.measuredProfile().orEmpty()
+            .ifEmpty { recentSpeedProfile(profileSessions, PROFILE_DISTANCE_KM) }
             .ifEmpty { pooledObservationProfile(observations) }
         val activeProfile = activeRideProfile(profileSessions)
         val forecastProfile = activeProfile ?: commonProfile
@@ -74,10 +89,12 @@ object RangeEstimator {
             .coerceIn(MIN_KM_PER_PERCENT, MAX_KM_PER_PERCENT)
 
         val voltagePercent = currentRestingVoltageV?.let { voltageModel?.percentAt(it) }
-        val effectiveBattery = voltagePercent
-            ?.takeIf { it in (currentBatteryPercent - 15.0)..(currentBatteryPercent + 15.0) }
-            ?.let { currentBatteryPercent * 0.7 + it * 0.3 }
-            ?: currentBatteryPercent.toDouble()
+        val effectiveBattery = estimatedBatteryPercent
+            ?.takeIf { it.isFinite() && it in 0.0..100.0 }
+            ?: (voltagePercent
+                ?.takeIf { it in (currentBatteryPercent - 15.0)..(currentBatteryPercent + 15.0) }
+                ?.let { currentBatteryPercent * 0.7 + it * 0.3 }
+                ?: currentBatteryPercent.toDouble())
         val confidence = min(
             100,
             (min(1.0, observedDistance / 100.0) * 60 +
@@ -105,6 +122,8 @@ object RangeEstimator {
             observedDepletionPercent = observedDepletion,
             message = if (activeProfile != null) {
                 "Adjusted to this trip's speed mix; calibrated from 5% battery-use windows"
+            } else if (useAccumulated) {
+                "Calibrated from accumulated per-board speed buckets"
             } else if (status == RangeEstimateStatus.CALIBRATED) {
                 "Calibrated to your latest ${"%.0f".format(Locale.US, observedDistance)} km usage pattern"
             } else {
@@ -112,6 +131,8 @@ object RangeEstimator {
             },
             bucketBatteryPercentPer100Km = bucketPercentPerKm.mapValues { (_, rate) -> rate * 100.0 },
             commonSpeedBucketDistributionPercent = profileDistributionPercent,
+            speedBucketStatistics = boardStats,
+            usesAccumulatedBucketConsumption = useAccumulated,
         )
     }
 
@@ -121,7 +142,7 @@ object RangeEstimator {
     ): Map<Int, Double> {
         val bucketed = observations.filter { it.hasCompleteBucketCoverage() }
         val bucketStarts = bucketed
-            .flatMap { it.speedBucketDistancesKm.keys }
+            .flatMap { it.effectiveBuckets.keys }
             .distinct()
             .sorted()
         if (bucketStarts.isEmpty()) return emptyMap()
@@ -133,16 +154,16 @@ object RangeEstimator {
                 var numerator = BUCKET_PRIOR_STRENGTH_KM_SQUARED * aggregatePercentPerKm
                 var denominator = BUCKET_PRIOR_STRENGTH_KM_SQUARED
                 bucketed.forEach observationLoop@{ observation ->
-                    val bucketDistance = observation.speedBucketDistancesKm[bucket] ?: 0.0
+                    val bucketDistance = observation.effectiveBuckets[bucket] ?: 0.0
                     if (bucketDistance <= 0.0) return@observationLoop
-                    val depletionFromOtherBuckets = observation.speedBucketDistancesKm.entries.sumOf {
+                    val depletionFromOtherBuckets = observation.effectiveBuckets.entries.sumOf {
                         (otherBucket, distanceKm) ->
                         if (otherBucket == bucket) 0.0
                         else distanceKm * (percentPerKm[otherBucket] ?: aggregatePercentPerKm)
                     }
-                    numerator += bucketDistance *
+                    numerator += observation.measuredShare * bucketDistance *
                         (observation.depletionPercent - depletionFromOtherBuckets)
-                    denominator += bucketDistance * bucketDistance
+                    denominator += observation.measuredShare * bucketDistance * bucketDistance
                 }
                 percentPerKm[bucket] = (numerator / denominator).coerceIn(
                     1.0 / MAX_KM_PER_PERCENT,
@@ -175,12 +196,17 @@ object RangeEstimator {
                             depletionPercent = window.observedDepletionPercent * fraction,
                             speedBucketDistancesKm = window.speedBucketDistancesKm
                                 .mapValues { (_, distanceKm) -> distanceKm * fraction },
+                            estimatedSpeedBucketDistancesKm = window.estimatedSpeedBucketDistancesKm
+                                .mapValues { (_, distanceKm) -> distanceKm * fraction },
                         ),
                     )
                     remainingDistanceKm -= window.recordedDistanceKm * fraction
                 }
         }
     }
+
+    internal fun observedCommonProfile(sessions: List<RideSummary>): Map<Int, Double> =
+        recentSpeedProfile(sessions, PROFILE_DISTANCE_KM)
 
     private fun recentSpeedProfile(
         sessions: List<RideSummary>,
@@ -225,9 +251,14 @@ object RangeEstimator {
         val distanceKm: Double,
         val depletionPercent: Double,
         val speedBucketDistancesKm: Map<Int, Double>,
+        val estimatedSpeedBucketDistancesKm: Map<Int, Double>,
     ) {
+        val effectiveBuckets: Map<Int, Double>
+            get() = mergeSpeedBuckets(speedBucketDistancesKm, estimatedSpeedBucketDistancesKm)
+        val measuredShare: Double
+            get() = (speedBucketDistancesKm.values.sum() / distanceKm).coerceIn(0.0, 1.0)
         fun hasCompleteBucketCoverage(): Boolean =
-            speedBucketDistancesKm.values.sum() >= distanceKm * MIN_BUCKET_COVERAGE_RATIO
+            measuredShare > 0.0 && effectiveBuckets.values.sum() >= distanceKm * MIN_BUCKET_COVERAGE_RATIO
     }
 
     private fun fitVoltageModel(points: List<CalibrationPoint>): VoltageModel? {

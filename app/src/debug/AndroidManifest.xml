@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
+        <receiver
+            android:name=".EmulatorTelemetryReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="at.themrcodes.ridershub.DEBUG_EMULATOR_TELEMETRY" />
+            </intent-filter>
+        </receiver>
         <!-- Debug-only Data Layer smoke-test sender; only ADB/system callers hold DUMP. -->
         <receiver
             android:name=".WearDataLayerTestReceiver"

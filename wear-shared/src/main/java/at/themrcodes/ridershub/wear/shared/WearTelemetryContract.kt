@@ -27,6 +27,7 @@ data class WearTelemetryState(
     val tripKm: Double?,
     val estimatedRangeKm: Double?,
     val mode: String?,
+    val estimatedBatteryPercent: Double? = null,
 ) {
     init {
         require(updatedAtEpochMs >= 0)
@@ -37,6 +38,8 @@ data class WearTelemetryState(
             estimatedRangeKm == null ||
                 estimatedRangeKm.isFinite() && estimatedRangeKm in 0.0..MAX_RANGE_KM,
         )
+        require(estimatedBatteryPercent == null ||
+            estimatedBatteryPercent.isFinite() && estimatedBatteryPercent in 0.0..100.0)
         require(mode == null || mode.length <= MAX_MODE_LENGTH)
     }
 
@@ -52,6 +55,7 @@ data class WearTelemetryState(
             output.writeOptionalDouble(tripKm)
             output.writeOptionalDouble(estimatedRangeKm)
             output.writeOptionalString(mode)
+            output.writeOptionalDouble(estimatedBatteryPercent)
         }
         return bytes.toByteArray()
     }
@@ -59,7 +63,7 @@ data class WearTelemetryState(
     companion object {
         const val DATA_PATH = "/riders-hub/telemetry"
         private const val MAGIC = 0x52485542
-        private const val SCHEMA_VERSION = 2
+        private const val SCHEMA_VERSION = 3
         private const val LEGACY_SCHEMA_VERSION = 1
         private const val MAX_SPEED_KMH = 200.0
         private const val MAX_TRIP_KM = 1_000_000.0
@@ -71,7 +75,7 @@ data class WearTelemetryState(
         ).use { input ->
             require(input.readInt() == MAGIC) { "Unknown Wear telemetry payload" }
             val version = input.readInt()
-            require(version == LEGACY_SCHEMA_VERSION || version == SCHEMA_VERSION) {
+            require(version in LEGACY_SCHEMA_VERSION..SCHEMA_VERSION) {
                 "Unsupported Wear telemetry schema $version"
             }
             val connection = WearConnectionStatus.valueOf(input.readUTF())
@@ -79,7 +83,7 @@ data class WearTelemetryState(
             val speedKmh = input.readOptionalDouble()
             val boardBatteryPercent = input.readOptionalInt()
             val tripKm = input.readOptionalDouble()
-            val estimatedRangeKm = if (version >= SCHEMA_VERSION) input.readOptionalDouble() else null
+            val estimatedRangeKm = if (version >= 2) input.readOptionalDouble() else null
             val state = WearTelemetryState(
                 connection = connection,
                 updatedAtEpochMs = updatedAtEpochMs,
@@ -88,6 +92,7 @@ data class WearTelemetryState(
                 tripKm = tripKm,
                 estimatedRangeKm = estimatedRangeKm,
                 mode = input.readOptionalString(),
+                estimatedBatteryPercent = if (version >= 3) input.readOptionalDouble() else null,
             )
             require(input.available() == 0) { "Wear telemetry payload has trailing data" }
             state

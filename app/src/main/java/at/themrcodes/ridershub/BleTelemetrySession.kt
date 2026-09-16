@@ -18,14 +18,19 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import at.themrcodes.ridershub.log.JsonlSessionLog
+import at.themrcodes.ridershub.log.telemetryFrameFields
+import at.themrcodes.ridershub.api.ApiIntegration
 import at.themrcodes.ridershub.protocol.BackfireFrameDecoder
 import at.themrcodes.ridershub.protocol.BackfireProtocol
 import at.themrcodes.ridershub.protocol.TelemetryFrame
 import at.themrcodes.ridershub.protocol.hex
 import at.themrcodes.ridershub.session.RideStore
+import at.themrcodes.ridershub.session.BatteryFrameDiagnostics
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
+import java.util.UUID
 
 class BleTelemetrySession(
     private val context: Context,
@@ -44,6 +49,8 @@ class BleTelemetrySession(
     private val rideStore = RideStore.get(context)
     private val segment = rideStore.openSegment(deviceAddress, deviceName)
     private val log = JsonlSessionLog(segment)
+    private val captureSegmentId = UUID.randomUUID().toString()
+    private val segmentStartedElapsedNs = SystemClock.elapsedRealtimeNanos()
     private val batteryWarnings = BatteryWarningNotifier(context)
     private val commandLock = Any()
     private val decoder = BackfireFrameDecoder { reason, bytes ->
@@ -463,14 +470,17 @@ class BleTelemetrySession(
     private fun handleNotification(
         characteristic: BluetoothGattCharacteristic,
         value: ByteArray,
-    ) {
+    ) = ingestNotification(characteristic.uuid.toString(), value)
+
+    /** Shared notification/decoder path; the debug emulator inlet never opens a GATT connection. */
+    internal fun ingestNotification(characteristicUuid: String, value: ByteArray) {
         if (!active) return
         notificationCount.incrementAndGet()
         notificationBytes.addAndGet(value.size.toLong())
         log.record(
             "notification",
             JSONObject()
-                .put("characteristic_uuid", characteristic.uuid.toString())
+                .put("characteristic_uuid", characteristicUuid)
                 .put("bytes_length", value.size)
                 .put("value_hex", value.hex()),
         )
@@ -478,49 +488,46 @@ class BleTelemetrySession(
     }
 
     private fun recordFrame(frame: TelemetryFrame) {
+        val receivedAt = Instant.now()
+        val receivedElapsedNs = SystemClock.elapsedRealtimeNanos()
         val number = frameCount.incrementAndGet()
         if (!frame.crcValid) crcErrorCount.incrementAndGet()
-        val speed = JSONArray()
-            .put(frame.speedCandidatesKmh.first)
-            .put(frame.speedCandidatesKmh.second)
-        val unknown = JSONObject()
-            .put("byte_1", frame.raw.copyOfRange(1, 2).hex())
-            .put("byte_3", frame.raw.copyOfRange(3, 4).hex())
-            .put("bytes_12_15", frame.raw.copyOfRange(12, 16).hex())
-            .put("bytes_21_22", frame.raw.copyOfRange(21, 23).hex())
-
+        val battery = try {
+            rideStore.recordFrame(frame, receivedAt, receivedElapsedNs / 1_000_000L)
+        } catch (error: Exception) {
+            // Preserve the raw frame even if processing fails; do not mislabel an old estimate.
+            log.record("telemetry_frame",
+                telemetryFrameFields(frame, number, BatteryFrameDiagnostics("processing_error"))
+                    .put("battery_processing_error_type", error.javaClass.simpleName),
+                receivedAt, receivedElapsedNs)
+            throw error
+        }
         log.record(
             "telemetry_frame",
-            JSONObject()
-                .put("frame_number", number)
-                .put("raw_hex", frame.raw.hex())
-                .put("frame_length", frame.raw.size)
-                .put("mode_code", frame.modeCode)
-                .put("mode", frame.mode)
-                .put("board_battery_percent", frame.boardBatteryPercent)
-                .put("speed_candidates_kmh", speed)
-                .put("speed_kmh", frame.speedKmh)
-                .put("pack_voltage_v", frame.packVoltageV)
-                .put("load_raw_signed_be", frame.loadRaw)
-                .put("trip_km", frame.tripKm)
-                .put("odometer_km", frame.odometerKm)
-                .put("unknown", unknown)
-                .put("crc_expected", frame.expectedCrc)
-                .put("crc_actual", frame.actualCrc)
-                .put("crc_valid", frame.crcValid),
+            telemetryFrameFields(frame, number, battery),
+            receivedAt,
+            receivedElapsedNs,
         )
-        if (
-            isPlausibleBoardTelemetry(
+        val usable = isPlausibleBoardTelemetry(
                 batteryPercent = frame.boardBatteryPercent,
                 packVoltageV = frame.packVoltageV,
                 crcValid = frame.crcValid,
             )
-        ) {
+        if (usable) {
             segmentBoardTelemetryReceived = true
             lastUsableTelemetryElapsedMs = SystemClock.elapsedRealtime()
             handler.removeCallbacks(resumeDeadlineRunnable)
+            rideStore.activeRide()?.let { ride ->
+                ApiIntegration.get(context).onFrame(
+                    ride = ride,
+                    frame = frame,
+                    captureSegmentId = captureSegmentId,
+                    frameNumber = number,
+                    frameAt = receivedAt,
+                    segmentElapsedMs = (receivedElapsedNs - segmentStartedElapsedNs).coerceAtLeast(0) / 1_000_000L,
+                )
+            }
         }
-        rideStore.recordFrame(frame)
         state.setFrame(number, frame)
         batteryWarnings.maybeNotifyBoard(
             sessionId = segment.sessionId,

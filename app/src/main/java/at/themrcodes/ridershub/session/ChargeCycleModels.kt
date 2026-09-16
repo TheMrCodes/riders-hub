@@ -43,6 +43,7 @@ data class ChargeCycleSummary(
     val odometerStartKm: Double?,
     val odometerEndKm: Double?,
     val rideCount: Int,
+    val estimatedSpeedBucketDistancesKm: Map<Int, Double> = emptyMap(),
 ) {
     val isClosed: Boolean
         get() = closedAt != null
@@ -67,6 +68,9 @@ data class ChargeCycleSummary(
     val profiledDistanceKm: Double
         get() = speedBucketDistancesKm.values.sum()
 
+    val effectiveSpeedBucketDistancesKm: Map<Int, Double>
+        get() = mergeSpeedBuckets(speedBucketDistancesKm, estimatedSpeedBucketDistancesKm)
+
     val profileCoverage: Double?
         get() = odometerDistanceKm
             ?.takeIf { it >= MIN_MEANINGFUL_DISTANCE_KM }
@@ -89,7 +93,7 @@ data class ChargeCycleUpdate(
 )
 
 object ChargeCycleTracker {
-    const val MIN_INFERRED_RECHARGE_PERCENT = 5
+    const val MIN_INFERRED_RECHARGE_PERCENT = 10
 
     fun recordRide(
         current: ChargeCycleSummary?,
@@ -129,6 +133,40 @@ object ChargeCycleTracker {
         return ChargeCycleUpdate(
             activeCycle = belongsToCurrentBoard.add(ride),
             completedCycle = null,
+        )
+    }
+
+    /** Live collection uses detected stream events; ride boundaries only count displayed rides. */
+    @JvmOverloads
+    internal fun recordFrame(
+        current: ChargeCycleSummary?,
+        observation: RideSummary,
+        localBoardId: String,
+        rechargeIncreasePercent: Int?,
+        firstFrameOfRide: Boolean,
+        estimatedSpeedBuckets: Map<Int, Double> = emptyMap(),
+    ): ChargeCycleUpdate {
+        val previous = current?.takeIf { it.localBoardId == localBoardId }
+        if (previous == null || rechargeIncreasePercent != null) {
+            return ChargeCycleUpdate(
+                newCycle(
+                    observation, localBoardId,
+                    if (rechargeIncreasePercent != null) ChargeCycleStartReason.INFERRED_RECHARGE
+                    else ChargeCycleStartReason.FIRST_OBSERVATION,
+                    rechargeIncreasePercent,
+                ).copy(estimatedSpeedBucketDistancesKm = estimatedSpeedBuckets),
+                previous?.copy(closedAt = observation.startedAt,
+                    endReason = ChargeCycleEndReason.INFERRED_RECHARGE),
+            )
+        }
+        return ChargeCycleUpdate(
+            previous.add(observation).copy(
+                rideCount = previous.rideCount + if (firstFrameOfRide) 1 else 0,
+                estimatedSpeedBucketDistancesKm = mergeSpeedBuckets(
+                    previous.estimatedSpeedBucketDistancesKm, estimatedSpeedBuckets,
+                ),
+            ),
+            null,
         )
     }
 

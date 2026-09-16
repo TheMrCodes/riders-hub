@@ -21,6 +21,7 @@ data class RangeDepletionWindow(
     val minBatteryPercent: Int,
     val recordedDistanceKm: Double,
     val speedBucketDistancesKm: Map<Int, Double>,
+    val estimatedSpeedBucketDistancesKm: Map<Int, Double> = emptyMap(),
 ) {
     val observedDepletionPercent: Int
         get() = max(0, startBatteryPercent - minBatteryPercent)
@@ -33,8 +34,9 @@ data class RangeCalibrationUpdate(
 
 object RangeCalibrationTracker {
     const val DEPLETION_STEP_PERCENT = 5
-    const val RECHARGE_RESET_PERCENT = 5
+    const val RECHARGE_RESET_PERCENT = ChargeCycleTracker.MIN_INFERRED_RECHARGE_PERCENT
 
+    @JvmOverloads
     fun observe(
         current: RangeDepletionWindow?,
         localBoardId: String,
@@ -43,6 +45,7 @@ object RangeCalibrationTracker {
         distanceKm: Double = 0.0,
         speedBucketDistancesKm: Map<Int, Double> = emptyMap(),
         allowRechargeReset: Boolean = false,
+        estimatedSpeedBucketDistancesKm: Map<Int, Double> = emptyMap(),
     ): RangeCalibrationUpdate? {
         if (batteryPercent !in 0..100) return null
         if (!distanceKm.isFinite() || distanceKm < 0.0) return null
@@ -53,7 +56,7 @@ object RangeCalibrationTracker {
 
         if (
             allowRechargeReset &&
-            batteryPercent - window.minBatteryPercent >= RECHARGE_RESET_PERCENT
+            batteryPercent - window.endBatteryPercent >= RECHARGE_RESET_PERCENT
         ) {
             window = newWindow(localBoardId, batteryPercent, observedAt)
         }
@@ -63,6 +66,10 @@ object RangeCalibrationTracker {
             endBatteryPercent = batteryPercent,
             minBatteryPercent = min(window.minBatteryPercent, batteryPercent),
             recordedDistanceKm = window.recordedDistanceKm + distanceKm,
+            estimatedSpeedBucketDistancesKm = mergeSpeedBuckets(
+                window.estimatedSpeedBucketDistancesKm,
+                estimatedSpeedBucketDistancesKm.filterValues { it.isFinite() && it > 0.0 },
+            ),
             speedBucketDistancesKm = mergeSpeedBuckets(
                 window.speedBucketDistancesKm,
                 speedBucketDistancesKm.filterValues { it.isFinite() && it > 0.0 },
@@ -90,7 +97,7 @@ object RangeCalibrationTracker {
         val start = if (
             current == null ||
             current.localBoardId != localBoardId ||
-            startBattery - current.minBatteryPercent >= RECHARGE_RESET_PERCENT
+            startBattery - current.endBatteryPercent >= RECHARGE_RESET_PERCENT
         ) {
             observe(
                 current = current,
@@ -131,7 +138,7 @@ object RangeCalibrationTracker {
 }
 
 internal fun RangeDepletionWindow.toJson(): JSONObject = JSONObject()
-    .put("schema_version", 1)
+    .put("schema_version", 2)
     .put("id", id)
     .put("local_board_id", localBoardId)
     .put("started_at", startedAt)
@@ -141,6 +148,7 @@ internal fun RangeDepletionWindow.toJson(): JSONObject = JSONObject()
     .put("end_battery_percent", endBatteryPercent)
     .put("min_battery_percent", minBatteryPercent)
     .put("recorded_distance_km", recordedDistanceKm)
+    .put("estimated_speed_bucket_distances_km", bucketMapJson(estimatedSpeedBucketDistancesKm))
     .put(
         "speed_bucket_distances_km",
         JSONObject().apply {
@@ -161,6 +169,7 @@ internal fun rangeDepletionWindowFromJson(value: JSONObject): RangeDepletionWind
         endBatteryPercent = value.getInt("end_battery_percent"),
         minBatteryPercent = value.getInt("min_battery_percent"),
         recordedDistanceKm = value.optDouble("recorded_distance_km", 0.0),
+        estimatedSpeedBucketDistancesKm = value.readBucketMap("estimated_speed_bucket_distances_km"),
         speedBucketDistancesKm = value.optJSONObject("speed_bucket_distances_km")?.let { buckets ->
             buildMap {
                 buckets.keys().forEach { key ->

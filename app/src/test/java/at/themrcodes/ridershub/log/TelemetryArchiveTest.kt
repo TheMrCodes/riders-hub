@@ -1,5 +1,6 @@
 package at.themrcodes.ridershub.log
 
+import at.themrcodes.ridershub.session.BatteryFrameDiagnostics
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -14,6 +15,32 @@ import java.util.Comparator
 
 class TelemetryArchiveTest {
     private val temporaryRoots = mutableListOf<File>()
+
+    @Test
+    fun uploadSnapshotUsesCommittedPrefixWithoutRepairingTheSourceTail() {
+        val root = temporaryRoot()
+        val archive = TelemetryArchive(targetPartitionBytes = 100 * 1024L)
+        val saved = archive.archiveFinalized(telemetryFile(root, "synthetic-one"), "synthetic-one")
+        saved.storageFile.appendBytes(byteArrayOf(0x52, 0x48, 0x45))
+        val original = saved.storageFile.readBytes()
+        val uploads = archive.prepareUploads(saved.archiveDirectory, File(root, "exports"))
+        assertEquals(1, uploads.size)
+        assertEquals(1, uploads.single().generation)
+        assertArrayEquals(original, saved.storageFile.readBytes())
+    }
+
+    @Test
+    fun corruptSealedPartitionIsReportedWhileOtherPartitionsRemainUploadable() {
+        val root = temporaryRoot()
+        val archive = TelemetryArchive(targetPartitionBytes = 200L)
+        val first = archive.archiveFinalized(telemetryFile(root, "synthetic-one"), "synthetic-one")
+        archive.archiveFinalized(telemetryFile(root, "synthetic-two"), "synthetic-two")
+        RandomAccessFile(first.storageFile, "rw").use { it.seek(0); it.writeByte(0) }
+        val invalid = mutableListOf<Int>()
+        val uploads = archive.prepareUploads(first.archiveDirectory, File(root, "exports"), invalid::add)
+        assertEquals(listOf(1), invalid)
+        assertEquals(listOf(2), uploads.map { it.partitionSequence })
+    }
 
     @After
     fun cleanUp() {
@@ -91,6 +118,20 @@ class TelemetryArchiveTest {
             ),
         )
         assertArrayEquals(original, restored.readBytes())
+        val frames = restored.readLines().map(::JSONObject).filter { it.getString("type") == "telemetry_frame" }
+        assertEquals(40, frames.size)
+        frames.forEachIndexed { index, frame ->
+            assertEquals(index + 2, frame.getInt("seq"))
+            assertEquals(index * 100_000_000L, frame.getLong("elapsed_realtime_ns"))
+            val diagnostics = frame.getJSONObject("battery_estimation")
+            if (index == 19) {
+                assertTrue(frame.isNull("estimated_battery_percent"))
+                assertEquals("invalid_crc", diagnostics.getString("status"))
+            } else {
+                assertEquals(60.0 - index * .01, frame.getDouble("estimated_battery_percent"), 0.0)
+                assertEquals(frame.getDouble("estimated_battery_percent"), diagnostics.getDouble("estimated_percent"), 0.0)
+            }
+        }
     }
 
     @Test
@@ -193,6 +234,30 @@ class TelemetryArchiveTest {
         assertEquals(24L, result.storageFile.length())
     }
 
+    @Test
+    fun workingPartitionSnapshotIsCompleteButDoesNotSealSourcePartition() {
+        val root = temporaryRoot()
+        val archive = TelemetryArchive(targetPartitionBytes = 100 * 1024L, clock = { SEAL_TIME })
+        val stored = archive.archiveFinalized(telemetryFile(root, "session-one"), "session-one")
+        val working = stored.storageFile
+        assertEquals("rhp", working.extension)
+        val original = working.readBytes()
+        val exports = File(root, "exports")
+
+        val upload = archive.prepareUploads(stored.archiveDirectory, exports).single()
+
+        assertFalse(upload.final)
+        assertEquals(1, upload.generation)
+        assertEquals("rha", upload.file.extension)
+        assertTrue(upload.compressedDigestBase64.isNotBlank())
+        assertTrue(upload.uncompressedDigestBase64.isNotBlank())
+        assertTrue(working.isFile)
+        assertArrayEquals(original, working.readBytes())
+        val restored = File(root, "snapshot-entry.jsonl")
+        assertTrue(archive.extractEntry(exports, upload.partitionSequence, stored.entryId, restored))
+        assertTrue(restored.readText().contains("session-one"))
+    }
+
     private fun temporaryRoot(): File = Files.createTempDirectory("riders-hub-archive-test-")
         .toFile()
         .also(temporaryRoots::add)
@@ -206,14 +271,19 @@ class TelemetryArchiveTest {
         val records = buildList {
             add(record(1, "session_start", sessionId, remoteAddress))
             repeat(40) { index ->
+                val battery = if (index == 19) BatteryFrameDiagnostics("invalid_crc")
+                    else BatteryFrameDiagnostics("updated", 60.0 - index * .01)
                 add(
                     JSONObject()
                         .put("seq", index + 2)
                         .put("type", "telemetry_frame")
                         .put("wall_time", "2030-01-01T10:00:00Z")
+                        .put("elapsed_realtime_ns", index * 100_000_000L)
                         .put("session_id", sessionId)
                         .put("raw_hex", "ac 00 19 00 02 50 00 00 00 00 00 00 00 00 00 00")
                         .put("pack_voltage_v", 40.0)
+                        .put("estimated_battery_percent", battery.estimatedPercent ?: JSONObject.NULL)
+                        .put("battery_estimation", battery.toJson())
                         .toString(),
                 )
             }

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "message_id": "10000000-0000-4000-8000-000000000001",
+  "sequence": 42,
+  "source_id": "20000000-0000-4000-8000-000000000002",
+  "app_version": "1.0.0-example",
+  "kind": "metrics.snapshot",
+  "occurred_at": "2030-01-01T12:00:00Z",
+  "sent_at": "2030-01-01T12:00:01Z",
+  "board_id": "30000000-0000-4000-8000-000000000003",
+  "ride_id": "40000000-0000-4000-8000-000000000004",
+  "data": {
+    "connection": "live",
+    "ride_active": true,
+    "trip_distance_km": 1.25,
+    "odometer_km": 123.45,
+    "battery_reported_percent": 80,
+    "battery_estimated_percent": 78.6,
+    "estimated_range_km": 14.2,
+    "last_board_observation_at": "2030-01-01T12:00:00Z"
+  }
+}

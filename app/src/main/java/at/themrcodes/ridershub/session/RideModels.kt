@@ -28,6 +28,7 @@ data class RideSummary(
     val active: Boolean,
     val speedBucketDistancesKm: Map<Int, Double> = emptyMap(),
     val localBoardId: String? = null,
+    val estimatedBatteryPercent: Double? = null,
 ) {
     val isTrack: Boolean
         get() = distanceKm >= 0.02 || movingSeconds >= 10.0
@@ -58,6 +59,7 @@ data class RideStoreSnapshot(
     val reconnectGraceEndsAt: String?,
     val chargeCycles: ChargeCycleStoreSnapshot,
     val batteryLongevity: BatteryLongevitySnapshot,
+    val speedBucketStatistics: BoardSpeedBucketStatistics? = null,
 ) {
     val currentTripDisplay: RideSummary?
         get() = activeRide ?: lastCompletedRide
@@ -92,4 +94,6 @@ data class RangeEstimate(
     val message: String,
     val bucketBatteryPercentPer100Km: Map<Int, Double> = emptyMap(),
     val commonSpeedBucketDistributionPercent: Map<Int, Double> = emptyMap(),
+    val speedBucketStatistics: BoardSpeedBucketStatistics? = null,
+    val usesAccumulatedBucketConsumption: Boolean = false,
 )

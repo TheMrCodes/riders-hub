@@ -124,8 +124,9 @@ Ambient mode fits the information available to the watch. Wear OS normally
 offers an ambient update about once per minute, so the ambient screen contains
 only values that remain useful at that cadence:
 
+- current local time, using the same 24-hour clock as the interactive screen;
 - current trip kilometres, displayed prominently;
-- board battery;
+- estimated board battery (with a `~` prefix), falling back to the reported percentage;
 - estimated kilometres remaining.
 
 Speed, connection state, and ride mode stay on the interactive screen. Speed is
@@ -146,15 +147,15 @@ its lifetime can still end promptly when the ride stops or becomes stale.
 
 ### Power and burn-in safeguards
 
-The ambient layout uses a black background, muted text, and only the three
-essential metrics. On devices that request burn-in protection, the complete
+The ambient layout uses a black background, muted text, the clock, and three
+essential ride metrics. On devices that request burn-in protection, the complete
 layout moves through four positions using small two-dp offsets. This prevents
 the same pixels from remaining continuously lit without making the values jump
 noticeably around the round display.
 
 Ambient mode deliberately has no app-owned per-second clock. Wear OS calls the
 ambient update callback, and the app renders one new frame from the most recent
-buffered payload.
+buffered payload and the current local clock, even when no telemetry arrives.
 
 ### Optional live screen
 
@@ -187,9 +188,10 @@ The decisions above rely on these components:
 - `WearRemoteLauncher` recognizes the first valid live frame once per ride and
   requests the dashboard through the platform remote-activity API.
 
-The dashboard and settings remain two horizontally swiped pages. A compact page
-indicator is shown on both pages; the old tappable settings icon overlay was
-removed from the dashboard so it cannot cover ride information.
+The dashboard and settings remain two horizontally swiped pages. They use fixed,
+non-scrolling layouts without a page-indicator overlay. The interactive dashboard
+shows a bare 24-hour clock at the top and keeps connection status at the bottom,
+leaving the ride metrics unobstructed in the center.
 
 Unit tests should continue to cover ambient buffering, burn-in offset rotation,
 recent-ride eligibility, keep-screen-on gating, persistence round-trips, and
@@ -203,3 +205,12 @@ facility and must not be present in release artifacts.
 - [Foreground services overview](https://developer.android.com/develop/background-work/services/fgs)
 - [Restrictions on starting a foreground service from the background](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)
 - [RemoteActivityHelper](https://developer.android.com/reference/androidx/wear/remote/interactions/RemoteActivityHelper)
+
+
+### Estimated battery transport
+
+Telemetry schema 3 adds an optional continuous battery estimate while preserving
+raw board battery percentage. New watches also read schemas 1 and 2, showing
+raw battery when no estimate is available. Update both phone and watch for the
+new payload; older watch builds reject schema 3. The watch does not run a second
+battery model. Ambient updates still follow the system callback cadence.

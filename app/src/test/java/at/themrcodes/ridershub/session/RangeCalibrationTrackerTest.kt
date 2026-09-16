@@ -6,6 +6,15 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class RangeCalibrationTrackerTest {
+    @Test fun chargeResetRequiresTenPointsAboveThePreviousReadingNotATransientMinimum() {
+        val initial = observe(null, 60, "a", 1.0, 20).activeWindow
+            .copy(minBatteryPercent = 56, endBatteryPercent = 60)
+        for (rise in listOf(5, 9, 10)) {
+            val result = observe(initial, 60 + rise, "b", 0.0, 20, allowRechargeReset = true)
+            assertEquals(if (rise >= 10) 0.0 else 1.0, result.activeWindow.recordedDistanceKm, 0.0)
+        }
+    }
+
     @Test
     fun zeroDropDistancesAccumulateUntilFivePercentIsObserved() {
         var update = observe(null, 80, "a", 1.0, 10)
@@ -28,13 +37,13 @@ class RangeCalibrationTrackerTest {
     fun rechargeDropsAnIncompleteDepletionWindow() {
         var update = observe(null, 80, "a", 2.0, 20)
         update = observe(update.activeWindow, 78, "b", 1.0, 20)
-        update = observe(update.activeWindow, 84, "c", 0.0, 20, allowRechargeReset = true)
+        update = observe(update.activeWindow, 88, "c", 0.0, 20, allowRechargeReset = true)
 
         assertNull(update.completedWindow)
-        assertEquals(84, update.activeWindow.startBatteryPercent)
+        assertEquals(88, update.activeWindow.startBatteryPercent)
         assertEquals(0.0, update.activeWindow.recordedDistanceKm, 0.0001)
 
-        update = observe(update.activeWindow, 79, "d", 1.0, 30)
+        update = observe(update.activeWindow, 83, "d", 1.0, 30)
         assertNotNull(update.completedWindow)
         assertEquals(1.0, requireNotNull(update.completedWindow).recordedDistanceKm, 0.0001)
     }

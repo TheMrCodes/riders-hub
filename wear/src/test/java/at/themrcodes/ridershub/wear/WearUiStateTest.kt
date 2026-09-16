@@ -7,8 +7,36 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
+import java.time.ZoneId
 
 class WearUiStateTest {
+    @Test
+    fun clockAdvancesAcrossMinuteAndDayBoundariesInTheLocalZone() {
+        val time = Instant.parse("2030-01-02T22:59:59Z").toEpochMilli()
+        val zone = ZoneId.of("Europe/Vienna")
+        assertEquals("23:59", wearClockText(time, zone))
+        assertEquals("00:00", wearClockText(time + 1_000, zone))
+    }
+
+    @Test
+    fun batteryEstimateIsClearlyMarkedAndRawPayloadsStillWork() {
+        val state = telemetry(WearConnectionStatus.LIVE, updatedAt = 100_000)
+        assertEquals("~57.3%", wearUiState(state.copy(estimatedBatteryPercent = 57.3), 100_000).battery)
+        assertEquals("${state.boardBatteryPercent}%", wearUiState(state, 100_000).battery)
+    }
+
+    @Test
+    fun clockUsesBareTwentyFourHourHoursAndMinutes() {
+        assertEquals(
+            "05:07",
+            wearClockText(
+                nowEpochMs = Instant.parse("2030-01-02T05:07:45Z").toEpochMilli(),
+                zoneId = ZoneId.of("UTC"),
+            ),
+        )
+    }
+
     @Test
     fun persistedTelemetryRoundTripsThroughTheProductionContract() {
         val telemetry = telemetry(WearConnectionStatus.RECONNECTING, updatedAt = 100_000)
@@ -42,6 +70,7 @@ class WearUiStateTest {
         assertEquals("4.3", ui.tripValue)
         assertEquals("12.8", ui.rangeValue)
         assertEquals("SPORT", ui.mode)
+        assertFalse(shouldShowStatusMessage(ui))
     }
 
     @Test
@@ -53,6 +82,7 @@ class WearUiStateTest {
 
         assertFalse(ui.live)
         assertEquals("UPDATE STALE", ui.statusLabel)
+        assertTrue(shouldShowStatusMessage(ui))
     }
 
     @Test

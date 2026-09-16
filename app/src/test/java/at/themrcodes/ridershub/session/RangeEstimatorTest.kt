@@ -7,6 +7,28 @@ import org.junit.Test
 
 class RangeEstimatorTest {
     @Test
+    fun estimatedBatteryPersistsAndLegacySummariesRemainReadable() {
+        val ride = summary(2.0, mapOf(20 to 2.0)).copy(estimatedBatteryPercent = 57.25)
+        val encoded = ride.toJson()
+        assertEquals(ride, summaryFromJson(org.json.JSONObject(encoded.toString())))
+        encoded.remove("estimated_battery_percent")
+        assertNull(summaryFromJson(encoded).estimatedBatteryPercent)
+    }
+
+    @Test
+    fun continuousBatteryEstimateFeedsRangeWithoutReapplyingRawPercentageSteps() {
+        val windows = listOf(window("a", "2030-01-01T10:00:00Z", 2.0, 10, mapOf(20 to 2.0)))
+        val result = RangeEstimator.estimate(
+            50, null, windows, emptyList(), emptyList(), estimatedBatteryPercent = 47.5,
+        )
+        assertEquals(9.5, result.remainingKm!!, 0.00001)
+        val invalid = RangeEstimator.estimate(
+            50, null, windows, emptyList(), emptyList(), estimatedBatteryPercent = Double.NaN,
+        )
+        assertEquals(10.0, invalid.remainingKm!!, 0.00001)
+    }
+
+    @Test
     fun collectsDataUntilTheFirstFivePercentWindowCompletes() {
         val result = RangeEstimator.estimate(
             currentBatteryPercent = 80,

@@ -1,0 +1,14 @@
+{
+  "contract_version": 1,
+  "server_id": "synthetic-server-a",
+  "capabilities": {
+    "metrics": { "schema_version": 1 },
+    "realtime": { "schema_version": 1, "gps": true },
+    "analytics": {
+      "schema_version": 1,
+      "rha_format_versions": [1],
+      "coa_format_versions": [1],
+      "max_upload_bytes": 52428800
+    }
+  }
+}

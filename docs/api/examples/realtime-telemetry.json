@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "type": "telemetry",
+  "source_id": "20000000-0000-4000-8000-000000000002",
+  "board_id": "30000000-0000-4000-8000-000000000003",
+  "ride_id": "40000000-0000-4000-8000-000000000004",
+  "stream_id": "50000000-0000-4000-8000-000000000005",
+  "capture_segment_id": "60000000-0000-4000-8000-000000000006",
+  "stream_sequence": 7,
+  "frame_number": 18,
+  "frame_at": "2030-01-01T12:00:00Z",
+  "segment_elapsed_ms": 17000,
+  "speed_kmh": 21.5,
+  "location": {
+    "fix_at": "2030-01-01T11:59:59.500Z",
+    "latitude": 0.0,
+    "longitude": 0.0,
+    "altitude_m": 10.0
+  }
+}

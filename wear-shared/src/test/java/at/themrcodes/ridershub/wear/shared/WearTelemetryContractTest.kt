@@ -17,6 +17,7 @@ class WearTelemetryContractTest {
             tripKm = 4.25,
             estimatedRangeKm = 12.75,
             mode = "SPORT",
+            estimatedBatteryPercent = 76.4,
         )
 
         assertEquals(expected, WearTelemetryState.decode(expected.encode()))
@@ -81,6 +82,28 @@ class WearTelemetryContractTest {
 
         assertEquals(null, decoded.estimatedRangeKm)
         assertEquals(4.25, decoded.tripKm!!, 0.001)
+    }
+
+    @Test
+    fun versionTwoPayloadDecodesWithoutEstimatedBattery() {
+        val bytes = ByteArrayOutputStream()
+        DataOutputStream(bytes).use { output ->
+            output.writeInt(0x52485542)
+            output.writeInt(2)
+            output.writeUTF(WearConnectionStatus.STANDBY.name)
+            output.writeLong(0)
+            repeat(5) { output.writeBoolean(false) }
+        }
+        assertEquals(null, WearTelemetryState.decode(bytes.toByteArray()).estimatedBatteryPercent)
+    }
+
+    @Test
+    fun invalidEstimatedBatteryIsRejected() {
+        for (value in listOf(-1.0, 101.0, Double.NaN, Double.POSITIVE_INFINITY)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                WearTelemetryState(WearConnectionStatus.STANDBY, 0, null, null, null, null, null, value)
+            }
+        }
     }
 
     @Test
