@@ -92,7 +92,7 @@ The Device panel contains a self-hosted API section. For HTTPS servers it loads
 Authorization Code + PKCE, and exchanges the access token at
 `POST /v1/devices/registrations`. Only the resulting source-bound device credential is persisted;
 the base URL and credential are protected using a non-exportable Android Keystore AES-GCM key.
-Legacy bearer entry remains available for migration and HTTP self-hosting. Discovery at
+Discovery at
 `GET /v1/capabilities` enables metrics, realtime, and analytics independently. Redirects are
 disabled for API HTTP requests.
 

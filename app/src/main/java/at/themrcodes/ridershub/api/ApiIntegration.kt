@@ -92,37 +92,6 @@ class ApiIntegration private constructor(context: Context) {
         }
     }
 
-    fun configureAndTest(baseUrl: String, bearerKey: String, confirmHttp: Boolean) {
-        val urls = apiUrls(baseUrl)
-        require(bearerKey.isNotBlank()) { "Bearer key must not be blank" }
-        require(urls.base.isHttps || confirmHttp) { "Confirm the unencrypted HTTP connection" }
-        val normalized = urls.base.toString().removeSuffix("/")
-        val candidate = ApiConnection(
-            normalized,
-            bearerKey,
-            ApiStore.destinationId(normalized),
-        )
-        val generation = discoveryGeneration.incrementAndGet()
-        state.clearError()
-        network.execute {
-            runCatching {
-                val (json, capabilities) = client.capabilities(candidate)
-                synchronized(ApiStore.CONFIG_LOCK) {
-                    if (generation != discoveryGeneration.get()) return@execute
-                    ApiClient.cancelAllTransports()
-                    store.configure(normalized, bearerKey, confirmHttp)
-                    store.saveCapabilities(candidate.destinationId, json, capabilities)
-                }
-                resetLiveTransports()
-                store.connection()?.let { acceptCapabilities(it, capabilities) }
-            }.onFailure {
-                if (generation == discoveryGeneration.get()) {
-                    state.setError("API connection test failed; check the URL, credentials, and server contract")
-                }
-            }
-        }
-    }
-
     fun refreshCapabilities() {
         val connection = store.connection() ?: return
         val generation = discoveryGeneration.incrementAndGet()

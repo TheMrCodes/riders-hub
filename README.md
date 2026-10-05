@@ -137,10 +137,9 @@ for the technical format.
 The optional integration targets any server implementing the published v1
 contract. Configure one base URL and sign in through the server's OIDC provider under
 **Device → Self-hosted API**. The app uses browser Authorization Code + PKCE and exchanges the
-short-lived access token for a source-bound device credential. A legacy bearer key remains
-available for migration. Capability discovery enables metrics, realtime, and analytics
-independently. HTTPS/WSS is preferred; HTTP/WS requires explicit confirmation
-and remains visibly marked as unencrypted.
+short-lived access token for a source-bound device credential. Each API publishes its own
+OIDC issuer and public client ID, so sign-in uses that server's provider. Capability discovery
+enables metrics, realtime, and analytics independently. Enrollment requires HTTPS.
 
 Core snapshots are best-effort every ten seconds while riding, while ride start
 and end events use a durable SQLite outbox. Realtime sends only the newest frame
@@ -155,7 +154,7 @@ and [server implementer guide](docs/api/implementer-guide.md).
 
 ## Privacy
 
-The API integration is off until configured. Its base URL and device or legacy bearer credential
+The API integration is off until configured. Its base URL and device credential
 are encrypted at rest with Android Keystore and excluded from backup. OIDC access tokens are used
 only for registration and are not persisted. Decoded API
 messages use random export identifiers and never include Bluetooth names,

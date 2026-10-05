@@ -1,6 +1,7 @@
 package at.themrcodes.ridershub.api
 
 import android.app.Application
+import android.content.Context
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.*
@@ -43,7 +44,7 @@ class ApiStoreTest {
     @Test fun keyRotationKeepsDeliveryScopeButRejectsOldCredentialRequests() {
         val old = configure("https://one.example.test", "server-a")
         store.approveAnalytics(true)
-        store.configure("https://one.example.test", "synthetic-rotated", false)
+        store.configureOidc("https://one.example.test", "rhd_" + "B".repeat(43))
         val rotated = requireNotNull(store.connection())
         assertEquals(old.deliveryScope, rotated.deliveryScope)
         assertNotEquals(old.revision, rotated.revision)
@@ -61,9 +62,6 @@ class ApiStoreTest {
         assertThrows(IllegalArgumentException::class.java) {
             store.configureOidc("http://one.example.test", "rhd_" + "B".repeat(43))
         }
-
-        store.configure("https://one.example.test/prefix", "synthetic-legacy", false)
-        assertEquals(ApiAuthMode.LEGACY_BEARER, store.snapshot().authMode)
     }
 
     @Test fun capabilityRemovalAndConsentRevocationStopOnlyTheirChannels() {
@@ -80,18 +78,27 @@ class ApiStoreTest {
         assertTrue(store.allows(connection, "realtime"))
     }
 
-    @Test fun httpRequiresConfirmationAndRetainsTheWarning() {
-        assertThrows(IllegalArgumentException::class.java) { store.configure("http://api.example.test", "synthetic", false) }
-        store.configure("http://api.example.test", "synthetic", true)
-        assertTrue(store.snapshot().insecure)
-        assertTrue(store.snapshot().httpConfirmed)
-        store.configure("https://api.example.test", "synthetic", true)
+    @Test fun oidcRequiresHttps() {
+        assertThrows(IllegalArgumentException::class.java) {
+            store.configureOidc("http://api.example.test", "rhd_" + "A".repeat(43))
+        }
+        store.configureOidc("https://api.example.test", "rhd_" + "A".repeat(43))
         assertFalse(store.snapshot().insecure)
         assertFalse(store.snapshot().httpConfirmed)
     }
 
+    @Test fun savedLegacyCredentialIsRemovedBeforeUse() {
+        app.getSharedPreferences("self_hosted_api_credentials", Context.MODE_PRIVATE).edit()
+            .putString("protected_base_url", "base-url|https://one.example.test")
+            .putString("protected_bearer_key", "bearer-key|synthetic-former-key")
+            .putString("auth_mode", ApiAuthMode.LEGACY_BEARER.name)
+            .commit()
+        assertNull(store.connection())
+        assertFalse(store.snapshot().configured)
+    }
+
     private fun configure(url: String, server: String): ApiConnection {
-        store.configure(url, "synthetic-secret", false)
+        store.configureOidc(url, "rhd_" + "A".repeat(43))
         capabilities(server)
         return requireNotNull(store.connection())
     }

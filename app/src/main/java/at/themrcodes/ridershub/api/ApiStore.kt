@@ -58,6 +58,10 @@ internal class ApiStore(
     private fun readConnection(): ApiConnection? = try {
         val url = preferences.getString(KEY_URL, null)?.let { vault.decrypt(it, "base-url") }
             ?: return null
+        if (preferences.getString(KEY_AUTH_MODE, null) != ApiAuthMode.OIDC_DEVICE.name) {
+            clearConfiguration()
+            return null
+        }
         val key = preferences.getString(KEY_KEY, null)?.let { vault.decrypt(it, "bearer-key") }
             ?: return null
         val destination = destinationId(url)
@@ -68,32 +72,22 @@ internal class ApiStore(
         null
     }
 
-    fun configure(baseUrl: String, bearerKey: String, confirmHttp: Boolean) = synchronized(CONFIG_LOCK) {
-        val urls = apiUrls(baseUrl)
-        require(bearerKey.isNotBlank()) { "Bearer key must not be blank" }
-        require(urls.base.isHttps || confirmHttp) { "Confirm the unencrypted HTTP connection" }
-        saveConfiguration(baseUrl, bearerKey, confirmHttp, ApiAuthMode.LEGACY_BEARER)
-    }
-
     fun configureOidc(baseUrl: String, deviceToken: String) = synchronized(CONFIG_LOCK) {
         require(apiUrls(baseUrl).base.isHttps) { "SSO enrollment requires HTTPS" }
         require(deviceToken.isNotBlank()) { "Device token must not be blank" }
-        saveConfiguration(baseUrl, deviceToken, false, ApiAuthMode.OIDC_DEVICE)
+        saveConfiguration(baseUrl, deviceToken)
     }
 
     private fun saveConfiguration(
         baseUrl: String,
-        bearerKey: String,
-        confirmHttp: Boolean,
-        authMode: ApiAuthMode,
+        deviceToken: String,
     ) {
         val urls = apiUrls(baseUrl)
         val normalized = urls.base.toString().removeSuffix("/")
         check(preferences.edit()
             .putString(KEY_URL, vault.encrypt(normalized, "base-url"))
-            .putString(KEY_KEY, vault.encrypt(bearerKey, "bearer-key"))
-            .putString(KEY_AUTH_MODE, authMode.name)
-            .putBoolean(KEY_HTTP_CONFIRMED, confirmHttp && !urls.base.isHttps)
+            .putString(KEY_KEY, vault.encrypt(deviceToken, "bearer-key"))
+            .putString(KEY_AUTH_MODE, ApiAuthMode.OIDC_DEVICE.name)
             .putBoolean(KEY_ENABLED, true)
             .putString(KEY_REVISION, UUID.randomUUID().toString())
             .commit()) { "Could not securely store API configuration" }
@@ -129,14 +123,9 @@ internal class ApiStore(
             enabled = preferences.getBoolean(KEY_ENABLED, false),
             configured = connection != null,
             baseUrl = connection?.baseUrl,
-            authMode = connection?.let {
-                runCatching {
-                    ApiAuthMode.valueOf(preferences.getString(KEY_AUTH_MODE, null)
-                        ?: ApiAuthMode.LEGACY_BEARER.name)
-                }.getOrDefault(ApiAuthMode.LEGACY_BEARER)
-            },
+            authMode = connection?.let { ApiAuthMode.OIDC_DEVICE },
             insecure = connection?.let { !apiUrls(it.baseUrl).base.isHttps } == true,
-            httpConfirmed = preferences.getBoolean(KEY_HTTP_CONFIRMED, false),
+            httpConfirmed = false,
             serverId = server,
             capabilities = caps,
             analyticsApproved = connection != null && server != null &&

@@ -104,7 +104,6 @@ import at.themrcodes.ridershub.session.TripHistoryGroup
 import at.themrcodes.ridershub.session.BoardSpeedBucketStatistics
 import at.themrcodes.ridershub.api.ApiIntegration
 import at.themrcodes.ridershub.api.ApiSnapshot
-import at.themrcodes.ridershub.api.ApiAuthMode
 import at.themrcodes.ridershub.api.OidcAuthConfig
 import at.themrcodes.ridershub.api.apiUrls
 import at.themrcodes.ridershub.api.oidcAuthorizationRequest
@@ -268,7 +267,6 @@ class MainActivity : ComponentActivity() {
                     onSetChildLimiter = ::requestChildLimiter,
                     onSetLowBatteryWarningPercent = ::setLowBatteryWarningPercent,
                     onSetApiEnabled = api::setEnabled,
-                    onConfigureApi = ::configureApi,
                     onStartOidc = ::startOidcEnrollment,
                     onDisconnectApi = api::clearConfiguration,
                     onRefreshApi = api::refreshCapabilities,
@@ -297,12 +295,6 @@ class MainActivity : ComponentActivity() {
 
     private fun setLowBatteryWarningPercent(percent: Int) {
         generalSettings.setLowBatteryWarningPercent(percent)
-        dashboard = loadDashboard()
-    }
-
-    private fun configureApi(baseUrl: String, bearerKey: String, confirmHttp: Boolean) {
-        runCatching { api.configureAndTest(baseUrl, bearerKey, confirmHttp) }
-            .onFailure { state.setError(it.message ?: "Could not save API configuration") }
         dashboard = loadDashboard()
     }
 
@@ -551,7 +543,6 @@ private fun RidersHubDashboard(
     onSetChildLimiter: (Boolean) -> Unit,
     onSetLowBatteryWarningPercent: (Int) -> Unit,
     onSetApiEnabled: (Boolean) -> Unit,
-    onConfigureApi: (String, String, Boolean) -> Unit,
     onStartOidc: (String) -> Unit,
     onDisconnectApi: () -> Unit,
     onRefreshApi: () -> Unit,
@@ -672,7 +663,6 @@ private fun RidersHubDashboard(
                         SelfHostedApiSection(
                             state = dashboard.api,
                             onSetEnabled = onSetApiEnabled,
-                            onConfigure = onConfigureApi,
                             onStartOidc = onStartOidc,
                             onRequestRemoval = { pendingApiRemoval = true },
                             onRefresh = onRefreshApi,
@@ -1589,7 +1579,6 @@ private fun GeneralSettingsSection(
 private fun SelfHostedApiSection(
     state: ApiSnapshot,
     onSetEnabled: (Boolean) -> Unit,
-    onConfigure: (String, String, Boolean) -> Unit,
     onStartOidc: (String) -> Unit,
     onRequestRemoval: () -> Unit,
     onRefresh: () -> Unit,
@@ -1599,10 +1588,7 @@ private fun SelfHostedApiSection(
     onSetGps: (Boolean) -> Unit,
 ) {
     var baseUrl by remember(state.baseUrl) { mutableStateOf(state.baseUrl.orEmpty()) }
-    var bearerKey by remember { mutableStateOf("") }
-    var confirmHttp by remember(state.httpConfirmed) { mutableStateOf(state.httpConfirmed) }
     val parsed = runCatching { apiUrls(baseUrl) }.getOrNull()
-    val insecureDraft = parsed?.base?.isHttps == false
     Column {
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -1614,7 +1600,7 @@ private fun SelfHostedApiSection(
         if (!state.enabled) return@Column
         Spacer(Modifier.height(22.dp))
         if (!state.configured) {
-            ApiTextField(baseUrl, { baseUrl = it; confirmHttp = false }, "API base URL",
+            ApiTextField(baseUrl, { baseUrl = it }, "API base URL",
                 "https://api.example.test/prefix", keyboardType = KeyboardType.Uri)
             Spacer(Modifier.height(14.dp))
             Button(
@@ -1628,39 +1614,11 @@ private fun SelfHostedApiSection(
                 size = 9,
                 lineHeight = 14,
             )
-            Spacer(Modifier.height(20.dp))
-            NothingText("Legacy bearer key", size = 11, weight = FontWeight.Bold)
-            Spacer(Modifier.height(12.dp))
-            ApiTextField(bearerKey, { bearerKey = it }, "Bearer key", "Key",
-                keyboardType = KeyboardType.Password, password = true)
-            if (insecureDraft) {
-                Spacer(Modifier.height(14.dp))
-                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                    NothingText("I understand HTTP exposes the key and ride data", color = NothingRed, size = 9,
-                        lineHeight = 14, modifier = Modifier.weight(1f))
-                    Switch(checked = confirmHttp, onCheckedChange = { confirmHttp = it })
-                }
-            }
-            Spacer(Modifier.height(14.dp))
-            Button(
-                onClick = { onConfigure(baseUrl, bearerKey, confirmHttp) },
-                enabled = parsed != null && bearerKey.isNotBlank() && (!insecureDraft || confirmHttp),
-                colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
-            ) { NothingLabel("SAVE & TEST", Color.White) }
         } else {
-            if (state.insecure) {
-                NothingText("UNENCRYPTED CONNECTION — bearer key and data travel in plaintext",
-                    color = NothingRed, size = 10, weight = FontWeight.Bold, lineHeight = 15)
-                Spacer(Modifier.height(12.dp))
-            }
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     NothingText(state.baseUrl.orEmpty(), size = 10, lineHeight = 15)
-                    NothingText(
-                        if (state.authMode == ApiAuthMode.OIDC_DEVICE) "SSO-enrolled device" else "Legacy bearer key",
-                        color = NothingMuted,
-                        size = 9,
-                    )
+                    NothingText("SSO-enrolled device", color = NothingMuted, size = 9)
                     state.serverId?.let { NothingText("Server ${it.take(18)}", color = NothingMuted, size = 9) }
                 }
                 ApiIconButton("Remove API configuration", true, onRequestRemoval) { TrashIcon() }
@@ -1971,7 +1929,7 @@ private fun ApiRemovalDialog(
         title = { NothingText("Remove API configuration?", size = 20, weight = FontWeight.Black) },
         text = {
             NothingText(
-                "This disables delivery and forgets the protected base URL and bearer key. " +
+                "This disables delivery and forgets the protected base URL and device credential. " +
                     "Destination-scoped delivery acknowledgements are retained if you reconnect later.",
                 color = NothingMuted,
                 size = 11,
