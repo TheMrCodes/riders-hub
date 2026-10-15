@@ -43,6 +43,8 @@ data class ApiSnapshot(
     val chargerAnalyticsStatus: String,
     val gpsStatus: String,
     val lastError: String?,
+    val motionEnabled: Boolean = false,
+    val motionStatus: String = "Off",
 )
 
 internal class ApiStore(
@@ -53,18 +55,33 @@ internal class ApiStore(
     private val app = context.applicationContext
     private val preferences = app.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
+    // Cache only decrypted identity, never server capabilities, consent or channel status.
+    // Compare persisted ciphertext on every read so other ApiStore instances invalidate it too.
+    private class Identity(val encryptedUrl: String, val encryptedKey: String,
+        val url: String, val key: String, val destination: String)
+    private var identity: Identity? = null
+
     fun connection(): ApiConnection? = synchronized(CONFIG_LOCK) { readConnection() }
 
     private fun readConnection(): ApiConnection? = try {
-        val url = preferences.getString(KEY_URL, null)?.let { vault.decrypt(it, "base-url") }
-            ?: return null
+        val encryptedUrl = preferences.getString(KEY_URL, null)
+        val encryptedKey = preferences.getString(KEY_KEY, null)
+        if (encryptedUrl == null || encryptedKey == null) {
+            identity = null
+            return null
+        }
         if (preferences.getString(KEY_AUTH_MODE, null) != ApiAuthMode.OIDC_DEVICE.name) {
             clearConfiguration()
             return null
         }
-        val key = preferences.getString(KEY_KEY, null)?.let { vault.decrypt(it, "bearer-key") }
-            ?: return null
-        val destination = destinationId(url)
+        val cached = identity?.takeIf {
+            it.encryptedUrl == encryptedUrl && it.encryptedKey == encryptedKey
+        } ?: run {
+            val url = vault.decrypt(encryptedUrl, "base-url")
+            Identity(encryptedUrl, encryptedKey, url, vault.decrypt(encryptedKey, "bearer-key"),
+                destinationId(url)).also { identity = it }
+        }
+        val (url, key, destination) = Triple(cached.url, cached.key, cached.destination)
         ApiConnection(url, key, destination, database.serverId(destination),
             preferences.getString(KEY_REVISION, "") ?: "")
     } catch (_: Exception) {
@@ -137,10 +154,13 @@ internal class ApiStore(
             chargerAnalyticsStatus = statuses[3] ?: "Unknown",
             gpsStatus = statuses[4] ?: "Unknown",
             lastError = statuses[5],
+            motionEnabled = connection?.takeIf { it.serverId != null }?.let { MotionStore.get(app).approved(it.deliveryScope) } == true,
+            motionStatus = connection?.takeIf { it.serverId != null }?.let { MotionStore.get(app).status(it.deliveryScope) } ?: "Off",
         )
     }
 
     fun clearConfiguration() = synchronized(CONFIG_LOCK) {
+        identity = null
         preferences.edit().clear().commit()
     }
 
@@ -157,6 +177,7 @@ internal class ApiStore(
         if (!config.enabled || connection.serverId == null) return@synchronized false
         if (!database.channelReady(connection.deliveryScope, channel)) return@synchronized false
         when (channel) {
+            "motion" -> config.capabilities?.motion != null && config.motionEnabled
             "metrics" -> config.capabilities?.metrics != null
             "realtime" -> config.capabilities?.realtime != null
             "analytics" -> config.capabilities?.analytics != null && config.analyticsApproved

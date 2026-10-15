@@ -12,6 +12,7 @@ import at.themrcodes.ridershub.session.RideStore
 import at.themrcodes.ridershub.session.RideSummary
 import org.json.JSONObject
 import java.time.Instant
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,6 +30,7 @@ class ApiIntegration private constructor(context: Context) {
     private val main = Handler(Looper.getMainLooper())
     private val cadence = Executors.newSingleThreadScheduledExecutor { Thread(it, "riders-hub-api-cadence") }
     private val snapshotInFlight = AtomicBoolean(false)
+    private val frames = ApiFrameBuffer()
     private val lock = Any()
     private var realtime: RealtimeSession? = null
     private var realtimeRide: String? = null
@@ -40,7 +42,7 @@ class ApiIntegration private constructor(context: Context) {
     @Volatile private var finalizingRide: String? = null
 
     init {
-        cadence.scheduleWithFixedDelay({
+        cadence.scheduleAtFixedRate({
             // One malformed observation must not permanently terminate the scheduler.
             runCatching { tick() }.onFailure { state.setError("API live update failed") }
         }, 1, 1, TimeUnit.SECONDS)
@@ -62,14 +64,19 @@ class ApiIntegration private constructor(context: Context) {
         }
     }
 
-    fun completeOidcEnrollment(baseUrl: String, accessToken: String) {
+    fun completeOidcEnrollment(
+        baseUrl: String,
+        accessToken: String,
+        result: (Result<Unit>, String) -> Unit,
+    ) {
         val normalized = apiUrls(baseUrl).base.also {
             require(it.isHttps) { "SSO enrollment requires HTTPS" }
         }.toString().removeSuffix("/")
         val generation = discoveryGeneration.incrementAndGet()
         state.clearError()
         network.execute {
-            runCatching {
+            var step = "Device registration"
+            val outcome = runCatching {
                 val registration = client.registerDevice(normalized, accessToken, database.sourceId())
                 synchronized(ApiStore.CONFIG_LOCK) {
                     if (generation != discoveryGeneration.get()) return@execute
@@ -77,6 +84,7 @@ class ApiIntegration private constructor(context: Context) {
                     store.configureOidc(normalized, registration.deviceToken)
                 }
                 val candidate = requireNotNull(store.connection())
+                step = "API capabilities"
                 val (json, capabilities) = client.capabilities(candidate)
                 synchronized(ApiStore.CONFIG_LOCK) {
                     if (generation != discoveryGeneration.get() || store.connection() != candidate) return@execute
@@ -84,10 +92,14 @@ class ApiIntegration private constructor(context: Context) {
                 }
                 resetLiveTransports()
                 store.connection()?.let { acceptCapabilities(it, capabilities) }
+                Unit
             }.onFailure {
                 if (generation == discoveryGeneration.get()) {
                     state.setError("SSO device enrollment failed; sign in again or check the server configuration")
                 }
+            }
+            main.post {
+                if (generation == discoveryGeneration.get()) result(outcome, step)
             }
         }
     }
@@ -132,6 +144,7 @@ class ApiIntegration private constructor(context: Context) {
             store.snapshot().analyticsApproved -> "Ready"
             else -> "Approval required"
         })
+        MotionDeliveryWorker.enqueue(app)
         if (capabilities.realtime?.gps != true) stopGps("Server does not advertise GPS")
         ApiDeliveryWorker.enqueue(app, connection.destinationId)
         if (store.snapshot().analyticsApproved) ApiArchiveWorker.enqueue(app)
@@ -171,6 +184,16 @@ class ApiIntegration private constructor(context: Context) {
         ApiArchiveWorker.enqueue(app)
     }
 
+    fun setMotionEnabled(enabled: Boolean) {
+        val connection = store.connection()?.takeIf { it.serverId != null } ?: return
+        synchronized(ApiStore.CONFIG_LOCK) {
+            MotionStore.get(app).approve(connection.deliveryScope, enabled)
+            MotionStore.get(app).status(connection.deliveryScope, if (enabled) "Waiting for a connected remote" else "Off")
+            if (!enabled) ApiClient.cancelMotionTransports()
+        }
+        if (!enabled) RideMotionService.stop(app) else MotionDelivery.request(app)
+    }
+
     fun setGpsEnabled(enabled: Boolean) {
         store.setGpsEnabled(enabled)
         if (!enabled) stopGps("GPS disabled")
@@ -202,6 +225,25 @@ class ApiIntegration private constructor(context: Context) {
         ApiDeliveryWorker.enqueue(app, connection.destinationId)
     }
 
+    fun onRemoteConnected(owner: String) { RemoteTrackingGate.shared.connected(owner) }
+
+    fun onRemoteDisconnected(owner: String) {
+        if (!RemoteTrackingGate.shared.disconnected(owner)) return
+        cadence.schedule({
+            if (RemoteTrackingGate.shared.current() == null) {
+                // Preserve the ride's WebSocket, but stop every tracking producer and HTTP send.
+                frames.clear()
+                ApiClient.cancelMotionTransports()
+                RideMotionService.stop(app)
+                stopGps("Paused: remote disconnected")
+                synchronized(lock) { realtime?.flushBatch() }
+                store.connection()?.takeIf { it.serverId != null }?.let {
+                    MotionStore.get(app).status(it.deliveryScope, "Paused: remote disconnected")
+                }
+            }
+        }, RemoteTrackingGate.GRACE_MS, TimeUnit.MILLISECONDS)
+    }
+
     fun onFrame(
         ride: RideSummary,
         frame: TelemetryFrame,
@@ -210,35 +252,27 @@ class ApiIntegration private constructor(context: Context) {
         frameAt: Instant,
         segmentElapsedMs: Long,
     ) {
-        if (!frame.crcValid) return
-        val config = store.snapshot()
-        val connection = store.connection() ?: return
-        if (!config.enabled || connection.serverId == null || finalizingRide == ride.id) return
-        val ids = exportIds(ride)
-        if (store.allows(connection, "realtime")) {
-            ensureRealtime(connection, ids.first, ids.second)
-            synchronized(lock) {
-                realtime?.offer(
-                    captureSegmentId, frameNumber, frameAt.toString(), segmentElapsedMs,
-                    frame.speedKmh, if (config.gpsEnabled) LocationFixState.latest() else null,
-                )
-            }
-        }
-        sendDueSnapshot(connection, ride, ids)
-        if (config.gpsEnabled && config.capabilities?.realtime?.gps == true) {
-            RideLocationService.start(app, ride.logFile)
-        }
+        // BLE callbacks run on the main looper. Only buffer an immutable sample here;
+        // credentials, SQLite, socket setup and GPS startup belong to the cadence worker.
+        if (!frame.crcValid || finalizingRide == ride.id) return
+        if (RemoteTrackingGate.shared.observe(captureSegmentId, ride.id, ride.logFile) == null) return
+        frames.offer(ApiFrame(ride.id, captureSegmentId, frameNumber, frameAt,
+            segmentElapsedMs, frame.speedKmh, SystemClock.elapsedRealtimeNanos(), frame.raw.copyOf()))
     }
 
     /** Stops live producers before the ride writer is drained and archived. */
     fun onRideFinalizing(rideId: String) {
         finalizingRide = rideId
+        RemoteTrackingGate.shared.endRide(rideId)
+        ApiClient.cancelMotionTransports()
+        frames.clear()
         synchronized(lock) {
             realtimeGeneration += 1
             realtime?.close()
             realtime = null
             realtimeRide = null
         }
+        RideMotionService.stop(app)
         stopGps("Ride finalized")
     }
 
@@ -287,6 +321,7 @@ class ApiIntegration private constructor(context: Context) {
                 val config = store.snapshot()
                 if (!config.enabled) return@execute
                 ApiDeliveryWorker.enqueue(app, connection.destinationId)
+                MotionDeliveryWorker.enqueue(app)
                 if (config.analyticsApproved) ApiArchiveWorker.enqueue(app)
             }.onFailure { state.setError("API delivery recovery failed; retained data will be retried") }
         }
@@ -332,20 +367,39 @@ class ApiIntegration private constructor(context: Context) {
     }
 
     private fun tick() {
+        val batch = frames.take()
+        if (batch.overflow) {
+            resetLiveTransports()
+            state.setError("Realtime buffer overflow; live stream restarted")
+            return
+        }
         rideStore.finalizeExpired()
         val config = store.snapshot()
         val connection = store.connection() ?: return
         if (!config.enabled || connection.serverId == null) return
         val ride = rideStore.activeRide() ?: return
         if (ride.boardFrameCount == 0L || finalizingRide == ride.id) return
+        val window = RemoteTrackingGate.shared.current()?.takeIf { it.rideId == ride.id }
         val ids = exportIds(ride)
-        sendDueSnapshot(connection, ride, ids)
-        // Reconnect during BLE grace too; a new board frame is not required to retry the socket.
-        if (store.allows(connection, "realtime")) ensureRealtime(connection, ids.first, ids.second)
-        if (config.gpsEnabled && !RideLocationService.hasRequiredPermissions(app)) {
+        if (window != null && config.motionEnabled && config.capabilities?.motion != null) {
+            RideMotionService.start(app, ride.id, connection, window)
+        } else RideMotionService.stop(app)
+        if (window != null) sendDueSnapshot(connection, ride, ids)
+        // An established trip can retain/recover its idle socket without restarting sensors.
+        if (store.allows(connection, "realtime")) {
+            if (window != null || realtimeRide == ids.second) ensureRealtime(connection, ids.first, ids.second, ride)
+            synchronized(lock) {
+                if (window != null && finalizingRide != ride.id && frames.isCurrent(batch)) {
+                    batch.frames.filter { it.rideId == ride.id }.forEach { frame ->
+                        realtime?.offer(frame.captureSegmentId, frame.frameNumber, frame.frameAt.toString(),
+                            frame.segmentElapsedMs, frame.speedKmh, frame.receivedAtNanos, frame.raw?.joinToString("") { "%02x".format(Locale.ROOT, it.toInt() and 0xff) })
+                    }
+                }
+            }
+        }
+        synchronized(lock) { realtime?.flushBatch() }
+        if (window != null && config.gpsEnabled && !RideLocationService.hasRequiredPermissions(app)) {
             reportGpsUnavailable("Precise and background location permissions are required")
-        } else if (config.gpsEnabled && config.capabilities?.realtime?.gps == true) {
-            RideLocationService.start(app, ride.logFile)
         }
     }
 
@@ -358,6 +412,7 @@ class ApiIntegration private constructor(context: Context) {
     }
 
     private fun resetLiveTransports() {
+        frames.clear()
         synchronized(lock) {
             realtimeGeneration += 1
             realtime?.close()
@@ -366,11 +421,13 @@ class ApiIntegration private constructor(context: Context) {
             reconnectAttempt = 0
             nextRealtimeAttemptElapsedMs = 0
         }
+        RideMotionService.stop(app)
         stopGps("GPS awaiting active ride")
     }
 
-    private fun ensureRealtime(connection: ApiConnection, boardId: String, rideId: String) {
+    private fun ensureRealtime(connection: ApiConnection, boardId: String, rideId: String, ride: RideSummary) {
         synchronized(lock) {
+            if (finalizingRide == ride.id) return
             if (realtimeRide == rideId && realtime != null) return
             if (SystemClock.elapsedRealtime() < nextRealtimeAttemptElapsedMs) return
             realtimeGeneration += 1
@@ -380,8 +437,21 @@ class ApiIntegration private constructor(context: Context) {
             val session = RealtimeSession(
                 connection,
                 RealtimeSession.Context(database.sourceId(), boardId, rideId),
-                allowed = store::allows,
-                locationAllowed = { store.snapshot().gpsEnabled && RideLocationService.hasRequiredPermissions(app) },
+                allowed = { candidate, channel -> finalizingRide != ride.id && store.allows(candidate, channel) },
+                trackingAllowed = { RemoteTrackingGate.shared.current()?.rideId == ride.id },
+                locationAllowed = {
+                    val current = store.snapshot()
+                    RemoteTrackingGate.shared.current()?.rideId == ride.id && current.enabled && current.gpsEnabled && current.capabilities?.realtime?.gps == true &&
+                        RideLocationService.hasRequiredPermissions(app)
+                },
+                requestLocation = {
+                    RemoteTrackingGate.shared.current()?.takeIf { it.rideId == ride.id }?.let { window ->
+                        LocationFixState.clear()
+                        RideLocationService.start(app, ride.logFile, window)
+                    }
+                },
+                latestLocation = LocationFixState::latest,
+                automaticFlush = false,
                 onState = { status, error ->
                     val current = synchronized(lock) {
                         if (generation != realtimeGeneration) false else {

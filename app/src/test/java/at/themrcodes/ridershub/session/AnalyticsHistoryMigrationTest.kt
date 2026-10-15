@@ -83,6 +83,7 @@ class AnalyticsHistoryMigrationTest {
         assertEquals(64, manifest.getString("source_sha256").length)
         assertTrue(JSONObject(result.replacement.getValue("battery_estimates_v1")).length() > 0)
         assertTrue(JSONObject(result.replacement.getValue("battery_learning_models_v1")).length() > 0)
+        assertEquals(2, JSONObject(result.replacement.getValue("raw_load_zero_v1")).length())
         assertEquals(manifest.toString(), result.report.getJSONObject("replay").toString())
     }
 
@@ -112,7 +113,8 @@ class AnalyticsHistoryMigrationTest {
         val root = temporary.newFolder()
         val start = Instant.parse("2030-01-01T10:00:00Z")
         archive(root, "session", "02:00:00:00:00:01", start,
-            List(10) { 40 } + List(40) { 55 })
+            List(10) { 40 } + List(40) { 55 },
+            odometers = List(10) { 100.0 + it * .005 } + List(40) { 102.2 + it * .005 })
 
         val result = AnalyticsHistoryMigration.rebuild(
             File(root, "archive"), temporary.newFolder(), emptyMap(),
@@ -123,9 +125,10 @@ class AnalyticsHistoryMigrationTest {
         assertEquals(start.plusSeconds(10).toString(), active.getString("started_at"))
         assertEquals(0.195, active.getDouble("recorded_distance_km"), 1e-9)
         assertEquals(1, result.report.getJSONObject("stream").getInt("confirmed_charge_boundaries"))
-        assertEquals(0.005, result.report.getJSONObject("stream").getDouble("charge_spanning_gap_km"), 1e-9)
+        assertEquals(0, result.report.getJSONObject("stream").getInt("hard_odometer_gaps"))
+        assertEquals(2.155, result.report.getJSONObject("stream").getDouble("charge_spanning_gap_km"), 1e-9)
         val board = pseudonymousBoardId("02:00:00:00:00:01")
-        assertEquals(0.005, BoardSpeedBucketStatsRegistry(
+        assertEquals(2.155, BoardSpeedBucketStatsRegistry(
             result.replacement.getValue("board_speed_bucket_stats_v1"),
         ).snapshot(board)!!.unattributedDistanceKm, 1e-9)
     }
@@ -179,8 +182,15 @@ class AnalyticsHistoryMigrationTest {
             val node = nodes.item(i)
             if (node.nodeName == "string") put(node.attributes.getNamedItem("name").nodeValue, node.textContent)
         } }
-        val result = AnalyticsHistoryMigration.rebuild(File(root, "before/telemetry/archive"), temporary.newFolder(), prefs)
-        val again = AnalyticsHistoryMigration.rebuild(File(root, "before/telemetry/archive"), temporary.newFolder(), prefs)
+        // Personal profile values come from the local environment, never from tracked files.
+        fun env(name: String) = System.getenv(name)?.toDoubleOrNull()
+        val profile = RiderBoardProfile(
+            riderMassKg = env("RIDERS_AUDIT_RIDER_KG") ?: RiderBoardProfile.DEFAULT_RIDER_MASS_KG,
+            boardMassKgOverride = env("RIDERS_AUDIT_BOARD_KG"),
+            batteryWhOverride = env("RIDERS_AUDIT_BATTERY_WH"),
+        ).normalized()
+        val result = AnalyticsHistoryMigration.rebuild(File(root, "before/telemetry/archive"), temporary.newFolder(), prefs, profile)
+        val again = AnalyticsHistoryMigration.rebuild(File(root, "before/telemetry/archive"), temporary.newFolder(), prefs, profile)
         assertEquals(result.replacement, again.replacement)
         File(root, "rebuilt.json").writeText(JSONObject(result.replacement).toString())
         File(root, "comparison.json").writeText(result.report.toString(2))

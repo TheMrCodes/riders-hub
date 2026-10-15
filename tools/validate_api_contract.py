@@ -57,6 +57,7 @@ def payload_validator(schema):
 def validate_examples(contracts):
     http, realtime = contracts["openapi"], contracts["asyncapi"]
     for filename, schema, document in [
+        ("motion-batch.json", http["components"]["schemas"]["MotionBatch"], http),
         ("auth-config.json", http["components"]["schemas"]["AuthConfig"], http),
         ("device-registration.json", http["components"]["schemas"]["DeviceRegistration"], http),
         ("device-registration-response.json", http["components"]["schemas"]["DeviceRegistrationResponse"], http),

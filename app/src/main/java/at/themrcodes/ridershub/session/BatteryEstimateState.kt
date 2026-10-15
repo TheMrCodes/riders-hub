@@ -3,20 +3,35 @@ package at.themrcodes.ridershub.session
 import org.json.JSONObject
 import kotlin.math.abs
 
-/** Only the board's estimate/reference survive disconnects; elapsed-time evidence never does. */
-internal data class BatteryEstimateState(val percent: Double, val referencePercent: Int) {
+/** Durable per-board SOC and capacity state; elapsed-time settling evidence never survives. */
+internal data class BatteryEstimateState(
+    val percent: Double,
+    val referencePercent: Int,
+    val capacity: BatteryCapacityEstimate = BatteryCapacityEstimate(),
+) {
     init {
         require(percent.isFinite() && percent in 0.0..100.0)
         require(referencePercent in 0..100)
     }
 
-    fun toJson(): JSONObject = JSONObject().put("version", 1)
+    fun toJson(): JSONObject = JSONObject().put("version", 2)
         .put("percent", percent).put("reference_percent", referencePercent)
+        .put("capacity", capacity.toJson())
 
     companion object {
         fun fromJson(value: JSONObject): BatteryEstimateState? = runCatching {
-            if (value.optInt("version") != 1) return null
-            BatteryEstimateState(value.getDouble("percent"), value.getInt("reference_percent"))
+            when (value.optInt("version")) {
+                1 -> BatteryEstimateState(
+                    value.getDouble("percent"),
+                    value.getInt("reference_percent"),
+                )
+                2 -> BatteryEstimateState(
+                    value.getDouble("percent"),
+                    value.getInt("reference_percent"),
+                    BatteryCapacityEstimate.fromJson(value.getJSONObject("capacity")) ?: return null,
+                )
+                else -> null
+            }
         }.getOrNull()
     }
 }
@@ -82,7 +97,7 @@ internal class BatteryObservationTracker {
         val reacquiringUsed = confirmed && reacquiring
         val step = BatteryPercentEstimator.step(current.percent, reference, elapsedSeconds, distanceKm,
             batteryPercentPerKm, settled, reacquiringUsed)
-        val result = BatteryEstimateState(step.percent, reference)
+        val result = current.copy(percent = step.percent, referencePercent = reference)
         if (confirmed && abs(result.percent - reference) <= 2.6) reacquiring = false
         return BatteryObservationResult(result, BatteryObservationDiagnostics(
             status = if (state == null) "initialized" else "updated",

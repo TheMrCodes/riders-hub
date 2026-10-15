@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import at.themrcodes.ridershub.BatteryWarningNotifier
+import at.themrcodes.ridershub.GeneralSettingsStore
 import at.themrcodes.ridershub.api.ApiIntegration
 import at.themrcodes.ridershub.api.ApiArchiveWorker
 import at.themrcodes.ridershub.log.JsonlSessionLog
@@ -23,6 +24,7 @@ import java.util.concurrent.Executors
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class RideStore private constructor(private val context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
@@ -53,6 +55,9 @@ class RideStore private constructor(private val context: Context) {
     private var batteryEstimates = BatteryEstimateRegistry(
         preferences.getString(KEY_BATTERY_ESTIMATES, "{}") ?: "{}",
     )
+    private var rawLoadZeros = RawLoadZeroRegistry(
+        preferences.getString(KEY_RAW_LOAD_ZERO, "{}") ?: "{}",
+    )
     private val boardContinuity = mutableMapOf<String, BoardContinuityState>().apply {
         val value = runCatching {
             JSONObject(preferences.getString("board_continuity_v1", "{}") ?: "{}")
@@ -75,6 +80,52 @@ class RideStore private constructor(private val context: Context) {
         preferences.getString("board_speed_bucket_stats_v1", "{}") ?: "{}",
     )
     private var lastPersistElapsedMs = 0L
+    private val generalSettings = GeneralSettingsStore(context)
+    private val archiveExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "riders-hub-archive-migration").apply { priority = Thread.MIN_PRIORITY }
+    }
+    private var archiveReplay = ArchiveReplayState()
+
+    fun archiveReplayState(): ArchiveReplayState = synchronized(LOCK) { archiveReplay }
+
+    fun replayCurrentArchive() {
+        synchronized(LOCK) {
+            if (archiveReplay.running) return
+            if (active != null) {
+                archiveReplay = ArchiveReplayState(message = "Finish the current recording before replaying archives.", failed = true)
+                return
+            }
+            archiveReplay = ArchiveReplayState(running = true, message = "Replaying saved recordings…")
+        }
+        archiveExecutor.execute {
+            val result = runCatching {
+                val directory = context.getExternalFilesDir("telemetry") ?: File(context.filesDir, "telemetry")
+                requireNotNull(migrateAnalyticsHistory(directory, restoreTrips = true))
+            }
+            synchronized(LOCK) {
+                archiveReplay = result.fold(
+                    onSuccess = {
+                        val trips = if (it.trips == 1) "trip" else "trips"
+                        val recordings = if (it.sessions == 1) "recording" else "recordings"
+                        ArchiveReplayState(message = "Restored ${it.trips} $trips and rebuilt Riders Profile from ${it.sessions} $recordings.")
+                    },
+                    onFailure = {
+                        ArchiveReplayState(
+                            message = if (it is NoArchivedRecordings) "No saved archives found on this phone."
+                                else "Replay failed. Your previous app data was kept. Check that the saved recordings are complete, then try again.",
+                            failed = true,
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    private data class ArchiveReplayResult(val trips: Int, val sessions: Int)
+    private class NoArchivedRecordings : IllegalStateException()
+
+    /** Read per use: in-memory preferences, so profile edits apply to the next snapshot. */
+    private fun riderBoardProfile(): RiderBoardProfile = generalSettings.riderBoardProfile()
 
     init {
         // An open BLE segment cannot survive process death. Preserve the logical ride's grace.
@@ -137,6 +188,14 @@ class RideStore private constructor(private val context: Context) {
             newSession = !resumable,
             resumeDeadlineEpochMs = resumeDeadlineEpochMs,
         )
+    }
+
+    /** Latest barometer sample for grade; frames ignore it once it is older than three seconds. */
+    internal fun recordPressure(pressureHPa: Double, receivedElapsedMs: Long) = synchronized(LOCK) {
+        val stored = active ?: return@synchronized
+        if (!pressureHPa.isFinite() || pressureHPa !in 300.0..1_100.0) return@synchronized
+        stored.pressureHPa = pressureHPa
+        stored.pressureElapsedMs = receivedElapsedMs
     }
 
     internal fun recordFrame(
@@ -246,7 +305,26 @@ class RideStore private constructor(private val context: Context) {
                 batteryElapsedSeconds = if (continuity.gapReason == null && previousContinuity != null) {
                     (now - previousContinuity.atMs) / 1000.0
                 } else 0.0
-                val estimatedGapProfile = recordStreamCalibrationLocked(stored, summary, continuity, wallTime)
+                val loadZero = rawLoadZeros.observe(
+                    board = stored.localBoardId,
+                    raw = frame.loadRaw,
+                    stationaryEligible = frame.speedKmh <= RESTING_SPEED_KMH &&
+                        !continuity.chargePending && continuity.rechargeIncreasePercent == null,
+                    elapsedSeconds = batteryElapsedSeconds,
+                )
+                val motion = if (continuity.gapReason != null || continuity.chargePending) {
+                    stored.physics.reset(); WindowMotion.ZERO
+                } else stored.physics.observe(
+                    model = speedBucketStats.physicsModel(stored.localBoardId),
+                    atMs = now,
+                    speedKmh = frame.speedKmh,
+                    voltageV = requireNotNull(voltage),
+                    effectiveLoadRaw = loadZero.effectiveRaw(frame.loadRaw),
+                    pressureHPa = stored.pressureHPa?.takeIf {
+                        stored.pressureElapsedMs?.let { at -> elapsedNow - at in 0..PhysicsPowerConstants.MAX_PRESSURE_AGE_MS } == true
+                    },
+                )
+                val estimatedGapProfile = recordStreamCalibrationLocked(stored, summary, continuity, wallTime, motion)
                 if (stored.batteryConsumptionModel == null || elapsedNow - stored.batteryModelAtMs >= 10_000L) {
                     stored.batteryConsumptionModel = RangeEstimator.estimate(
                         currentBatteryPercent = battery,
@@ -257,7 +335,7 @@ class RideStore private constructor(private val context: Context) {
                         ),
                         calibrationPoints = emptyList(),
                         selectedBoardId = stored.localBoardId,
-                        speedBucketStatistics = speedBucketStats.snapshot(stored.localBoardId),
+                        speedBucketStatistics = speedBucketStats.snapshot(stored.localBoardId, riderBoardProfile()),
                     )
                     stored.batteryModelAtMs = elapsedNow
                 }
@@ -287,7 +365,7 @@ class RideStore private constructor(private val context: Context) {
                     distanceKm = intervalDistanceKm,
                     batteryPercentPerKm = appliedRate,
                     voltageV = requireNotNull(voltage),
-                    loadRaw = frame.loadRaw,
+                    loadRaw = loadZero.effectiveRaw(frame.loadRaw).roundToInt(),
                 )
                 val inferredGapBase = model?.let {
                     DigitalTwinDriveModel.inferredTransition(
@@ -356,6 +434,17 @@ class RideStore private constructor(private val context: Context) {
                     inferredGapConsumptionPercent = inferredGapStep?.consumptionPercent ?: 0.0,
                     highestReportedBatteryPercent = chargeStats.highestReportedPercent,
                     highestSettledBatteryPercent = chargeStats.highestSettledPercent,
+                    estimatedCapacityWh = estimate.state.capacity.estimatedWh,
+                    capacityStatus = estimate.state.capacity.status,
+                    capacityObservationCount = estimate.state.capacity.observationCount,
+                    capacityQualifiedDepletionPercent =
+                        estimate.state.capacity.qualifiedDepletionPercent,
+                    loadRaw = frame.loadRaw,
+                    loadEffectiveRaw = loadZero.effectiveRaw(frame.loadRaw),
+                    loadZeroRaw = loadZero.zeroRaw,
+                    loadDeadbandRaw = loadZero.deadbandRaw,
+                    loadZeroSampleCount = loadZero.acceptedSampleCount,
+                    loadZeroCalibrated = loadZero.calibrated,
                     bucketModelSource = when {
                         model?.usesAccumulatedBucketConsumption == true -> "cumulative"
                         model?.kmPerPercent != null -> "retained_windows"
@@ -364,6 +453,30 @@ class RideStore private constructor(private val context: Context) {
                     bucketEvidence = intervalSpeedKmh?.let(::speedBucketStartKmh)?.let { bucket ->
                         model?.speedBucketStatistics?.buckets?.firstOrNull { it.startKmh == bucket }
                     },
+                    bucketRollingPercentPerKm =
+                        model?.speedBucketStatistics?.rollingPercentPerKm,
+                    bucketAerodynamicPercentPerKmPerKmhSquared =
+                        model?.speedBucketStatistics?.aerodynamicPercentPerKmPerKmhSquared,
+                    bucketUnconstrainedRollingCoefficient =
+                        model?.speedBucketStatistics?.unconstrainedRollingCoefficient,
+                    bucketUnconstrainedAerodynamicCoefficientPerKmhSquared =
+                        model?.speedBucketStatistics
+                            ?.unconstrainedAerodynamicCoefficientPerKmhSquared,
+                    bucketRollingCoefficientStandardError =
+                        model?.speedBucketStatistics?.rollingCoefficientStandardError,
+                    bucketAerodynamicCoefficientStandardErrorPerKmhSquared =
+                        model?.speedBucketStatistics
+                            ?.aerodynamicCoefficientStandardErrorPerKmhSquared,
+                    bucketShapeReferenceSpeedKmh =
+                        model?.speedBucketStatistics?.shapeReferenceSpeedKmh,
+                    bucketAerodynamicShareAtReference =
+                        model?.speedBucketStatistics?.aerodynamicShareAtReference,
+                    bucketShapeConditionNumber =
+                        model?.speedBucketStatistics?.shapeConditionNumber,
+                    bucketShapeRSquared = model?.speedBucketStatistics?.shapeRSquared,
+                    bucketShapeEvidenceKm = model?.speedBucketStatistics?.shapeEvidenceKm,
+                    bucketShapeSupportedBuckets =
+                        model?.speedBucketStatistics?.shapeSupportedBucketCount,
                 )
                 stored.lastBatteryElapsedMs = elapsedNow
 
@@ -438,7 +551,7 @@ class RideStore private constructor(private val context: Context) {
 
     /** Cumulative per-board analysis, independent of the range forecast's rolling history. */
     fun speedBucketStatistics(localBoardId: String): BoardSpeedBucketStatistics? = synchronized(LOCK) {
-        speedBucketStats.snapshot(localBoardId)
+        speedBucketStats.snapshot(localBoardId, riderBoardProfile())
     }
 
     private fun seedSpeedBucketStatsLocked(board: String) {
@@ -466,7 +579,7 @@ class RideStore private constructor(private val context: Context) {
             activeCycles = activeChargeCycles.values.sortedByDescending { it.lastObservedAt },
             completedCycles = completedChargeCycles.sortedByDescending { it.closedAt },
         )
-        val bucketStatistics = rangeBoardId?.let { speedBucketStats.snapshot(it) }
+        val bucketStatistics = rangeBoardId?.let { speedBucketStats.snapshot(it, riderBoardProfile()) }
         RideStoreSnapshot(
             activeRide = active?.summary,
             lastCompletedRide = lastCompletedRide ?: tracks.firstOrNull(),
@@ -544,6 +657,11 @@ class RideStore private constructor(private val context: Context) {
             )
         }
         if (completed.boardFrameCount > 0) lastCompletedRide = completed
+        if (completed.boardFrameCount > 0) {
+            // A trip changes cumulative evidence only. Refit the shape once from the entire
+            // supported distribution so one ride never becomes a direct shape update.
+            speedBucketStats.completeTrip(stored.localBoardId, completed.id)
+        }
         val finalRangeEstimate = if (
             completed.boardBatteryStart != null && completed.packVoltageStart != null
         ) {
@@ -559,7 +677,7 @@ class RideStore private constructor(private val context: Context) {
                 },
                 calibrationPoints = calibrationPoints,
                 selectedBoardId = stored.localBoardId,
-                speedBucketStatistics = speedBucketStats.snapshot(stored.localBoardId),
+                speedBucketStatistics = speedBucketStats.snapshot(stored.localBoardId, riderBoardProfile()),
             )
         } else null
         // Journal first. A crash before active is cleared repeats this transition, but the
@@ -573,6 +691,10 @@ class RideStore private constructor(private val context: Context) {
                 sessionId = completed.id,
                 batteryPercent = completed.boardBatteryEnd,
                 packVoltageV = completed.packVoltageEnd,
+                chargingBehaviorThresholdPercent = ChargingBehaviorEstimator.estimate(
+                    completedChargeCycles,
+                    stored.localBoardId,
+                )?.notificationThresholdPercent,
                 nowEpochMs = nowEpochMs,
             )
         }
@@ -632,6 +754,7 @@ class RideStore private constructor(private val context: Context) {
         summary: RideSummary,
         update: BoardContinuityUpdate,
         wallTime: Instant,
+        motion: WindowMotion = WindowMotion.ZERO,
     ): Map<Int, Double> {
         val board = stored.localBoardId
         val percent = requireNotNull(summary.boardBatteryEnd)
@@ -640,7 +763,7 @@ class RideStore private constructor(private val context: Context) {
             GapSpeedProfile.estimate(
                 update.unprofiledDistanceKm, board,
                 rangeEstimationSessions(history, stored.summary),
-                speedBucketStats.snapshot(board),
+                speedBucketStats.snapshot(board, riderBoardProfile()),
             )
         } else emptyMap()
         speedBucketStats.recordDistance(
@@ -662,6 +785,7 @@ class RideStore private constructor(private val context: Context) {
                 if (update.rechargeIncreasePercent == null) update.intervalDistanceKm + update.unprofiledDistanceKm else 0.0,
                 update.intervalSpeedKmh,
                 estimatedGapProfile,
+                motion,
             )
         }
         val distance = if (update.chargePending || update.rechargeIncreasePercent != null) 0.0
@@ -702,6 +826,7 @@ class RideStore private constructor(private val context: Context) {
         distanceKm: Double,
         speedKmh: Double?,
         estimatedSpeedBuckets: Map<Int, Double> = emptyMap(),
+        motion: WindowMotion = WindowMotion.ZERO,
     ) {
         val speedBuckets = if (speedKmh != null && distanceKm > 0.0) {
             mapOf(speedBucketStartKmh(speedKmh) to distanceKm)
@@ -717,6 +842,7 @@ class RideStore private constructor(private val context: Context) {
             speedBucketDistancesKm = speedBuckets,
             allowRechargeReset = false,
             estimatedSpeedBucketDistancesKm = estimatedSpeedBuckets,
+            motion = motion,
         ) ?: return
         activeRangeWindows[localBoardId] = update.activeWindow
         update.completedWindow?.let { completed ->
@@ -763,10 +889,7 @@ class RideStore private constructor(private val context: Context) {
         val directory = context.getExternalFilesDir("telemetry")
             ?: File(context.filesDir, "telemetry")
         val activePath = active?.summary?.logFile?.let(::File)?.absolutePath
-        val executor = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "riders-hub-archive-migration").apply { priority = Thread.MIN_PRIORITY }
-        }
-        executor.execute {
+        archiveExecutor.execute {
             directory.listFiles()
                 ?.asSequence()
                 ?.filter { it.isFile && it.extension == "jsonl" && it.absolutePath != activePath }
@@ -785,17 +908,20 @@ class RideStore private constructor(private val context: Context) {
                 }
             migrateAnalyticsHistory(directory)
         }
-        executor.shutdown()
     }
 
-    /** Startup worker only: compute off the UI thread, then atomically replace idle legacy state. */
-    private fun migrateAnalyticsHistory(telemetryDirectory: File) {
+    /** Archive worker: compute off the UI thread, then atomically replace idle state. */
+    private fun migrateAnalyticsHistory(telemetryDirectory: File, restoreTrips: Boolean = false): ArchiveReplayResult? {
         val before = synchronized(LOCK) {
             val projectionCurrent = preferences.getString(AnalyticsHistoryMigration.VERSION_KEY, null)
                 ?.toIntOrNull()?.let { it >= AnalyticsHistoryMigration.VERSION.toInt() } == true
             val modelCurrent = preferences.getString(AnalyticsHistoryMigration.MODEL_VERSION_KEY, null) ==
                 AnalyticsHistoryMigration.MODEL_VERSION
-            if (active != null || projectionCurrent && modelCurrent) return
+            if (active != null) {
+                check(!restoreTrips) { "Recording started before replay" }
+                return null
+            }
+            if (!restoreTrips && projectionCurrent && modelCurrent) return null
             preferences.all.toMap()
         }
         val strings = before.mapNotNull { (key, value) -> (value as? String)?.let { key to it } }.toMap()
@@ -803,19 +929,38 @@ class RideStore private constructor(private val context: Context) {
         val rawArchiveAvailable = archiveDirectory.listFiles()?.any {
             it.isFile && it.extension.lowercase(Locale.ROOT) in setOf("rhp", "rha")
         } == true
-        if (!AnalyticsHistoryMigration.required(strings, rawArchiveAvailable)) {
+        if (restoreTrips && !rawArchiveAvailable) throw NoArchivedRecordings()
+        if (!restoreTrips && !AnalyticsHistoryMigration.required(strings, rawArchiveAvailable)) {
             synchronized(LOCK) {
                 if (active == null && preferences.all == before) preferences.edit()
                     .putString(AnalyticsHistoryMigration.VERSION_KEY, AnalyticsHistoryMigration.VERSION)
                     .putString(AnalyticsHistoryMigration.MODEL_VERSION_KEY, AnalyticsHistoryMigration.MODEL_VERSION)
                     .commit()
             }
-            return
+            return null
         }
         val directory = File(context.filesDir, "analytics-migration").also { it.mkdirs() }
         val scratch = File(context.cacheDir, "analytics-migration").also { it.mkdirs() }
-        runCatching {
-            val rebuilt = AnalyticsHistoryMigration.rebuild(archiveDirectory, scratch, strings)
+        val profile = riderBoardProfile()
+        val outcome = runCatching {
+            val recovered = if (restoreTrips) ArchiveHistoryRecovery.recover(archiveDirectory, scratch) else null
+            val restoredHistory = recovered?.let {
+                val existing = JSONArray(strings[KEY_HISTORY] ?: "[]")
+                ArchiveHistoryRecovery.merge(it, List(existing.length()) { index -> summaryFromJson(existing.getJSONObject(index)) })
+            }
+            val rebuilt = AnalyticsHistoryMigration.rebuild(archiveDirectory, scratch, strings, profile)
+            val replacement = rebuilt.replacement.toMutableMap()
+            if (restoredHistory != null) {
+                replacement[KEY_HISTORY] = JSONArray(restoredHistory.map { it.toJson() }).toString()
+                val existingLast = strings[KEY_LAST_COMPLETED_RIDE]?.let { summaryFromJson(JSONObject(it)) }
+                val retainedLast = existingLast?.let { old -> recovered.firstOrNull { it.id == old.id }?.let {
+                    old.copy(logFile = it.logFile, localBoardId = old.localBoardId ?: it.localBoardId)
+                } ?: old }
+                (listOfNotNull(retainedLast) + recovered.filter { it.boardFrameCount > 0 })
+                    .maxByOrNull { Instant.parse(it.startedAt) }?.let {
+                    replacement[KEY_LAST_COMPLETED_RIDE] = it.toJson().toString()
+                }
+            }
             // Backup and comparison are durable before the completion marker or derived state changes.
             val backup = File.createTempFile("before-v${AnalyticsHistoryMigration.VERSION}-", ".json", directory)
             java.io.FileOutputStream(backup).use { output ->
@@ -826,9 +971,11 @@ class RideStore private constructor(private val context: Context) {
             ).writeText(rebuilt.report.toString(2))
             synchronized(LOCK) {
                 // A recording, finalization or settings writer may have changed the inputs during replay.
-                if (active != null || preferences.all != before) return@synchronized
+                check(active == null && preferences.all == before && riderBoardProfile() == profile) {
+                    "App data changed during archive replay"
+                }
                 val committed = preferences.edit().apply {
-                    rebuilt.replacement.forEach { (key, value) -> putString(key, value) }
+                    replacement.forEach { (key, value) -> putString(key, value) }
                     putString("analytics_history_backup", backup.name)
                     remove("analytics_history_migration_error")
                 }.commit()
@@ -836,12 +983,17 @@ class RideStore private constructor(private val context: Context) {
                     // SharedPreferences changes its in-memory map even when disk persistence fails.
                     // Restore these keys too, so a failed write cannot suppress the next attempt.
                     preferences.edit().apply {
-                        (rebuilt.replacement.keys + "analytics_history_backup" + "analytics_history_migration_error").forEach { key ->
+                        (replacement.keys + "analytics_history_backup" + "analytics_history_migration_error").forEach { key ->
                             val old = before[key] as? String
                             if (old == null) remove(key) else putString(key, old)
                         }
                     }.commit()
                     error("Could not persist rebuilt analytics")
+                }
+                if (restoredHistory != null) {
+                    history = restoredHistory.toMutableList()
+                    lastCompletedRide = preferences.getString(KEY_LAST_COMPLETED_RIDE, null)
+                        ?.let { summaryFromJson(JSONObject(it)) }
                 }
                 activeRangeWindows = readRangeWindowArray(KEY_ACTIVE_RANGE_WINDOWS).associateBy { it.localBoardId }.toMutableMap()
                 completedRangeWindows = readRangeWindowArray(KEY_COMPLETED_RANGE_WINDOWS)
@@ -853,16 +1005,21 @@ class RideStore private constructor(private val context: Context) {
                 batteryEstimates = BatteryEstimateRegistry(
                     rebuilt.replacement.getValue("battery_estimates_v1"),
                 )
+                rawLoadZeros = RawLoadZeroRegistry(
+                    rebuilt.replacement.getValue(KEY_RAW_LOAD_ZERO),
+                )
                 boardObservationTrackers.clear()
                 boardLearningTrackers.clear()
                 val continuity = JSONObject(rebuilt.replacement.getValue("board_continuity_v1"))
                 boardContinuity.clear()
                 continuity.keys().forEach { id -> boardContinuity[id] = BoardContinuityState.fromJson(continuity.getJSONObject(id)) }
+                ArchiveReplayResult(history.count { it.isTrack }, rebuilt.report.getInt("sessions"))
             }
         }.onFailure {
             // Keep the old data and retry on a later idle startup; never mark a failed rebuild complete.
             preferences.edit().putString("analytics_history_migration_error", it.javaClass.simpleName).apply()
         }
+        return if (restoreTrips) outcome.getOrThrow() else outcome.getOrNull()
     }
 
     private fun replaceCompletedLogReferenceLocked(source: File, archiveReference: String) {
@@ -947,6 +1104,7 @@ class RideStore private constructor(private val context: Context) {
                 batteryLearningModels.forEach { (boardId, model) -> put(boardId, model.toJson()) }
             }.toString())
             .putString(KEY_BATTERY_ESTIMATES, batteryEstimates.toJson().toString())
+            .putString(KEY_RAW_LOAD_ZERO, rawLoadZeros.toJson().toString())
             .putString("battery_charge_stats_v1", batteryChargeStats.toJson().toString())
             .putString("board_speed_bucket_stats_v1", speedBucketStats.toJson().toString())
             .putString("board_continuity_v1", JSONObject().apply {
@@ -1071,6 +1229,11 @@ class RideStore private constructor(private val context: Context) {
         var batteryModelAtMs: Long = 0L,
         var batteryConsumptionModel: RangeEstimate? = null,
     ) {
+        /** Transient alignment state; a restored ride simply re-warms over three seconds. */
+        val physics = PhysicsFrameProcessor()
+        var pressureHPa: Double? = null
+        var pressureElapsedMs: Long? = null
+
         fun toJson(): JSONObject = JSONObject()
             .put("summary", summary.toJson())
             .put("device_address", deviceAddress)
@@ -1094,6 +1257,7 @@ class RideStore private constructor(private val context: Context) {
         private const val KEY_ACTIVE = "active_ride"
         private const val KEY_BATTERY_LEARNING_MODELS = "battery_learning_models_v1"
         private const val KEY_BATTERY_ESTIMATES = "battery_estimates_v1"
+        private const val KEY_RAW_LOAD_ZERO = "raw_load_zero_v1"
         private const val KEY_LAST_COMPLETED_RIDE = "last_completed_ride"
         private const val KEY_HISTORY = "ride_history"
         private const val KEY_CALIBRATION = "calibration_points"

@@ -7,12 +7,19 @@ import java.time.Instant
 import java.util.Locale
 
 class AppStateStore(context: Context) {
+    private val contextForStorage = context.applicationContext
     private val preferences = context.getSharedPreferences("monitor_state", Context.MODE_PRIVATE)
     private val wearPublisher = WearTelemetryPublisher(context.applicationContext)
+    private val racePublisher = WearRacePublisher(context.applicationContext)
     private var lastFramePersistElapsedMs = 0L
 
     fun setAssociation(address: String, name: String?, associationId: Int?) {
         val previousAddress = preferences.getString(KEY_ADDRESS, null)
+        if (previousAddress == null || !previousAddress.equals(address, ignoreCase = true)) {
+            at.themrcodes.ridershub.storage.StorageModeStore.get(contextForStorage).selectBoard(
+                at.themrcodes.ridershub.session.pseudonymousBoardId(address),
+            )
+        }
         preferences.edit()
             .putString(KEY_ADDRESS, address)
             .putString(KEY_NAME, name ?: "Supported remote")
@@ -111,7 +118,13 @@ class AppStateStore(context: Context) {
         publishWear(force = true)
     }
 
-    fun setFrame(frameCount: Long, frame: TelemetryFrame) {
+    internal fun setFrame(
+        frameCount: Long,
+        frame: TelemetryFrame,
+        diagnostics: at.themrcodes.ridershub.session.BatteryFrameDiagnostics,
+        receivedAtEpochMs: Long,
+    ) {
+        racePublisher.publish(frame, diagnostics, receivedAtEpochMs)
         val elapsed = SystemClock.elapsedRealtime()
         if (elapsed - lastFramePersistElapsedMs < FRAME_PERSIST_INTERVAL_MS) return
         lastFramePersistElapsedMs = elapsed

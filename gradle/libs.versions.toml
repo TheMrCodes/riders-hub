@@ -1,0 +1,6 @@
+[versions]
+phoneVersion = "0.7.9"
+wearVersion = "0.7.4-wear"
+# Separate build-code ranges for phone (500xxx) and Wear (600xxx).
+phoneVersionCode = "500031"
+wearVersionCode = "600023"

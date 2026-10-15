@@ -1,6 +1,7 @@
 package at.themrcodes.ridershub.session
 
 import org.json.JSONObject
+import java.util.Locale
 
 internal data class BatteryObservationResult(
     val state: BatteryEstimateState,
@@ -67,8 +68,30 @@ internal data class BatteryFrameDiagnostics(
     val inferredGapConsumptionPercent: Double = 0.0,
     val highestReportedBatteryPercent: Int? = null,
     val highestSettledBatteryPercent: Int? = null,
+    val estimatedCapacityWh: Double? = null,
+    val capacityStatus: BatteryCapacityStatus? = null,
+    val capacityObservationCount: Int? = null,
+    val capacityQualifiedDepletionPercent: Double? = null,
+    val loadRaw: Int? = null,
+    val loadEffectiveRaw: Double? = null,
+    val loadZeroRaw: Double? = null,
+    val loadDeadbandRaw: Double? = null,
+    val loadZeroSampleCount: Int? = null,
+    val loadZeroCalibrated: Boolean? = null,
     val bucketModelSource: String? = null,
     val bucketEvidence: SpeedBucketStatistics? = null,
+    val bucketRollingPercentPerKm: Double? = null,
+    val bucketAerodynamicPercentPerKmPerKmhSquared: Double? = null,
+    val bucketUnconstrainedRollingCoefficient: Double? = null,
+    val bucketUnconstrainedAerodynamicCoefficientPerKmhSquared: Double? = null,
+    val bucketRollingCoefficientStandardError: Double? = null,
+    val bucketAerodynamicCoefficientStandardErrorPerKmhSquared: Double? = null,
+    val bucketShapeReferenceSpeedKmh: Double? = null,
+    val bucketAerodynamicShareAtReference: Double? = null,
+    val bucketShapeConditionNumber: Double? = null,
+    val bucketShapeRSquared: Double? = null,
+    val bucketShapeEvidenceKm: Double? = null,
+    val bucketShapeSupportedBuckets: Int? = null,
 ) {
     fun toJson(): JSONObject = (observation?.toJson() ?: JSONObject())
         .put("schema_version", 2)
@@ -90,7 +113,45 @@ internal data class BatteryFrameDiagnostics(
         .put("inferred_gap_consumption_percent", inferredGapConsumptionPercent.takeIf { it.isFinite() } ?: JSONObject.NULL)
         .put("highest_reported_battery_percent", highestReportedBatteryPercent ?: JSONObject.NULL)
         .put("highest_settled_battery_percent", highestSettledBatteryPercent ?: JSONObject.NULL)
+        .put("estimated_capacity_wh",
+            estimatedCapacityWh?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("capacity_status", capacityStatus?.name?.lowercase(Locale.ROOT) ?: JSONObject.NULL)
+        .put("capacity_observation_count", capacityObservationCount ?: JSONObject.NULL)
+        .put("capacity_qualified_depletion_percent",
+            capacityQualifiedDepletionPercent?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("load_raw", loadRaw ?: JSONObject.NULL)
+        .put("load_effective_raw",
+            loadEffectiveRaw?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("load_zero_raw", loadZeroRaw?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("load_deadband_raw", loadDeadbandRaw?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("load_zero_sample_count", loadZeroSampleCount ?: JSONObject.NULL)
+        .put("load_zero_calibrated", loadZeroCalibrated ?: JSONObject.NULL)
         .put("bucket_model_source", bucketModelSource ?: JSONObject.NULL)
+        .put("bucket_quadratic_rolling_percent_per_km",
+            bucketRollingPercentPerKm?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_aerodynamic_percent_per_km_per_kmh_squared",
+            bucketAerodynamicPercentPerKmPerKmhSquared?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_unconstrained_rolling",
+            bucketUnconstrainedRollingCoefficient?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_unconstrained_aerodynamic_per_kmh_squared",
+            bucketUnconstrainedAerodynamicCoefficientPerKmhSquared?.takeIf { it.isFinite() }
+                ?: JSONObject.NULL)
+        .put("bucket_quadratic_rolling_standard_error",
+            bucketRollingCoefficientStandardError?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_aerodynamic_standard_error_per_kmh_squared",
+            bucketAerodynamicCoefficientStandardErrorPerKmhSquared?.takeIf { it.isFinite() }
+                ?: JSONObject.NULL)
+        .put("bucket_quadratic_reference_speed_kmh",
+            bucketShapeReferenceSpeedKmh?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_aerodynamic_share_at_reference",
+            bucketAerodynamicShareAtReference?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_condition_number",
+            bucketShapeConditionNumber?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_r_squared",
+            bucketShapeRSquared?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_evidence_km",
+            bucketShapeEvidenceKm?.takeIf { it.isFinite() } ?: JSONObject.NULL)
+        .put("bucket_quadratic_supported_buckets", bucketShapeSupportedBuckets ?: JSONObject.NULL)
         .put("bucket_model_evidence", bucketEvidence?.let {
             JSONObject().put("speed_bucket_kmh", it.startKmh)
                 .put("confidence_km", it.confidenceKm)

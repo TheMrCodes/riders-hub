@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "supported_pairs": [
+    {
+      "phone": "0.7.9",
+      "wear": "0.7.4-wear"
+    },
+    {
+      "phone": "0.7.8",
+      "wear": "0.7.4-wear"
+    },
+    {
+      "phone": "0.7.7",
+      "wear": "0.7.3-wear"
+    },
+    {
+      "phone": "0.7.6",
+      "wear": "0.7.3-wear"
+    },
+    {
+      "phone": "0.7.5",
+      "wear": "0.7.3-wear"
+    },
+    {
+      "phone": "0.7.4",
+      "wear": "0.7.3-wear"
+    }
+  ]
+}

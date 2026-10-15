@@ -41,6 +41,7 @@ class ChargerStore(context: Context) {
         putBoolean("rpc_verified", false)
         putString("phase", if (preferences.getBoolean("paired", false)) ChargerPhase.ABSENT.name else ChargerPhase.UNPAIRED.name)
         putString("status", detail)
+        remove("error")
         remove("appearance_token")
         remove("output_on")
         remove("power_w")

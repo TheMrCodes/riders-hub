@@ -75,7 +75,7 @@ The manifest contains the companion/Bluetooth permissions plus:
 - `POST_NOTIFICATIONS`, for the user-requested low-battery warning
 - `INTERNET`, for the optional self-hosted API
 - coarse, fine, and background location, requested only for opt-in ride GPS
-- foreground-service and location foreground-service permission for continuous ride fixes
+- foreground-service and location foreground-service permission for one-shot ride fixes before realtime batches
 
 It contains no storage, boot, wake-lock, or exact-alarm permission. Backups are
 disabled and data-extraction rules exclude all app data. Cleartext networking is
@@ -98,14 +98,15 @@ disabled for API HTTP requests.
 
 Metrics snapshots run at ten-second cadence while the ride process is active;
 lifecycle events are retained in SQLite and retried with their original identity.
-The realtime socket sends `stream.opened` followed only by latest-frame telemetry
-at a maximum of one hertz. Analytics uploads complete RHA packages after a
+The realtime socket sends `stream.opened` followed by ordered telemetry frames in five-second batches
+as individual v1 messages. Analytics uploads complete RHA packages after a
 separate consent disclosure and retain destination-scoped acknowledgements.
 
 GPS is available only when advertised by realtime capability and requires
-precise plus background access. Its foreground service starts at the first valid
-ride frame, continues through reconnect grace, and writes full `location_fix`
-records into the ride-owned serialized log. See [the public contracts](api/implementer-guide.md).
+precise plus background access. Two seconds before each nonempty batch, its foreground
+service requests one fresh fix with a 1.5-second limit. Continuous GPS updates are not
+registered. A successful fix enters the ride-owned log and appears once in the batch;
+a missing fix never delays telemetry. Revocation and ride finalization cancel requests. See [the public contracts](api/implementer-guide.md).
 
 ## Build and install
 
@@ -263,6 +264,7 @@ can identify the new per-frame format without rewriting its original start recor
 | `decoder_discard` | reason and exact bytes discarded during resynchronization |
 | `telemetry_frame` | raw frame, decoded fields, unknown ranges, CRCs, validity, post-frame estimated battery and diagnostic context |
 | `location_fix` | schema version, coordinates, altitude/accuracy/motion/bearing metadata when available, provider, mock flag, fix and receipt clocks |
+| `pressure_sample` | barometric `pressure_hpa` at most once per second, only on phones with a pressure sensor; used as relative height for the grade term |
 | `gatt_reconnect_scheduled` | reason, attempt, delay |
 | `stale_gatt_callback_ignored` | late callback from a GATT client already replaced by a retry |
 | `protocol_error` / `fatal_error` | nonrecoverable connection problem |
@@ -383,10 +385,15 @@ JSONL but do not clutter ride history.
   active window instead of being discarded. A battery increase of at least ten
   points at the start of a new logical ride resets an incomplete window as an
   inferred recharge; voltage rebound during one ride does not.
-- Completed 5% windows form equations relating battery depletion to distance in
-  each speed bucket. A regularized non-negative model expresses each bucket as
-  battery percentage consumed per 100 km. This is a percentage-based empirical
-  measure, not measured Wh or battery capacity.
+- Completed 5% windows relate battery depletion to distance in each speed bucket.
+  When the physics-informed frame model is ready (see below), its rolling,
+  aerodynamic and idle shape sets the bucket cruise costs. The windows supply one
+  scale, and stop-and-go and hill braking appear as separate per-kilometre
+  overheads. Otherwise the fallback fits a non-negative rolling term plus a
+  non-negative speed-squared aerodynamic term from all cumulative supported
+  windows, then normalizes it to reproduce their accepted weighted depletion.
+  Trip completion refits both models from aggregate history. This is a
+  percentage-based empirical measure, not measured Wh or battery capacity.
 - The common riding profile is the distance-weighted 5 km/h bucket distribution
   of the newest 100 km. The remaining-range estimate weights the learned bucket
   consumption rates by that profile between rides. During an active ride, the
@@ -490,10 +497,18 @@ logical ride when `board_battery_percent` is at or below the configured warning
 threshold and the frame also contains a plausible live pack voltage. When the
 ride is finalized after the reconnect grace period, the final valid board frame
 can produce a second recharge reminder if no board warning was delivered in the
-previous two hours. The known G3 telemetry/API does not expose a separately
+previous two hours. After three confirmed recharge boundaries, this ride-end-only
+path also uses the lower 20th percentile of the board's retained charge-start
+percentages, rounded upward to a five-point step and capped at 50%. This behavioural
+threshold never changes live low-battery warnings, SOC, capacity, range, or the
+separate physical low-output threshold. The known G3 telemetry/API does not expose a separately
 identified remote-battery field, so remote battery is shown as **Not decoded**
 and no remote warning is fabricated. Raw captures should identify that field
 before such an alert is added.
+
+Per-frame battery diagnostics bootstrap the signed raw-load idle region at absolute
+values `-10..10`. Stationary, non-charging evidence then learns a durable per-board
+median zero and noise deadband; moving input is never admitted as calibration.
 
 ## Hidden child-limiter control
 
@@ -800,10 +815,93 @@ normalization.
 
 The versioned `board_speed_bucket_stats_v1` preference is saved in the same edit
 as ride, continuity, and active calibration state. Totals accumulate across rides
-and recharges and survive rolling history retention. Weighted regression cross
-products and targets preserve consumption evidence without retaining an unbounded
-list of depletion windows. Mixed windows use their measured fraction as weight;
-inferred-only or insufficiently covered windows cannot teach bucket costs.
+and recharges and survive rolling history retention. Weighted exposure, depletion,
+regression cross products, and targets preserve consumption evidence without
+retaining an unbounded list of depletion windows. Mixed windows use their measured
+fraction as weight; inferred-only or insufficiently covered windows cannot teach
+bucket costs.
+The current model fits `rolling + aerodynamic * speed^2`, with both coefficients
+constrained to be non-negative, then applies one normalization scale so the rates
+reproduce the weighted observed depletion over the same bucket exposure. Once per
+finished trip it solves the fit again from all durable sufficient statistics. The
+objective includes only buckets with at least 1 km of measured distance and accepted
+calibration support. Grey buckets remain in total energy accounting and receive
+rates extrapolated from the fitted physical curve, but cannot steer its shape.
+The evidence-weighted root-mean-square speed conditions the two-column regression;
+it is derived from the data and is not a fixed shape parameter. When the unconstrained
+fit would make either term negative, non-negative least squares chooses the best
+boundary solution. Rank-deficient evidence uses a flat raw shape whose scale is
+still learned from aggregate depletion rather than inventing curvature.
+### Physics-informed frame model
+
+Five-percent windows alone cannot separate rolling, aerodynamic, stop-and-go and
+hill costs, because those features are almost perfectly correlated across windows.
+The app therefore learns the shape from roughly 10 Hz frames and keeps only the
+overall scale from depletion windows:
+
+```text
+w = v (r + k v^2 + a + g s)                  per-mass mechanical power
+P = m max(w, 0) - eta m max(-w, 0) + P0      electrical power (raw load x voltage)
+```
+
+- Speed is centre-smoothed over three seconds. The signed load channel trails the
+  speed-derived acceleration by four frames (about 0.4 s), so each sample pairs
+  speed at frame `t` with load at `t + 4`.
+- The load channel reports drive current but not charge current: under hard braking
+  its median is exactly zero. The frame fit is therefore the hinge
+  `max(c_r v + c_a v^3 + m v a, 0) + P0` over all moving frames. Predicted braking
+  frames contribute only to the idle intercept. Durable 4 x 4 normal equations are
+  refit once per completed trip with non-negative `c_r`, `c_a` and positive `m`.
+- Only the scale-free ratios `r = c_r / m`, `k = c_a / m` and `P0 / m` leave the
+  learner, so the unverified raw-load scale cancels. Mass re-enters only through
+  the stated profile's depletion scale below.
+- Recuperation `eta` comes from pack voltage instead. Pack resistance is the
+  detrended regression of voltage on load. The open-circuit voltage is tracked from
+  `V + R I` outside braking. A braking voltage above it implies charge current;
+  `eta` is that recovered power over the model's negative mechanical power, a
+  battery-side round-trip fraction. Coasting with zero load acts as a control
+  and implies about zero current.
+- Grade comes from the phone barometer when one exists (`pressure_sample`).
+  Otherwise it comes from the smoothed drive residual
+  `((P - P0) / (m v) - r - k v^2 - a) / g`, clipped to ±20%. The residual is
+  held, then decays, while the load reads zero. Climb and descent use a 2 m
+  hysteresis.
+
+Each window accumulates per-mass motion work. Integrating the hinge gives
+
+```text
+work / m = cruise(r, k, P0/m; bucket distances) + delta kinetic + g delta height
+         + (1 - eta) braked work
+```
+
+Braked work is split between deceleration (stop-and-go) and descent (hills).
+
+The depletion scale starts from the General rider and board profile instead of
+being learned from scratch:
+
+```text
+percent per J/kg = 100 m / (0.85 x 3600 x Wh) x f
+f = (D + 10) / (stated prediction + 10)
+```
+
+`m` is rider plus board mass and `Wh` the stated pack energy. Both default to an
+average adult rider and the published figures of the selected board model (a
+stock G3 unless changed). The single learned pack-energy factor `f` absorbs pack
+ageing, drivetrain efficiency and how the remote maps energy to percent. It
+compares the accepted weighted depletion `D` of motion-carrying windows with what
+the stated pack predicts for the same work, and the stated pack counts as 10% of
+depletion so a few noisy windows cannot swing it. `f` is clamped to 1/3 to 3. The
+Riders Profile reports `Wh / f` as usable pack energy. Rider weight stays in local
+settings; app backup is disabled and it never enters logs, archives or the API.
+
+The cruise costs per bucket follow the fitted curve. Stop-and-go and hill
+overheads per kilometre are added to every rate that range, gap and capacity
+estimates consume. The Riders Profile shows cruise cost per bucket together with
+the overheads, recuperation, usable pack energy and climb per kilometre. Once the
+frame model has three thousand drive samples and a fitted trip, rates come from
+the stated profile even before any depletion window closes; before that the
+window fit above remains in use.
+
 Range forecasts, gap state transitions, and capacity normalization consume only
 supported rates from this shared per-board model
 and measured-distance distribution. The active trip can change the range forecast's
@@ -841,7 +939,10 @@ capacity evidence. Odometer-derived cycle age continues to use observed cycle
 consumption rather than a normalized speed-bucket range.
 
 Per-frame `battery_estimation` diagnostics include `bucket_model_source`
-(`cumulative`, `retained_windows`, or `unavailable`) and `bucket_model_evidence`.
+(`cumulative`, `retained_windows`, or `unavailable`), `bucket_model_evidence`, the
+applied and unconstrained rolling/aerodynamic coefficients, their standard errors,
+the conditioning reference speed, condition number, R-squared, supported evidence
+kilometres, and supported-bucket count.
 The latter preserves the selected bucket's measured confidence kilometres,
 inferred kilometres, calibration support, window count, and limit flag from the
 model used for that frame. The existing base/applied rates retain the actual
@@ -890,6 +991,16 @@ to the charge are not observable. Rebuilt charge cycles, depletion windows,
 cumulative bucket statistics, continuity, reported maxima, adaptive-learning
 parameters and the final continuous battery estimate are replaced together.
 Saved trip totals remain presentation history and are not rewritten.
+
+At the bottom of device Settings, **Replay local archive** explicitly restores
+missing trip history and rebuilds Riders Profile from the phone's current archive,
+even when its analytics version is already current. Replay runs in the background
+and shows its result in Settings. Finish any active recording first. Verified
+session-end totals supply the recovered trips; existing trips retain their totals
+and receive refreshed archive references, so repeating recovery does not duplicate
+them. A private state backup precedes an atomic update of history and analytics.
+Invalid or incomplete archives, a new recording, or changes to app data or the
+rider/board profile during replay prevent replacement and leave prior UI data intact.
 
 `analytics_replay_manifest_v1` binds each installed projection to its model
 version and a SHA-256 fingerprint of the exact verified JSONL records, plus source
@@ -945,6 +1056,23 @@ in-app chip and notification, but neither path turns on the relay. Both open the
 same confirmation dialog. A confirmed start uses `Switch.Set` for switch `0`
 with `toggle_after=43200`; the app then verifies the reported output state.
 
+A dedicated `connectedDevice` foreground service owns monitoring and shows an
+ongoing **Riders Hub charger monitoring** notification. BLE RPC, polling and
+archive writes run on a worker thread. Companion-service unbinding or a delayed
+presence callback does not end monitoring. A stalled connection is closed and
+recreated after a 30-second watchdog; failures back off from 2 to 60 seconds.
+If the last verified relay state was OFF and no OFF confirmation is pending,
+a disconnect or RPC failure ends monitoring immediately. Otherwise recovery is
+limited to two minutes after the first failure. Expiry closes the link, finalizes
+the episode, and removes the foreground notification, without claiming the relay
+is off. A paused monitor waits for fresh charger presence; a companion-service
+rebind cannot restart it. Successful status readback resets the recovery budget.
+Every reconnect verifies the model and reads relay state before accepting commands.
+An uncertain ON command is never replayed. A pending OFF is retried only after
+readback confirms that output remains on. **Stop monitoring** closes the BLE link
+and finalizes the local episode; it does not change plug output. Unpairing or
+revoking Bluetooth permission also stops monitoring.
+
 Observed power at or above 10 W must remain fresh for 30 seconds before charging
 is considered active. An output that does not develop active load within five
 minutes is turned off. After active charging, completion requires 20 continuous
@@ -962,3 +1090,46 @@ COA is not mixed into ride RHA files. A server can opt into uploads with
 `coa_format_versions: [1]` and receives files at
 `PUT /v1/analytics/charger-files/{source_id}/{file_id}` under the same explicit
 raw-analytics consent, with independent durable acknowledgement state.
+
+### Local ZIP export
+
+At the end of Settings, **Export local archive** opens Android's save dialog for
+`ridershub-archive.zip`. It copies every local `.rha` and `.rhp` partition into
+`archive/` inside the ZIP, preserving the original bytes. The snapshot is taken
+under the archive writer lock, then compressed in the background. It includes
+finalized archived recordings at that point; an ongoing recording is included
+after it finishes and enters the archive. No API connection is required.
+Temporary snapshot files are removed after success or failure. This exports
+recordings, not account credentials or app preferences.
+
+### Charger detection notification
+
+When the paired companion charger appears and its Shelly identity and relay
+status are verified, Riders Hub posts **Board charger detected** if notification
+permission is granted. **Start charging** directly confirms the current charger
+appearance and starts charging; a locked phone requires authentication. The
+notification body still opens the app for review. Old appearance actions are
+rejected, and the prompt is removed when charging starts or the charger leaves.
+The existing 12-hour relay fail-safe, no-load timeout, completion detection and
+protection handling still apply.
+
+## Phone accelerometer and gyroscope
+
+In Self-hosted API settings, enable **Record and share phone motion** after the
+server advertises the separate motion capability. During an active ride, a
+foreground service requests both phone sensors at 50 Hz and enforces a minimum
+20 ms between recorded samples of each sensor, even if hardware callbacks arrive
+faster. Retained samples keep their original timestamps and use five-second batches. It uses an independent private journal
+and `POST /v1/motion/batches`; no motion samples are inserted into GPS, RHA,
+charger COA, or the realtime WebSocket channel.
+
+The ongoing notification offers **Stop motion recording**. The switch controls
+both recording and sharing for this API server. Offline batches are retained
+and retried only while the remote is connected or within five seconds of disconnect.
+After that grace GPS, accelerometer, gyroscope, and motion uploads pause. The realtime
+API socket stays open without tracking until the trip is finalized (normally after
+its two-minute reconnect grace), so reconnecting can resume the same stream.
+Optional barometer collection stops with the BLE segment. The final partial motion batch is saved locally for a later
+connected window; callbacks from the old connection are rejected. See the
+[API implementer guide](api/implementer-guide.md#phone-motion-recording) for
+coordinate conventions, units, consent, storage limits, and recovery behavior.

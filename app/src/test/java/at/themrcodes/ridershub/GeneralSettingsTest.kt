@@ -49,4 +49,11 @@ class GeneralSettingsTest {
         )
         assertFalse(shouldNotifyLowBatteryRideEndReminder(now + 1, now))
     }
+
+    @Test
+    fun learnedChargingBehaviourOnlyRaisesTheRideEndThreshold() {
+        assertEquals(15, rideEndChargingReminderThreshold(15, null))
+        assertEquals(15, rideEndChargingReminderThreshold(15, 10))
+        assertEquals(25, rideEndChargingReminderThreshold(15, 25))
+    }
 }

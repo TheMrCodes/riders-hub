@@ -23,6 +23,8 @@ signing.properties
 # Local telemetry and captures may contain device identifiers
 captures/
 riders-hub-telemetry/
+# Local scratch space for calculations, screenshots and temporary probes
+/tmp/
 /research-log.md
 
 # Android/Gradle build state
@@ -35,3 +37,11 @@ local.properties
 
 # Local Python tooling
 __pycache__/
+
+# Private Firebase distribution configuration, credentials and outputs
+/firebase-distribution/
+# Keep Firebase app registration files private
+**/google-services.json
+
+# Private local distribution recipes
+/justfile

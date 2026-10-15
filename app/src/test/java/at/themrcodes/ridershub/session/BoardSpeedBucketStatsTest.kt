@@ -59,12 +59,17 @@ class BoardSpeedBucketStatsTest {
         r.recordWindow("board-a", windows[0])
         val restored = BoardSpeedBucketStatsRegistry(r.toJson().toString())
         restored.recordWindow("board-a", windows[1])
+        restored.completeTrip("board-a", "completed-trip")
         val actual = restored.snapshot("board-a")!!
         val batch = RangeEstimator.estimate(55, null, windows, emptyList(), emptyList())
         actual.buckets.forEach {
             assertEquals(batch.bucketBatteryPercentPer100Km.getValue(it.startKmh), it.batteryPercentPer100Km!!, 1e-8)
             assertEquals(10000 / it.batteryPercentPer100Km, it.fullBatteryRangeKm!!, 1e-8)
         }
+        val rates = actual.buckets.associate { it.startKmh to requireNotNull(it.batteryPercentPer100Km) / 100.0 }
+        // First window has full weight. The second is 75% measured and therefore contributes
+        // 0.75 km of weighted exposure to each bucket and 3.75 percentage points of depletion.
+        assertEquals(8.75, 2.75 * rates.getValue(20) + 1.25 * rates.getValue(30), 1e-8)
         assertEquals(100.0, actual.buckets.sumOf { it.consumptionSharePercent!! }, 1e-8)
         assertEquals(2.5, actual.buckets.first().calibrationMeasuredKm, 0.0)
         assertEquals(0.5, actual.buckets.first().calibrationInferredKm, 0.0)
@@ -101,6 +106,133 @@ class BoardSpeedBucketStatsTest {
         assertTrue(s.consumptionRates().isEmpty())
         // Persistent size depends on buckets, not on the number of retained raw windows.
         assertTrue(r.toJson().toString().length < 2000)
+    }
+
+    @Test fun normalizationConservesObservedDepletionAndRetainsNearLimitWarning() {
+        val fit = SpeedBucketConsumptionFit.normalize(
+            rawRates = mapOf(20 to 0.7, 30 to 4.0),
+            exposureKm = mapOf(20 to 5.0, 30 to 5.0),
+            observedDepletionPercent = 30.0,
+        )
+
+        assertEquals(30.0, fit.rates.entries.sumOf { (bucket, rate) ->
+            rate * if (bucket == 20) 5.0 else 5.0
+        }, 1e-8)
+        assertTrue(20 in fit.limitBuckets)
+        assertFalse(30 in fit.limitBuckets)
+    }
+
+    @Test fun quadraticShapeIsSmoothMonotonicAndConservesObservedDepletion() {
+        val exposure = (0..40 step 5).associateWith { 2.0 }
+        val fit = SpeedBucketConsumptionFit.quadratic(
+            exposure,
+            observedDepletionPercent = 90.0,
+            rollingCoefficient = 1.0,
+            aerodynamicCoefficientPerKmhSquared = 0.01,
+        )
+
+        assertEquals(90.0, fit.rates.entries.sumOf { (bucket, rate) ->
+            rate * exposure.getValue(bucket)
+        }, 1e-8)
+        fit.rates.toSortedMap().values.zipWithNext().forEach { (slower, faster) ->
+            assertTrue(faster > slower)
+        }
+        val firstDifferences = fit.rates.toSortedMap().values.zipWithNext { slower, faster ->
+            faster - slower
+        }
+        firstDifferences.zipWithNext().forEach { (earlier, later) -> assertTrue(later > earlier) }
+        assertTrue(fit.limitBuckets.isEmpty())
+    }
+
+    @Test fun completedTripRefitsQuadraticFromAggregateHistoryAndSurvivesRestart() {
+        val r = BoardSpeedBucketStatsRegistry()
+        val buckets = listOf(10, 20, 30)
+        r.recordDistance("board-a", buckets.associateWith { 10.0 })
+        var expectedEvidenceKm = 0.0
+        repeat(4) { repetition ->
+            buckets.forEach { bucket ->
+                val speed = bucket + 2.5
+                val rate = 1.0 + 0.01 * speed * speed
+                val distance = 5.0 / rate
+                expectedEvidenceKm += distance
+                r.recordWindow("board-a", window("$repetition-$bucket", mapOf(bucket to distance)))
+            }
+        }
+
+        assertEquals(0.0, r.snapshot("board-a")!!.aerodynamicPercentPerKmPerKmhSquared!!, 0.0)
+        r.completeTrip("board-a", "trip-a")
+        val fitted = r.snapshot("board-a")!!
+        assertTrue(fitted.rollingPercentPerKm!! > 0.0)
+        assertTrue(fitted.aerodynamicPercentPerKmPerKmhSquared!! > 0.0)
+        assertTrue(fitted.unconstrainedAerodynamicCoefficientPerKmhSquared!! > 0.0)
+        assertEquals(3, fitted.shapeSupportedBucketCount)
+        assertEquals(expectedEvidenceKm, fitted.shapeEvidenceKm, 1e-8)
+        assertEquals(1L, fitted.shapeRefits)
+        r.completeTrip("board-a", "trip-a")
+        assertEquals(1L, r.snapshot("board-a")!!.shapeRefits)
+        assertEquals(fitted, BoardSpeedBucketStatsRegistry(r.toJson().toString()).snapshot("board-a"))
+    }
+
+    @Test fun greyBucketCannotSteerAggregateQuadraticFit() {
+        val supported = setOf(10, 20, 30)
+        val exposure = mutableMapOf<Int, Double>()
+        val target = mutableMapOf<Int, Double>()
+        val cross = mutableMapOf<Int, MutableMap<Int, Double>>()
+        repeat(4) {
+            supported.forEach { bucket ->
+                val speed = bucket + 2.5
+                val rate = 1.0 + 0.01 * speed * speed
+                val distance = 5.0 / rate
+                exposure[bucket] = (exposure[bucket] ?: 0.0) + distance
+                target[bucket] = (target[bucket] ?: 0.0) + distance * 5.0
+                cross.getOrPut(bucket) { mutableMapOf() }[bucket] =
+                    (cross[bucket]?.get(bucket) ?: 0.0) + distance * distance
+            }
+        }
+        val baseline = SpeedBucketQuadraticFit.fit(
+            exposure, target, cross, supported,
+            weightedDepletion = 60.0,
+            weightedSquaredDepletion = 300.0,
+            windowWeight = 12.0,
+            acceptedWindows = 12,
+        )
+        exposure[40] = 0.5
+        target[40] = 5_000.0
+        cross[40] = mutableMapOf(40 to 0.25)
+        val withGreyOutlier = SpeedBucketQuadraticFit.fit(
+            exposure, target, cross, supported,
+            weightedDepletion = 10_060.0,
+            weightedSquaredDepletion = 100_000_300.0,
+            windowWeight = 13.0,
+            acceptedWindows = 13,
+        )
+
+        assertEquals(baseline.rollingCoefficient, withGreyOutlier.rollingCoefficient, 0.0)
+        assertEquals(baseline.aerodynamicCoefficientPerKmhSquared,
+            withGreyOutlier.aerodynamicCoefficientPerKmhSquared, 0.0)
+        assertEquals(baseline.conditionNumber, withGreyOutlier.conditionNumber)
+        assertEquals(3, withGreyOutlier.supportedBucketCount)
+    }
+
+    @Test fun decreasingNoisyTrendCannotCreateNegativeAerodynamicConsumption() {
+        val r = BoardSpeedBucketStatsRegistry()
+        val rates = mapOf(10 to 8.0, 20 to 5.0, 30 to 2.0)
+        r.recordDistance("board-a", rates.keys.associateWith { 10.0 })
+        repeat(4) { repetition ->
+            rates.forEach { (bucket, rate) ->
+                r.recordWindow(
+                    "board-a",
+                    window("decreasing-$repetition-$bucket", mapOf(bucket to 5.0 / rate)),
+                )
+            }
+        }
+
+        r.completeTrip("board-a", "trip-a")
+        val fitted = r.snapshot("board-a")!!
+        assertTrue(fitted.unconstrainedAerodynamicCoefficientPerKmhSquared!! < 0.0)
+        assertEquals(0.0, fitted.aerodynamicPercentPerKmPerKmhSquared!!, 0.0)
+        val fittedRates = fitted.buckets.mapNotNull { it.batteryPercentPer100Km }.toSet()
+        assertEquals(1, fittedRates.size)
     }
 
     @Test fun badEntriesCannotPoisonAnotherBoardOrDistanceTotals() {

@@ -49,6 +49,25 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/CapabilitiesResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/motion/batches:
+    post:
+      operationId: postMotionBatch
+      description: Independently consented phone motion recordings, normally sent every five seconds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MotionBatch' }
+      responses:
+        '204': { description: Durably stored or byte-identical retry. }
+        '400': { description: Invalid motion recording. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenSource' }
+        '409': { description: Batch identity or stream sequence conflicts with retained content. }
+        '429': { description: Upload capacity busy. Retry the same batch after Retry-After seconds. }
+        '413': { description: Exceeds motion max_upload_bytes. }
+        '415': { description: Content-Type must be application/json. }
+        '503': { description: Storage unavailable; retry the identical batch. }
   /v1/metrics:
     post:
       operationId: postMetric
@@ -62,6 +81,22 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/ForbiddenSource' }
   /v1/analytics/partitions/{source_id}/{partition_sequence}:
+    head:
+      operationId: findFinalAnalyticsPartition
+      description: Check whether this exact finalized logical partition is already durable under any installation of the same OIDC account. No archive body is sent and no new copy is created.
+      parameters:
+        - { name: source_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: partition_sequence, in: path, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: Riders-Hub-Partition-Entries, in: header, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: Riders-Hub-Partition-Final, in: header, required: true, schema: { type: boolean } }
+        - { name: Riders-Hub-Uncompressed-Digest, in: header, required: true, schema: { type: string, pattern: '^sha-256=:[A-Za-z0-9+/]+={0,2}:$' } }
+      responses:
+        '204': { description: Exact finalized archive already stored for this account; acknowledge locally without PUT. }
+        '404': { description: No finalized match; upload normally. }
+        '400': { description: Invalid lookup headers or identity. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenSource' }
+        '503': { description: Lookup unavailable; retry later without uploading. }
     put:
       operationId: putAnalyticsPartition
       parameters:
@@ -79,6 +114,7 @@ paths:
       responses:
         '2XX': { description: Accepted or identical successful no-op. }
         '409': { description: 'Older generation, divergent prefix, or changed final content. Existing data is preserved.' }
+        '429': { description: Upload capacity busy. Retry the same upload after Retry-After seconds. }
         '413': { description: Exceeds advertised max_upload_bytes. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/ForbiddenSource' }
@@ -98,6 +134,7 @@ paths:
       responses:
         '2XX': { description: Accepted or an identical successful no-op. }
         '409': { description: A file with this identity was already stored with different bytes. Existing data is preserved. }
+        '429': { description: Upload capacity busy. Retry the same upload after Retry-After seconds. }
         '413': { description: Exceeds advertised max_upload_bytes. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/ForbiddenSource' }
@@ -163,6 +200,7 @@ components:
             - required: [metrics]
             - required: [realtime]
             - required: [analytics]
+            - required: [motion]
           properties:
             metrics:
               type: object
@@ -174,6 +212,13 @@ components:
               properties:
                 schema_version: { const: 1 }
                 gps: { type: boolean }
+            motion:
+              type: object
+              required: [schema_version, max_batch_samples, max_upload_bytes]
+              properties:
+                schema_version: { const: 1 }
+                max_batch_samples: { type: integer, minimum: 4096 }
+                max_upload_bytes: { type: integer, minimum: 1 }
             analytics:
               type: object
               required: [schema_version, rha_format_versions, max_upload_bytes]
@@ -188,6 +233,43 @@ components:
                   description: Optional supported Charger Observation Archive formats.
                   items: { type: integer, minimum: 1 }
                 max_upload_bytes: { type: integer, minimum: 1 }
+    MotionBatch:
+      type: object
+      required: [schema_version, batch_id, source_id, board_id, ride_id, stream_id, sequence, started_at, device, coordinate_system, accelerometer_unit, gyroscope_unit, sample_period_us, sensors, samples]
+      properties:
+        schema_version: { const: 1 }
+        batch_id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid }
+        board_id: { type: string, format: uuid }
+        ride_id: { type: string, format: uuid }
+        stream_id: { type: string, format: uuid }
+        sequence: { type: integer, minimum: 1 }
+        started_at: { type: string, format: date-time, description: Wall-clock anchor for this sensor stream. }
+        device: { const: phone }
+        coordinate_system: { const: android_device }
+        accelerometer_unit: { const: m/s2, description: Acceleration including gravity. }
+        gyroscope_unit: { const: rad/s }
+        sample_period_us: { const: 20000, description: Requested period; actual sample timing is in elapsed_ns. }
+        sensors:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items: { enum: [accelerometer, gyroscope] }
+        samples:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items:
+            type: object
+            required: [sensor, elapsed_ns, x, y, z, accuracy]
+            properties:
+              sensor: { enum: [accelerometer, gyroscope] }
+              elapsed_ns: { type: integer, minimum: 0, description: Nanoseconds since started_at using the Android monotonic sensor clock; strictly increasing per sensor. }
+              x: { type: number }
+              y: { type: number }
+              z: { type: number }
+              accuracy: { type: integer, minimum: -1, maximum: 3, description: Android sensor accuracy status. }
     MetricEnvelope:
       type: object
       required: [schema_version, message_id, sequence, source_id, app_version, kind, occurred_at, sent_at, board_id, data]

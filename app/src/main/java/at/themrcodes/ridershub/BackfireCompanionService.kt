@@ -11,9 +11,8 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
-import at.themrcodes.ridershub.charger.ChargerControl
 import at.themrcodes.ridershub.charger.ChargerStore
-import at.themrcodes.ridershub.charger.ShellyChargerSession
+import at.themrcodes.ridershub.charger.ChargerMonitorService
 
 abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
     private lateinit var state: AppStateStore
@@ -25,10 +24,6 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
     private var blePresent = false
     private var bluetoothConnected = false
     private var gattActive = false
-    private var chargerSession: ShellyChargerSession? = null
-    private var chargerAddress: String? = null
-    private var chargerPresent = false
-    private var chargerGattActive = false
     private val limiterCommandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action != LimiterControl.ACTION_SET_CHILD_LIMITER ||
@@ -42,31 +37,10 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
             }
         }
     }
-    private val chargerCommandReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action !in setOf(ChargerControl.ACTION_START, ChargerControl.ACTION_STOP) ||
-                !intent.getBooleanExtra(ChargerControl.EXTRA_CONFIRMED, false)
-            ) return
-            val token = intent.getStringExtra(ChargerControl.EXTRA_APPEARANCE_TOKEN).orEmpty()
-            val start = intent.action == ChargerControl.ACTION_START
-            val result = chargerSession?.userDecision(start, token)
-                ?: Result.failure(IllegalStateException("Charger RPC is not connected"))
-            result.onFailure { error ->
-                chargerState.update(
-                    at.themrcodes.ridershub.charger.ChargerPhase.ERROR,
-                    error.message ?: "Charger command failed",
-                    error = error.message ?: "Charger command failed",
-                )
-            }
-        }
-    }
     private val stopIfAbsent = Runnable {
         if (!blePresent && !bluetoothConnected && !gattActive) {
             stopSession("all_companion_transports_absent")
         }
-    }
-    private val stopChargerIfAbsent = Runnable {
-        if (!chargerPresent && !chargerGattActive) stopChargerSession("charger_absent")
     }
 
     override fun onCreate() {
@@ -80,26 +54,15 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
             IntentFilter(LimiterControl.ACTION_SET_CHILD_LIMITER),
             RECEIVER_NOT_EXPORTED,
         )
-        registerReceiver(
-            chargerCommandReceiver,
-            IntentFilter().apply {
-                addAction(ChargerControl.ACTION_START)
-                addAction(ChargerControl.ACTION_STOP)
-            },
-            RECEIVER_NOT_EXPORTED,
-        )
         resumeFromSystemBinding()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(stopIfAbsent)
-        handler.removeCallbacks(stopChargerIfAbsent)
-        stopChargerSession("companion_service_destroyed")
         stopSession("companion_service_destroyed")
         state.setPresence(false, "Companion monitor stopped; waiting for Android to restart it")
         state.setServiceActive(false)
         unregisterReceiver(limiterCommandReceiver)
-        unregisterReceiver(chargerCommandReceiver)
         super.onDestroy()
     }
 
@@ -148,9 +111,7 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
 
     protected fun handleBleDisappeared(association: BackfireAssociation, source: String) {
         if (roleFor(association) == CompanionRole.CHARGER_PLUG) {
-            chargerPresent = false
-            handler.removeCallbacks(stopChargerIfAbsent)
-            if (!chargerGattActive) handler.postDelayed(stopChargerIfAbsent, TRANSPORT_SETTLE_MS)
+            // Foreground charger monitoring owns reconnects independently of presence.
             return
         }
         if (roleFor(association) != CompanionRole.BOARD_REMOTE) return
@@ -175,8 +136,7 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
 
     protected fun handleBluetoothDisconnected(association: BackfireAssociation, source: String) {
         if (roleFor(association) == CompanionRole.CHARGER_PLUG) {
-            chargerPresent = false
-            if (!chargerGattActive) handler.postDelayed(stopChargerIfAbsent, TRANSPORT_SETTLE_MS)
+            // Foreground charger monitoring owns reconnects independently of presence.
             return
         }
         if (roleFor(association) != CompanionRole.BOARD_REMOTE) return
@@ -281,36 +241,8 @@ abstract class BackfireCompanionServiceBase : CompanionDeviceService() {
         fresh: Boolean,
         presenceObserved: Boolean = true,
     ) {
-        handler.removeCallbacks(stopChargerIfAbsent)
-        if (presenceObserved) chargerPresent = true
         chargerState.setAssociation(association.associationId, association.displayName)
-        if (chargerAddress == association.address && chargerSession != null) return
-        stopChargerSession("different_charger_appeared")
-        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            chargerState.update(at.themrcodes.ridershub.charger.ChargerPhase.ERROR, "Bluetooth permission was revoked", error = "Bluetooth permission was revoked")
-            return
-        }
-        chargerState.beginAppearance(presenceObserved)
-        chargerAddress = association.address
-        chargerSession = runCatching {
-            ShellyChargerSession(this, association.address, chargerState, fresh) { active ->
-                handler.post {
-                    chargerGattActive = active
-                    if (!active && !chargerPresent) handler.postDelayed(stopChargerIfAbsent, TRANSPORT_SETTLE_MS)
-                }
-            }.also { it.start() }
-        }.getOrElse { error ->
-            chargerState.update(at.themrcodes.ridershub.charger.ChargerPhase.ERROR, "Could not connect to charger", error = error.message ?: "Charger connection failed")
-            chargerAddress = null
-            null
-        }
-    }
-
-    private fun stopChargerSession(reason: String) {
-        chargerSession?.stop(reason)
-        chargerSession = null
-        chargerAddress = null
-        chargerGattActive = false
+        ChargerMonitorService.start(this, association.associationId, fresh && presenceObserved)
     }
 
     private fun handleTransportLost(address: String, source: String) {

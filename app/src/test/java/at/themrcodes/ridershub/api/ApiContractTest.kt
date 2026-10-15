@@ -22,6 +22,98 @@ import java.util.concurrent.TimeUnit
 import java.io.File
 
 class ApiContractTest {
+    @Test fun realtimeCarriesRawFrameBytes() {
+        val sample = RealtimeSample("source", "board", "ride", "stream", "segment", 1, 1,
+            "2030-01-01T00:00:00.123456789Z", 0, 5.0, null, "ac0019")
+        val json = sample.toJson(0)
+        assertEquals("ac0019", json.getString("raw_hex"))
+        assertEquals("2030-01-01T00:00:00.123456789Z", json.getString("frame_at"))
+    }
+
+    @Test
+    fun finalizedArchiveLookupSkipsBytesAcrossInstallations() = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(204))
+            val missing = File("synthetic-archive-not-read.rha")
+            val result = ApiClient().uploadArchiveDurable(
+                ApiConnection(server.url("/").toString(), "synthetic", "destination"),
+                "20000000-0000-4000-8000-000000000002", 1, missing, 2, true, "compressed", "logical",
+            )
+            assertEquals(204, result)
+            assertEquals(1, server.requestCount)
+            val request = server.takeRequest()
+            assertEquals("HEAD", request.method)
+            assertEquals(0L, request.bodySize)
+            assertEquals("sha-256=:logical:", request.getHeader("Riders-Hub-Uncompressed-Digest"))
+        }
+    }
+
+    @Test
+    fun archiveLookupMissOrOldServerFallsBackToUpload() = runBlocking {
+        for (status in listOf(404, 405)) MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(status))
+            server.enqueue(MockResponse().setResponseCode(204))
+            val file = File.createTempFile("synthetic-archive", ".rha")
+            try {
+                file.writeText("synthetic archive")
+                assertEquals(204, ApiClient().uploadArchiveDurable(
+                    ApiConnection(server.url("/").toString(), "synthetic", "destination"),
+                    "20000000-0000-4000-8000-000000000002", 1, file, 2, true, "compressed", "logical",
+                ))
+                assertEquals("HEAD", server.takeRequest().method)
+                val upload = server.takeRequest()
+                assertEquals("PUT", upload.method)
+                assertEquals("synthetic archive", upload.body.readUtf8())
+            } finally { file.delete() }
+        }
+    }
+
+    @Test
+    fun archiveLookupFailureDoesNotSendArchive() = runBlocking {
+        for (status in listOf(401, 403, 429, 503)) MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(status))
+            try {
+                ApiClient().uploadArchiveDurable(
+                    ApiConnection(server.url("/").toString(), "synthetic", "destination"),
+                    "20000000-0000-4000-8000-000000000002", 1, File("synthetic-unread.rha"), 2, true, "compressed", "logical",
+                )
+                throw AssertionError("Expected lookup failure")
+            } catch (e: ApiHttpException) { assertEquals(status, e.statusCode) }
+            assertEquals(1, server.requestCount)
+        }
+    }
+
+    @Test fun stoppingMotionDoesNotCancelAnUnrelatedMetricUpload() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(204).setHeadersDelay(300, TimeUnit.MILLISECONDS))
+            val client = ApiClient.withClientForTest(OkHttpClient.Builder().build())
+            val connection = ApiConnection(server.url("/").toString(), "synthetic", "destination")
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                val pending = executor.submit<Int> { client.postMetric(connection, "{}") }
+                assertEquals("/v1/metrics", server.takeRequest(5, TimeUnit.SECONDS)?.path)
+                ApiClient.cancelMotionTransports()
+                assertEquals(204, pending.get(5, TimeUnit.SECONDS).toInt())
+            } finally { executor.shutdownNow() }
+        }
+    }
+    @Test fun remoteDisconnectCancelsAnInFlightMotionUpload() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val client = ApiClient.withClientForTest(OkHttpClient.Builder().build())
+            val connection = ApiConnection(server.url("/").toString(), "synthetic", "destination")
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                val pending = executor.submit<Boolean> {
+                    runCatching { client.postMotion(connection, "{}") }.isFailure
+                }
+                assertEquals("/v1/motion/batches", server.takeRequest(5, TimeUnit.SECONDS)?.path)
+                ApiClient.cancelMotionTransports()
+                assertTrue(pending.get(5, TimeUnit.SECONDS))
+            } finally { executor.shutdownNow() }
+        }
+    }
+
     @Test
     fun oidcEnrollmentUsesHttpsBasePathAccessTokenAndSourceIdentity() {
         val heldCertificate = HeldCertificate.Builder()
@@ -110,6 +202,34 @@ class ApiContractTest {
             }
             assertEquals(307, error.statusCode)
             assertEquals(1, server.requestCount)
+        }
+    }
+
+    @Test
+    fun deviceRegistrationExposesOnlyKnownSafeServerErrors() {
+        val certificate = HeldCertificate.Builder().addSubjectAlternativeName("localhost").build()
+        val serverCertificates = HandshakeCertificates.Builder().heldCertificate(certificate).build()
+        val clientCertificates = HandshakeCertificates.Builder().addTrustedCertificate(certificate.certificate).build()
+        MockWebServer().use { server ->
+            server.useHttps(serverCertificates.sslSocketFactory(), false)
+            server.enqueue(MockResponse().setResponseCode(503)
+                .setBody("""{"error":"OIDC provider is unavailable"}"""))
+            server.enqueue(MockResponse().setResponseCode(503)
+                .setBody("""{"error":"private account detail"}"""))
+            val client = ApiClient.withClientForTest(OkHttpClient.Builder()
+                .sslSocketFactory(clientCertificates.sslSocketFactory(), clientCertificates.trustManager)
+                .followRedirects(false).followSslRedirects(false).build())
+            val baseUrl = server.url("/").toString()
+            val sourceId = "20000000-0000-4000-8000-000000000002"
+            val first = assertThrows(ApiHttpException::class.java) {
+                client.registerDevice(baseUrl, "synthetic-access-token", sourceId)
+            }
+            assertEquals(503, first.statusCode)
+            assertEquals("OIDC provider is unavailable", first.publicError)
+            val second = assertThrows(ApiHttpException::class.java) {
+                client.registerDevice(baseUrl, "synthetic-access-token", sourceId)
+            }
+            assertNull(second.publicError)
         }
     }
 

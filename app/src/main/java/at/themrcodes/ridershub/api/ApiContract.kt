@@ -30,6 +30,8 @@ data class DeviceRegistration(
 
 data class MetricsCapability(val schemaVersion: Int)
 data class RealtimeCapability(val schemaVersion: Int, val gps: Boolean)
+data class MotionCapability(val schemaVersion: Int, val maxBatchSamples: Int, val maxUploadBytes: Long)
+
 data class AnalyticsCapability(
     val schemaVersion: Int,
     val rhaFormatVersions: Set<Int>,
@@ -43,11 +45,12 @@ data class ApiCapabilities(
     val metrics: MetricsCapability?,
     val realtime: RealtimeCapability?,
     val analytics: AnalyticsCapability?,
+    val motion: MotionCapability? = null,
 ) {
     init {
         require(contractVersion == API_CONTRACT_VERSION) { "Unsupported contract version $contractVersion" }
         require(serverId.isNotBlank()) { "server_id must not be blank" }
-        require(metrics != null || realtime != null || analytics != null) {
+        require(metrics != null || realtime != null || analytics != null || motion != null) {
             "Server advertised no usable capabilities"
         }
     }
@@ -66,6 +69,8 @@ data class ApiUrls(
         .addPathSegment(sourceId)
         .addPathSegment(partitionSequence.toString())
         .build()
+
+    fun motionBatches(): HttpUrl = base.newBuilder().addPathSegments("v1/motion/batches").build()
 
     fun chargerFile(sourceId: String, fileId: String): HttpUrl = base.newBuilder()
         .addPathSegments("v1/analytics/charger-files")
@@ -173,7 +178,14 @@ fun parseCapabilities(json: JSONObject): ApiCapabilities {
             }
             ?.let { AnalyticsCapability(it, requireNotNull(versions), coaVersions, requireNotNull(maxBytes)) }
     }
-    return ApiCapabilities(version, serverId, metrics, realtime, analytics)
+    val motion = advertised.optJSONObject("motion")?.let { value ->
+        val samples = value.strictInt("max_batch_samples")
+        val bytes = value.strictLong("max_upload_bytes")
+        value.strictInt("schema_version").takeIf {
+            it == 1 && samples != null && samples >= MotionBatch.MAX_SAMPLES && bytes != null && bytes >= 1024 * 1024
+        }?.let { MotionCapability(it, requireNotNull(samples), requireNotNull(bytes)) }
+    }
+    return ApiCapabilities(version, serverId, metrics, realtime, analytics, motion)
 }
 
 enum class MetricsKind(val wireValue: String) {
@@ -263,6 +275,7 @@ data class RealtimeSample(
     val segmentElapsedMs: Long,
     val speedKmh: Double,
     val location: RealtimeLocation?,
+    val rawHex: String? = null,
 ) {
     fun toJson(nowElapsedNanos: Long): JSONObject = JSONObject()
         .put("schema_version", REALTIME_SCHEMA_VERSION)
@@ -277,6 +290,7 @@ data class RealtimeSample(
         .put("frame_at", frameAt)
         .put("segment_elapsed_ms", segmentElapsedMs)
         .putFinite("speed_kmh", speedKmh)
+        .putOptional("raw_hex", rawHex)
         .apply {
             location?.takeIf {
                 it.observedElapsedNanos >= 0 && nowElapsedNanos >= it.observedElapsedNanos &&

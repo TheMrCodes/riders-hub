@@ -14,8 +14,11 @@ internal class RealtimeSession(
     private val context: Context,
     private val onState: (String, String?) -> Unit,
     private val onDisconnected: (authorizationPaused: Boolean) -> Unit,
-    allowed: (ApiConnection, String) -> Boolean = { _, _ -> true },
+    private val allowed: (ApiConnection, String) -> Boolean = { _, _ -> true },
+    private val trackingAllowed: () -> Boolean = { true },
     private val locationAllowed: () -> Boolean = { true },
+    private val requestLocation: () -> Unit = {},
+    private val latestLocation: () -> RealtimeLocation? = { null },
     private val nowNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
     private val openSocket: (ApiConnection, WebSocketListener) -> WebSocket = ApiClient(allowed)::openRealtime,
     private val automaticFlush: Boolean = true,
@@ -25,9 +28,10 @@ internal class RealtimeSession(
     private val lock = Any()
     private val streamId = UUID.randomUUID().toString()
     private var sequence = 0L
-    private var pending: RealtimeSample? = null
+    private val pending = ArrayDeque<RealtimeSample>()
+    private var nextSendAt = 0L
+    private var locationRequested = false
     private var lastFrame: Pair<String, Long>? = null
-    private var lastSentAt: Long? = null
     private var queuedSince: Long? = null
     private var terminal = false
     private val sender = Executors.newSingleThreadScheduledExecutor()
@@ -37,7 +41,10 @@ internal class RealtimeSession(
     fun open() {
         synchronized(lock) {
             if (terminal || socket != null) return
-            if (automaticFlush) sender.scheduleWithFixedDelay(::flushLatest, 1, 1, TimeUnit.SECONDS)
+            nextSendAt = nowNanos() + INTERVAL_NANOS
+            if (automaticFlush) sender.scheduleAtFixedRate({
+                runCatching { flushBatch() }.onFailure { terminate(false, "Batch preparation failed") }
+            }, 1, 1, TimeUnit.SECONDS)
         }
         try {
             val created = openSocket(connection, object : WebSocketListener() {
@@ -48,7 +55,7 @@ internal class RealtimeSession(
                         return
                     }
                     val accepted = synchronized(lock) {
-                        if (terminal) false else {
+                        if (terminal || !allowed(connection, "realtime")) false else {
                             socket = webSocket
                             opened = webSocket.send(streamOpened(context.sourceId, context.boardId, context.rideId, streamId).toString())
                             opened
@@ -86,11 +93,20 @@ internal class RealtimeSession(
     }
 
     fun offer(captureSegmentId: String, frameNumber: Long, frameAt: String, segmentElapsedMs: Long,
-              speedKmh: Double, location: RealtimeLocation?): Unit = synchronized(lock) {
-        if (!opened || terminal || !speedKmh.isFinite() || speedKmh < 0 ||
-            frameNumber < 1 || segmentElapsedMs < 0 || lastFrame == captureSegmentId to frameNumber) return
-        pending = RealtimeSample(context.sourceId, context.boardId, context.rideId, streamId,
-            captureSegmentId, 0, frameNumber, frameAt, segmentElapsedMs, speedKmh, location)
+              speedKmh: Double, receivedAtNanos: Long = nowNanos(), rawHex: String? = null) {
+        var overflow = false
+        synchronized(lock) {
+            if (terminal || !trackingAllowed() || !speedKmh.isFinite() || speedKmh < 0 || frameNumber < 1 || segmentElapsedMs < 0 ||
+                lastFrame?.let { it.first == captureSegmentId && frameNumber <= it.second } == true) return
+            // Include time spent in the BLE-to-worker handoff in the first batch deadline.
+            if (sequence == 0L) nextSendAt = minOf(nextSendAt, receivedAtNanos + INTERVAL_NANOS)
+            if (pending.size >= MAX_BATCH_FRAMES) overflow = true else {
+                pending.addLast(RealtimeSample(context.sourceId, context.boardId, context.rideId, streamId,
+                    captureSegmentId, 0, frameNumber, frameAt, segmentElapsedMs, speedKmh, null, rawHex))
+                lastFrame = captureSegmentId to frameNumber
+            }
+        }
+        if (overflow) terminate(false, "Realtime batch overflow")
     }
 
     /** Intentional close invalidates callbacks, even when the upgrade has not completed yet. */
@@ -98,7 +114,7 @@ internal class RealtimeSession(
         val old = synchronized(lock) {
             terminal = true
             opened = false
-            pending = null
+            pending.clear()
             sender.shutdownNow()
             socket.also { socket = null }
         }
@@ -106,9 +122,17 @@ internal class RealtimeSession(
         old?.cancel()
     }
 
-    internal fun flushLatest() {
+    internal fun flushBatch() {
+        if (!allowed(connection, "realtime")) { terminate(false, "Streaming disabled"); return }
         var stalled = false
+        var requestFix = false
         synchronized(lock) {
+            if (!trackingAllowed()) {
+                pending.clear()
+                locationRequested = false
+                nextSendAt = nowNanos() + INTERVAL_NANOS
+                return
+            }
             if (!opened || terminal) return
             val webSocket = socket ?: return
             val now = nowNanos()
@@ -117,23 +141,38 @@ internal class RealtimeSession(
                 if (queuedSince == null) queuedSince = now
                 stalled = queued >= MAX_OUTGOING_BYTES || now - requireNotNull(queuedSince) >= STALL_NANOS
             } else queuedSince = null
-            if (!stalled) {
-                val sample = pending ?: return
-                if (lastSentAt?.let { now - it < INTERVAL_NANOS } == true) return
-                val encoded = sample.copy(streamSequence = sequence + 1,
-                    location = sample.location.takeIf { locationAllowed() }).toJson(now).toString()
-                if (queued + encoded.toByteArray(Charsets.UTF_8).size > MAX_OUTGOING_BYTES) {
-                    stalled = true
+            if (!stalled && pending.isNotEmpty()) {
+                if (now < nextSendAt) {
+                    if (!locationRequested && now >= nextSendAt - LOCATION_LEAD_NANOS) {
+                        locationRequested = true
+                        requestFix = locationAllowed()
+                    }
                 } else {
-                    pending = null
-                    if (webSocket.send(encoded)) {
-                        sequence += 1
-                        lastSentAt = now
-                        lastFrame = sample.captureSegmentId to sample.frameNumber
-                    } else stalled = true
+                    // A missing/late GPS fix never delays the five-second send deadline.
+                    val location = latestLocation().takeIf { locationRequested && locationAllowed() }
+                    val messages = pending.mapIndexed { index, sample ->
+                        sample.copy(streamSequence = sequence + index + 1,
+                            location = location.takeIf { index == pending.size - 1 }).toJson(now).toString()
+                    }
+                    if (queued + messages.sumOf { it.toByteArray(Charsets.UTF_8).size } > MAX_OUTGOING_BYTES) {
+                        stalled = true
+                    } else {
+                        pending.clear()
+                        for (message in messages) {
+                            if (!trackingAllowed()) break
+                            if (!allowed(connection, "realtime") || !webSocket.send(message)) { stalled = true; break }
+                            sequence++
+                        }
+                        nextSendAt = now + INTERVAL_NANOS
+                        locationRequested = false
+                    }
                 }
+            } else if (!stalled && now >= nextSendAt) {
+                nextSendAt = now + INTERVAL_NANOS
+                locationRequested = false
             }
         }
+        if (requestFix && trackingAllowed()) requestLocation()
         if (stalled) terminate(false, "Outgoing buffer stalled")
     }
 
@@ -142,7 +181,7 @@ internal class RealtimeSession(
             if (terminal) return
             terminal = true
             opened = false
-            pending = null
+            pending.clear()
             sender.shutdownNow()
             socket.also { socket = null }
         }
@@ -152,8 +191,10 @@ internal class RealtimeSession(
     }
 
     companion object {
-        private const val MAX_OUTGOING_BYTES = 64L * 1024L
-        private const val INTERVAL_NANOS = 1_000_000_000L
+        private const val MAX_OUTGOING_BYTES = 1024L * 1024L
+        private const val MAX_BATCH_FRAMES = 2048
+        private const val LOCATION_LEAD_NANOS = 2_000_000_000L
+        private const val INTERVAL_NANOS = 5_000_000_000L
         private const val STALL_NANOS = 5_000_000_000L
     }
 }

@@ -12,6 +12,10 @@ class RidersHubApplication : Application() {
         ChargerStore(this).resetRuntime()
         BatteryWarningNotifier.createChannel(this)
         ChargerNotifier.createChannel(this)
+        at.themrcodes.ridershub.storage.StorageNotifications.createChannel(this)
+        at.themrcodes.ridershub.storage.StorageReminderReceiver.schedule(
+            this, at.themrcodes.ridershub.storage.StorageModeStore.get(this).snapshot(),
+        )
         ApiIntegration.get(this).recoverDelivery()
     }
 }

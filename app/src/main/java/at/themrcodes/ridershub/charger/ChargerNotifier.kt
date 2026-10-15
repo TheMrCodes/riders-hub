@@ -15,10 +15,12 @@ class ChargerNotifier(private val context: Context) {
     fun prompt(token: String) = show(
         id = PROMPT_ID,
         title = "Board charger detected",
-        body = "Tap to review before power is turned on.",
+        body = "Charger is ready. Connect the board, then tap Start charging.",
         token = token,
         ongoing = false,
     )
+
+    fun cancelPrompt() = context.getSystemService(NotificationManager::class.java).cancel(PROMPT_ID)
 
     fun complete() = show(
         id = RESULT_ID,
@@ -41,17 +43,32 @@ class ChargerNotifier(private val context: Context) {
             context, id, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val notification = Notification.Builder(context, CHANNEL_ID)
+        val builder = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification).setContentTitle(title).setContentText(body)
             .setContentIntent(open).setAutoCancel(!ongoing).setOngoing(ongoing)
-            .setCategory(Notification.CATEGORY_STATUS).setVisibility(Notification.VISIBILITY_PRIVATE).build()
-        context.getSystemService(NotificationManager::class.java).notify(id, notification)
+            .setCategory(Notification.CATEGORY_STATUS).setVisibility(Notification.VISIBILITY_PRIVATE)
+        if (token != null) {
+            val start = PendingIntent.getBroadcast(
+                context, PROMPT_ID,
+                Intent(ChargerControl.ACTION_START).apply {
+                    setPackage(context.packageName)
+                    // Keep old notification intents tied to their original appearance.
+                    identifier = token
+                    putExtra(ChargerControl.EXTRA_APPEARANCE_TOKEN, token)
+                    putExtra(ChargerControl.EXTRA_CONFIRMED, true)
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(Notification.Action.Builder(null, "Start charging", start)
+                .setAuthenticationRequired(true).build())
+        }
+        context.getSystemService(NotificationManager::class.java).notify(id, builder.build())
     }
 
     companion object {
         private const val CHANNEL_ID = "charger_observation"
         private const val PROMPT_ID = 2101
-        private const val RESULT_ID = 2102
+        private const val RESULT_ID = 2112
         fun createChannel(context: Context) {
             context.getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Charger observation", NotificationManager.IMPORTANCE_HIGH).apply {

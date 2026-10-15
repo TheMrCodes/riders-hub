@@ -52,6 +52,12 @@ class BleTelemetrySession(
     private val captureSegmentId = UUID.randomUUID().toString()
     private val segmentStartedElapsedNs = SystemClock.elapsedRealtimeNanos()
     private val batteryWarnings = BatteryWarningNotifier(context)
+    private val barometer = BarometerSampler(context) { hPa, wallTime, elapsedNs ->
+        if (!active) return@BarometerSampler
+        log.record("pressure_sample", JSONObject().put("pressure_hpa", Math.round(hPa * 100.0) / 100.0),
+            wallTime, elapsedNs)
+        rideStore.recordPressure(hPa, elapsedNs / 1_000_000L)
+    }
     private val commandLock = Any()
     private val decoder = BackfireFrameDecoder { reason, bytes ->
         log.record(
@@ -210,6 +216,7 @@ class BleTelemetrySession(
     fun stop(reason: String) {
         if (!active) return
         active = false
+        barometer.stop()
         handler.removeCallbacks(reconnectRunnable)
         handler.removeCallbacks(commandTimeoutRunnable)
         handler.removeCallbacks(telemetryWatchdogRunnable)
@@ -514,6 +521,7 @@ class BleTelemetrySession(
                 crcValid = frame.crcValid,
             )
         if (usable) {
+            if (reportedGattActive) barometer.start()
             segmentBoardTelemetryReceived = true
             lastUsableTelemetryElapsedMs = SystemClock.elapsedRealtime()
             handler.removeCallbacks(resumeDeadlineRunnable)
@@ -528,7 +536,12 @@ class BleTelemetrySession(
                 )
             }
         }
-        state.setFrame(number, frame)
+        state.setFrame(number, frame, battery, receivedAt.toEpochMilli())
+        rideStore.activeRide()?.let { ride ->
+            at.themrcodes.ridershub.storage.StorageModeStore.get(context).onTelemetry(
+                ride, frame, receivedAt.toEpochMilli(), receivedElapsedNs / 1_000_000L,
+            )
+        }
         batteryWarnings.maybeNotifyBoard(
             sessionId = segment.sessionId,
             batteryPercent = frame.boardBatteryPercent,
@@ -594,6 +607,11 @@ class BleTelemetrySession(
     private fun reportGattActive(active: Boolean) {
         if (reportedGattActive == active) return
         reportedGattActive = active
+        if (active) ApiIntegration.get(context).onRemoteConnected(captureSegmentId)
+        else {
+            barometer.stop()
+            ApiIntegration.get(context).onRemoteDisconnected(captureSegmentId)
+        }
         onGattActiveChanged(active)
     }
 
@@ -638,6 +656,7 @@ class BleTelemetrySession(
     private fun requestSessionRestart(reason: String) {
         if (!active || interruptionRequested) return
         interruptionRequested = true
+        reportGattActive(false)
         handler.removeCallbacks(reconnectRunnable)
         handler.removeCallbacks(telemetryWatchdogRunnable)
         handler.removeCallbacks(resumeDeadlineRunnable)

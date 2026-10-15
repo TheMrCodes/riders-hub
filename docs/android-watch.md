@@ -126,7 +126,7 @@ only values that remain useful at that cadence:
 
 - current local time, using the same 24-hour clock as the interactive screen;
 - current trip kilometres, displayed prominently;
-- estimated board battery (with a `~` prefix), falling back to the reported percentage;
+- estimated board battery, falling back to the reported percentage;
 - estimated kilometres remaining.
 
 Speed, connection state, and ride mode stay on the interactive screen. Speed is
@@ -159,7 +159,12 @@ buffered payload and the current local clock, even when no telemetry arrives.
 
 ### Optional live screen
 
-When **Live screen** is enabled, Riders Hub applies `FLAG_KEEP_SCREEN_ON` only
+The display setting cycles **Ambient → Live screen → Race → Ambient** with each
+tap. The selected mode survives restarts; the previous keep-awake setting migrates
+to Ambient or Live screen. These are watch display choices, independent of the
+board's riding mode. The settings swipe page and Auto open switch remain available.
+
+When **Live screen** or **Race** is enabled, Riders Hub applies `FLAG_KEEP_SCREEN_ON` only
 while telemetry still represents a recent active ride. The flag is cleared when
 the ride enters standby, telemetry becomes stale, the setting is disabled, or
 the composable leaves the activity. It is a window behavior, not a wake lock or
@@ -170,6 +175,62 @@ higher display power use is why it is not the default. Once the active-ride
 condition ends, the app no longer prevents the system from entering ambient
 mode.
 
+### Race dashboard
+
+Race shows an open-bottom perimeter power marker, large central speed and a
+compact battery dial beneath it. Range and trip distance remain on the other
+dashboard modes, not Race. The small battery dial uses estimated charge
+with reported charge as fallback, and its red warning zone follows the phone's
+configured low-battery threshold. Battery percentages have no approximation prefix.
+The local clock is centered at the top with the live dot just to its left, as in
+the other interactive modes. System ambient uses the existing
+low-power trip/clock layout even when Race is selected.
+
+Zero power points left (180 degrees). Positive draw travels clockwise through
+240 degrees up to 2000 W; estimated recovery travels counter-clockwise up to 60 degrees
+at -500 W. This leaves a 60-degree bottom opening for the signed watt readout
+(for example, `+420 W`, without an `EST` prefix). The marker is clamped at the
+dial endpoints while the numerical reading retains out-of-range values. Scalar interpolation crosses zero
+and changes the marker from red to green for estimated recovery. The separate
+label reads `DRAW EST.` or `REGEN EST.`; accessibility announces estimated
+consumption or recovery explicitly. Sub-watt values rounding to zero show `0 W`.
+
+Power is a **provisional command-based estimate**, computed for every usable BLE
+frame. The raw input is a remote command, not a battery-current measurement.
+Positive input retains the existing drive-display scale:
+`voltage × effective raw input × 0.020497265957721715`.
+Negative input uses a separate motor-braking envelope:
+
+```text
+brake_fraction = clamp(-effective_raw_input / 670, 0, 1)
+mechanical_braking_W = 480 N × brake_fraction × min(speed_mps, 6 m/s)
+estimated_recovered_W = 0.40 × mechanical_braking_W
+display_W = -estimated_recovered_W
+```
+
+The force/power limits are rounded provisional parameters from the force-model
+experiment, not manufacturer ratings. Recovery efficiency is an explicit 40%
+assumption, not a measured coefficient. At standstill, braking reports zero
+recovery; neutral input does not infer regeneration from slowing or voltage
+rebound. The existing board-specific raw-zero/noise calibration supplies effective
+input. Invalid CRC, voltage, input or speed leaves power unavailable. Estimates
+use only the current frame and existing zero calibration; controller delay,
+battery charge acceptance and electrical losses are not independently observed.
+The drive and recovery branches remain display diagnostics and supply no SOC,
+capacity or range credit.
+
+The original telemetry v3 and auto-open settings v1 remain unchanged. Separate
+version-1 payloads use `/riders-hub/display-mode` (watch preference) and
+`/riders-hub/race-sample` (durable sample, at most every two seconds). Connected
+watches selecting Race also receive `/riders-hub/race-live` messages normally every
+250 ms. Transitions into or out of displayed recovery bypass that interval when
+transport is available. Messages contain sample time, speed, signed estimated watts and the warning
+threshold. Messages update memory only; one in-flight message per watch prevents
+queues; an event wholly inside a busy or disconnected interval can still be missed.
+The two-second sample supplies reconnect/process-restart fallback. After
+three seconds without a fresh sample the marker returns to zero in grey, speed
+and power show placeholders, and the dashboard identifies stale power data.
+
 ## Implementation boundaries
 
 The decisions above rely on these components:
@@ -177,8 +238,11 @@ The decisions above rely on these components:
 - `MainActivity` attaches the ambient lifecycle, gates visible telemetry to
   ambient ticks, applies burn-in offsets, and owns the optional keep-screen-on
   flag.
-- `WearTelemetryListenerService` receives only the Riders Hub telemetry Data
-  Layer path while the activity is backgrounded.
+- `WearTelemetryListenerService` receives the Riders Hub telemetry and Race
+  Data Items, plus the transient Race message path.
+- `WearRaceRepository` keeps fast updates in memory, persists only durable
+  samples, and rejects older deliveries. Source timestamps and a monotonic
+  receipt timeout prevent stale speed/power, including when device clocks differ.
 - `WearTelemetryPersistence` stores and restores the newest payload and
   prevents older bootstrap data from replacing it.
 - `WearOngoingActivity` owns the recent-ride eligibility and notification

@@ -7,6 +7,7 @@ import android.net.Uri
 import android.util.Log
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
+import at.themrcodes.ridershub.wear.shared.WearRaceSample
 import com.google.android.gms.tasks.Task
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.PutDataRequest
@@ -34,6 +35,14 @@ class WearDataLayerTestReceiver : BroadcastReceiver() {
                 .setData(state.encode())
                 .setUrgent()
             dataClient.putDataItem(request)
+        }
+
+        if (!clear) {
+            val sample = WearRaceSample(System.currentTimeMillis(), 18.5,
+                intent.getFloatExtra("estimated_power_w", 420f).toDouble(), 20)
+            dataClient.putDataItem(PutDataRequest.create(WearRaceSample.DATA_PATH).setData(sample.encode()).setUrgent())
+        } else {
+            dataClient.deleteDataItems(Uri.parse("wear://*${WearRaceSample.DATA_PATH}"), DataClient.FILTER_LITERAL)
         }
 
         task.addOnSuccessListener {

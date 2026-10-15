@@ -7,6 +7,7 @@ import androidx.core.content.ContextCompat
 import androidx.wear.remote.interactions.RemoteActivityHelper
 import at.themrcodes.ridershub.wear.shared.WearConnectionStatus
 import at.themrcodes.ridershub.wear.shared.WearSettingsState
+import at.themrcodes.ridershub.wear.shared.WearDisplayModeState
 import at.themrcodes.ridershub.wear.shared.WearTelemetryState
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
@@ -46,6 +47,18 @@ internal class WearAutoOpenStore(context: Context) {
 class WearSettingsListenerService : WearableListenerService() {
     override fun onDataChanged(events: DataEventBuffer) {
         events.forEach { event ->
+            if (event.dataItem.uri.path == WearDisplayModeState.DATA_PATH) {
+                val node = event.dataItem.uri.host ?: return@forEach
+                if (event.type == DataEvent.TYPE_DELETED) {
+                    WearDisplayModeStore(this).set(node, null)
+                    return@forEach
+                }
+                val mode = runCatching {
+                    WearDisplayModeState.decode(event.dataItem.data ?: return@forEach).mode
+                }.getOrNull() ?: return@forEach
+                WearDisplayModeStore(this).set(node, mode)
+                return@forEach
+            }
             if (event.dataItem.uri.path != WearSettingsState.DATA_PATH) return@forEach
             if (event.type == DataEvent.TYPE_DELETED) return@forEach
             val settings = runCatching {

@@ -22,6 +22,8 @@ data class RangeDepletionWindow(
     val recordedDistanceKm: Double,
     val speedBucketDistancesKm: Map<Int, Double>,
     val estimatedSpeedBucketDistancesKm: Map<Int, Double> = emptyMap(),
+    /** Aligned per-mass motion work; empty for windows recorded before the physics model. */
+    val motion: WindowMotion = WindowMotion.ZERO,
 ) {
     val observedDepletionPercent: Int
         get() = max(0, startBatteryPercent - minBatteryPercent)
@@ -46,6 +48,7 @@ object RangeCalibrationTracker {
         speedBucketDistancesKm: Map<Int, Double> = emptyMap(),
         allowRechargeReset: Boolean = false,
         estimatedSpeedBucketDistancesKm: Map<Int, Double> = emptyMap(),
+        motion: WindowMotion = WindowMotion.ZERO,
     ): RangeCalibrationUpdate? {
         if (batteryPercent !in 0..100) return null
         if (!distanceKm.isFinite() || distanceKm < 0.0) return null
@@ -74,6 +77,7 @@ object RangeCalibrationTracker {
                 window.speedBucketDistancesKm,
                 speedBucketDistancesKm.filterValues { it.isFinite() && it > 0.0 },
             ),
+            motion = window.motion + motion,
         )
 
         if (window.observedDepletionPercent < DEPLETION_STEP_PERCENT) {
@@ -149,6 +153,7 @@ internal fun RangeDepletionWindow.toJson(): JSONObject = JSONObject()
     .put("min_battery_percent", minBatteryPercent)
     .put("recorded_distance_km", recordedDistanceKm)
     .put("estimated_speed_bucket_distances_km", bucketMapJson(estimatedSpeedBucketDistancesKm))
+    .apply { if (!motion.isEmpty) put("motion", motion.toJson()) }
     .put(
         "speed_bucket_distances_km",
         JSONObject().apply {
@@ -170,6 +175,7 @@ internal fun rangeDepletionWindowFromJson(value: JSONObject): RangeDepletionWind
         minBatteryPercent = value.getInt("min_battery_percent"),
         recordedDistanceKm = value.optDouble("recorded_distance_km", 0.0),
         estimatedSpeedBucketDistancesKm = value.readBucketMap("estimated_speed_bucket_distances_km"),
+        motion = WindowMotion.fromJson(value.optJSONObject("motion")),
         speedBucketDistancesKm = value.optJSONObject("speed_bucket_distances_km")?.let { buckets ->
             buildMap {
                 buckets.keys().forEach { key ->

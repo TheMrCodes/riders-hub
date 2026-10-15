@@ -14,6 +14,28 @@ class BatteryEstimateStateTest {
         }
     }
 
+    @Test fun newBoardsStartWithAnExplicitUncalibrated346WhPrior() {
+        val state = BatteryEstimateState(60.0, 60)
+        assertEquals(346.0, state.capacity.estimatedWh, 0.0)
+        assertEquals(0, state.capacity.observationCount)
+        assertEquals(0.0, state.capacity.qualifiedDepletionPercent, 0.0)
+        assertEquals(BatteryCapacityStatus.PRIOR, state.capacity.status)
+    }
+
+    @Test fun substantialCapacityObservationsMoveThePriorSlowlyAndTrackEvidence() {
+        val initial = BatteryCapacityEstimate()
+        assertEquals(initial, BatteryCapacityEstimator.observe(initial, 500.0, 19.9))
+        val first = BatteryCapacityEstimator.observe(initial, 500.0, 40.0)
+        assertTrue(first.estimatedWh > 346.0)
+        assertEquals(1, first.observationCount)
+        assertEquals(40.0, first.qualifiedDepletionPercent, 0.0)
+        assertEquals(BatteryCapacityStatus.LEARNING, first.status)
+        val second = BatteryCapacityEstimator.observe(first, 500.0, 40.0)
+        val third = BatteryCapacityEstimator.observe(second, 500.0, 40.0)
+        assertEquals(BatteryCapacityStatus.TRACKING, third.status)
+        assertTrue(third.estimatedWh < 500.0)
+    }
+
     @Test fun transientReportedReboundDoesNotMoveTheEstimate() {
         val s = Stream()
         repeat(20) { s.tick(80) }
@@ -66,7 +88,8 @@ class BatteryEstimateStateTest {
     }
 
     @Test fun estimateSurvivesSerializationButSettlingEvidenceDoesNot() {
-        val s = Stream(BatteryEstimateState(58.125, 60))
+        val capacity = BatteryCapacityEstimate(340.0, 2, 80.0)
+        val s = Stream(BatteryEstimateState(58.125, 60, capacity))
         repeat(20) { s.tick(80) }
         val registry = BatteryEstimateRegistry()
         registry.record("board-a", s.state)
@@ -76,6 +99,15 @@ class BatteryEstimateStateTest {
         assertEquals(s.state, resumed.state)
         repeat(20) { resumed.tick(80) }
         assertEquals(60, resumed.state.referencePercent)
+    }
+
+    @Test fun versionOneSocStateMigratesToTheUncalibratedCapacityPrior() {
+        val legacy = JSONObject().put("version", 1)
+            .put("percent", 58.2).put("reference_percent", 60)
+        val migrated = requireNotNull(BatteryEstimateState.fromJson(legacy))
+        assertEquals(58.2, migrated.percent, 0.0)
+        assertEquals(346.0, migrated.capacity.estimatedWh, 0.0)
+        assertEquals(BatteryCapacityStatus.PRIOR, migrated.capacity.status)
     }
 
     @Test fun boardsNeverShareAnEstimate() {

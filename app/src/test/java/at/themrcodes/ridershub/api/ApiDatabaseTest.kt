@@ -23,6 +23,19 @@ class ApiDatabaseTest {
 
     @After fun close() { database.close(); app.deleteDatabase("self_hosted_api.db") }
 
+    @Test fun boardIdentitySurvivesReinstallationAndMatchesArchiveIdentity() {
+        val key = "board_6d42c15bb166be5ddc684cb8"
+        val expected = "00351e63-1177-3f8f-b968-bd16bc3beee0"
+        val oldSource = database.sourceId()
+        assertEquals(expected, database.exportId("board", key))
+        database.close()
+        app.deleteDatabase("self_hosted_api.db")
+        database = ApiDatabase(app)
+        assertNotEquals(oldSource, database.sourceId())
+        assertEquals(expected, database.exportId("board", key))
+        assertNotEquals(expected, database.exportId("board", "board_111111111111111111111111"))
+    }
+
     @Test fun lifecycleJournalDeduplicatesAcrossAcknowledgementAndReopen() {
         val row = enqueue(scopeA, "started")
         val initial = database.pendingMetrics(scopeA).single().payload

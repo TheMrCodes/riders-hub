@@ -6,18 +6,19 @@ import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
 import java.time.Instant
+import kotlin.math.roundToInt
 
 /** Rebuild disposable analytics projections from immutable raw frames. */
 internal object AnalyticsHistoryMigration {
     const val VERSION_KEY = "analytics_history_version"
     const val VERSION = "4"
-    const val MODEL_VERSION = "digital-twin-replay-v2"
+    const val MODEL_VERSION = "digital-twin-replay-v9"
     const val MODEL_VERSION_KEY = "analytics_model_version"
     const val MANIFEST_KEY = "analytics_replay_manifest_v1"
     val derivedKeys = setOf("active_range_windows_v1", "completed_range_windows_v1",
         "active_charge_cycles_v1", "completed_charge_cycles_v1", "board_speed_bucket_stats_v1",
         "board_continuity_v1", "battery_charge_stats_v1", "battery_learning_models_v1",
-        "battery_estimates_v1", MANIFEST_KEY)
+        "battery_estimates_v1", "raw_load_zero_v1", MANIFEST_KEY)
 
     fun required(values: Map<String, String>, rawArchiveAvailable: Boolean = false) =
         ((values[VERSION_KEY]?.toIntOrNull() ?: 0) < VERSION.toInt() ||
@@ -29,7 +30,7 @@ internal object AnalyticsHistoryMigration {
     data class Result(val replacement: Map<String, String>, val report: JSONObject)
     private data class Frame(val session: String, val board: String, val at: Instant, val seq: Long,
         val percent: Int, val speed: Double, val odo: Double, val voltage: Double, val loadRaw: Int,
-        val valid: Boolean)
+        val valid: Boolean, val pressureHPa: Double? = null)
     private data class StreamFrame(
         val frame: Frame,
         val continuity: BoardContinuityUpdate,
@@ -37,6 +38,7 @@ internal object AnalyticsHistoryMigration {
     )
 
     private class Board {
+        val physics = PhysicsFrameProcessor()
         var window: RangeDepletionWindow? = null
         val windows = mutableListOf<RangeDepletionWindow>()
         var cycle: ChargeCycleSummary? = null
@@ -44,6 +46,7 @@ internal object AnalyticsHistoryMigration {
         var lastSession: String? = null
         var lastValidAtMs: Long? = null
         var batteryState: BatteryEstimateState? = null
+        var rawLoadZero = RawLoadZeroEstimate()
         var learningModel = BatteryLearningModel()
         val observationTracker = BatteryObservationTracker()
         val learningTracker = BatteryLearningTracker()
@@ -51,7 +54,12 @@ internal object AnalyticsHistoryMigration {
         var rangeModelAtMs: Long? = null
     }
 
-    fun rebuild(directory: File, scratch: File, legacy: Map<String, String>): Result {
+    fun rebuild(
+        directory: File,
+        scratch: File,
+        legacy: Map<String, String>,
+        profile: RiderBoardProfile = RiderBoardProfile.DEFAULT,
+    ): Result {
         val frames = mutableListOf<Frame>()
         val sessions = mutableMapOf<String, String>()
         val sessionStarts = mutableMapOf<String, Instant>()
@@ -60,6 +68,7 @@ internal object AnalyticsHistoryMigration {
         var sourceRecords = 0L
         var session: String? = null
         var board: String? = null
+        var pressure: Pair<Instant, Double>? = null
         TelemetryArchive().forEachFinalizedRecordLine(directory, scratch) { line, row ->
             sourceDigest.update(line.toByteArray(Charsets.UTF_8))
             sourceDigest.update('\n'.code.toByte())
@@ -72,6 +81,12 @@ internal object AnalyticsHistoryMigration {
                         "Duplicate session identity"
                     }
                     sessionStarts[requireNotNull(session)] = Instant.parse(row.getString("wall_time"))
+                    pressure = null
+                }
+                "pressure_sample" -> {
+                    row.optDouble("pressure_hpa").takeIf { it.isFinite() && it in 300.0..1_100.0 }?.let {
+                        pressure = Instant.parse(row.getString("wall_time")) to it
+                    }
                 }
                 "session_end" -> {
                     require(row.getString("session_id") == session)
@@ -82,11 +97,16 @@ internal object AnalyticsHistoryMigration {
                     val v = row.getDouble("pack_voltage_v")
                     val speed = row.getDouble("speed_kmh")
                     val odo = row.getDouble("odometer_km")
+                    val frameAt = Instant.parse(row.getString("wall_time"))
+                    val framePressure = pressure?.takeIf { (sampleAt, _) ->
+                        java.time.Duration.between(sampleAt, frameAt).toMillis() in 0..PhysicsPowerConstants.MAX_PRESSURE_AGE_MS
+                    }?.second
                     frames += Frame(requireNotNull(session), requireNotNull(board),
-                        Instant.parse(row.getString("wall_time")), row.getLong("seq"), p, speed, odo, v,
+                        frameAt, row.getLong("seq"), p, speed, odo, v,
                         row.optInt("load_raw_signed_be", 0),
                         row.getBoolean("crc_valid") && p in 0..100 && v in 10.0..70.0 &&
-                            speed.isFinite() && speed >= 0 && odo.isFinite() && odo >= 0)
+                            speed.isFinite() && speed >= 0 && odo.isFinite() && odo >= 0,
+                        framePressure)
                 }
             }
         }
@@ -147,17 +167,22 @@ internal object AnalyticsHistoryMigration {
             val frame = observation.frame
             val update = observation.continuity
             val b = boards.getOrPut(frame.board) { Board() }
+            if (b.lastSession != null && b.lastSession != frame.session) {
+                stats.completeTrip(frame.board, requireNotNull(b.lastSession))
+                b.rangeModel = null
+                b.rangeModelAtMs = null
+            }
             val at = frame.at.toString()
             val startsCharge = observation.confirmedRechargeAtStart != null
             val hardGap = update.calibrationGapReason != null &&
                 update.calibrationGapReason != "first_observation" && !startsCharge
-            if (update.calibrationGapReason == "unobserved_distance") hardOdometerGapCount++
+            if (hardGap && update.calibrationGapReason == "unobserved_distance") hardOdometerGapCount++
             if (startsCharge) {
                 chargeSpanningGapKm += update.odometerDeltaKm?.coerceAtLeast(0.0) ?: 0.0
             }
             val inferred = if (update.unprofiledDistanceKm > 0.0) {
                 GapSpeedProfile.estimate(update.unprofiledDistanceKm, frame.board,
-                    emptyList(), stats.snapshot(frame.board))
+                    emptyList(), stats.snapshot(frame.board, profile))
             } else emptyMap()
             retainedGapKm += update.unprofiledDistanceKm
             val measured = update.intervalSpeedKmh?.takeIf { update.intervalDistanceKm > 0 }?.let {
@@ -169,15 +194,39 @@ internal object AnalyticsHistoryMigration {
                 (update.unprofiledDistanceKm - inferred.values.sum()).coerceAtLeast(0.0)
             }
             stats.recordDistance(frame.board, measured, inferred, unattributedDistance)
+            // Same order as the live path: raw-load zero, then aligned physics, then windows.
+            val frameAtMs = frame.at.toEpochMilli()
+            val continuous = !startsCharge && update.gapReason == null && b.lastValidAtMs != null
+            val elapsedSeconds = if (continuous) {
+                (frameAtMs - requireNotNull(b.lastValidAtMs)) / 1000.0
+            } else 0.0
+            b.rawLoadZero = RawLoadZeroEstimator.observe(
+                current = b.rawLoadZero,
+                raw = frame.loadRaw,
+                stationaryEligible = frame.speed <= 0.5 &&
+                    !update.chargePending && update.rechargeIncreasePercent == null,
+                elapsedSeconds = elapsedSeconds,
+            )
+            val motion = if (update.gapReason != null || update.chargePending || startsCharge) {
+                b.physics.reset(); WindowMotion.ZERO
+            } else b.physics.observe(
+                model = stats.physicsModel(frame.board),
+                atMs = frameAtMs,
+                speedKmh = frame.speed,
+                voltageV = frame.voltage,
+                effectiveLoadRaw = b.rawLoadZero.effectiveRaw(frame.loadRaw),
+                pressureHPa = frame.pressureHPa,
+            )
             if (startsCharge || hardGap || update.calibrationGapReason == "first_observation") b.window = null
             run {
                 val distance = if (startsCharge || hardGap) 0.0
                     else update.intervalDistanceKm + update.unprofiledDistanceKm
-                val profile = update.intervalSpeedKmh?.takeIf { distance > 0 }?.let {
+                val bucketDistances = update.intervalSpeedKmh?.takeIf { distance > 0 }?.let {
                     mapOf(speedBucketStartKmh(it) to distance)
                 } ?: emptyMap()
                 val range = requireNotNull(RangeCalibrationTracker.observe(b.window, frame.board,
-                    frame.percent, at, distance, profile, false, inferred))
+                    frame.percent, at, distance, bucketDistances, false, inferred,
+                    if (startsCharge || hardGap) WindowMotion.ZERO else motion))
                 b.window = range.activeWindow
                 range.completedWindow?.let {
                     b.windows += it
@@ -192,7 +241,7 @@ internal object AnalyticsHistoryMigration {
                     .put("odometer_start_km", frame.odo).put("odometer_end_km", frame.odo)
                     .put("moving_seconds", if (distance > 0 && (update.intervalSpeedKmh ?: 0.0) >= 1.0)
                         distance * 3600 / requireNotNull(update.intervalSpeedKmh) else 0.0)
-                    .put("speed_bucket_distances_km", JSONObject().apply { profile.forEach { (key, value) -> put(key.toString(), value) } })
+                    .put("speed_bucket_distances_km", JSONObject().apply { bucketDistances.forEach { (key, value) -> put(key.toString(), value) } })
                 if (frame.speed <= 0.5) json.put("resting_voltage_start", frame.voltage).put("resting_voltage_end", frame.voltage)
                 val charge = ChargeCycleTracker.recordFrame(b.cycle, summaryFromJson(json), frame.board,
                     observation.confirmedRechargeAtStart, b.lastSession != frame.session, inferred)
@@ -203,7 +252,6 @@ internal object AnalyticsHistoryMigration {
             // Replay the live estimator from an empty state. Models are refreshed on completed
             // windows and at the same ten-second cadence used by the live path; no legacy learned
             // parameter or battery estimate is admitted as input.
-            val frameAtMs = frame.at.toEpochMilli()
             val refreshModel = b.rangeModel == null || b.rangeModelAtMs == null ||
                 frameAtMs - requireNotNull(b.rangeModelAtMs) >= 10_000L
             if (refreshModel) {
@@ -215,15 +263,11 @@ internal object AnalyticsHistoryMigration {
                     calibrationPoints = emptyList(),
                     estimatedBatteryPercent = b.batteryState?.percent,
                     selectedBoardId = frame.board,
-                    speedBucketStatistics = stats.snapshot(frame.board),
+                    speedBucketStatistics = stats.snapshot(frame.board, profile),
                 )
                 b.rangeModelAtMs = frameAtMs
             }
             val model = b.rangeModel
-            val continuous = !startsCharge && update.gapReason == null && b.lastValidAtMs != null
-            val elapsedSeconds = if (continuous) {
-                (frameAtMs - requireNotNull(b.lastValidAtMs)) / 1000.0
-            } else 0.0
             val intervalDistance = if (continuous) update.intervalDistanceKm else 0.0
             val baseRate = update.intervalSpeedKmh?.takeIf { continuous }?.let { speed ->
                 model?.bucketBatteryPercentPer100Km?.get(speedBucketStartKmh(speed))?.div(100.0)
@@ -236,7 +280,7 @@ internal object AnalyticsHistoryMigration {
                 distanceKm = intervalDistance,
                 batteryPercentPerKm = appliedRate,
                 voltageV = frame.voltage,
-                loadRaw = frame.loadRaw,
+                loadRaw = b.rawLoadZero.effectiveRaw(frame.loadRaw).roundToInt(),
             )
             val inferredGapBase = model?.let {
                 DigitalTwinDriveModel.inferredTransition(
@@ -274,10 +318,13 @@ internal object AnalyticsHistoryMigration {
             b.lastValidAtMs = frameAtMs
             b.lastSession = frame.session
             if (index % 10000 == 0) {
-                val snapshots = boards.keys.associateWith { stats.snapshot(it) }
+                val snapshots = boards.keys.associateWith { stats.snapshot(it, profile) }
                 stats = BoardSpeedBucketStatsRegistry(stats.toJson().toString())
-                require(snapshots.all { (id, snapshot) -> stats.snapshot(id) == snapshot }) { "Statistics changed after serialization" }
+                require(snapshots.all { (id, snapshot) -> stats.snapshot(id, profile) == snapshot }) { "Statistics changed after serialization" }
             }
+        }
+        boards.forEach { (board, state) ->
+            state.lastSession?.let { stats.completeTrip(board, it) }
         }
         val knownBoards = derivedKeys.filter { it.endsWith("cycles_v1") || it.endsWith("windows_v1") }
             .flatMap { key -> JSONArray(legacy[key] ?: "[]").let { a ->
@@ -321,6 +368,9 @@ internal object AnalyticsHistoryMigration {
             "battery_estimates_v1" to JSONObject().apply {
                 boards.forEach { (id, value) -> value.batteryState?.let { put(id, it.toJson()) } }
             }.toString(),
+            "raw_load_zero_v1" to JSONObject().apply {
+                boards.forEach { (id, value) -> put(id, value.rawLoadZero.toJson()) }
+            }.toString(),
             MANIFEST_KEY to manifest.toString(),
             MODEL_VERSION_KEY to MODEL_VERSION,
             VERSION_KEY to VERSION,
@@ -338,7 +388,7 @@ internal object AnalyticsHistoryMigration {
                 .put("retained_sub_2km_gap_km", retainedGapKm)
                 .put("charge_spanning_gap_km", chargeSpanningGapKm))
             .put("boards", JSONArray().apply { boards.forEach { (id, b) ->
-                val snapshot = requireNotNull(stats.snapshot(id))
+                val snapshot = requireNotNull(stats.snapshot(id, profile))
                 val longevity = BatteryLongevityEstimator.estimate(ChargeCycleStoreSnapshot(listOfNotNull(b.cycle), b.cycles), id, null, snapshot)
                 val rangeAtForty = RangeEstimator.estimate(
                     currentBatteryPercent = 40,
@@ -356,8 +406,46 @@ internal object AnalyticsHistoryMigration {
                     .put("forecast_range_at_40_percent_km", rangeAtForty.remainingKm ?: JSONObject.NULL)
                     .put("forecast_full_battery_km", rangeAtForty.kmPerPercent?.times(100.0) ?: JSONObject.NULL)
                     .put("forecast_status", rangeAtForty.status.name)
+                    .put("bucket_quadratic_rolling_percent_per_km",
+                        snapshot.rollingPercentPerKm ?: JSONObject.NULL)
+                    .put("bucket_quadratic_aerodynamic_percent_per_km_per_kmh_squared",
+                        snapshot.aerodynamicPercentPerKmPerKmhSquared ?: JSONObject.NULL)
+                    .put("bucket_quadratic_unconstrained_rolling",
+                        snapshot.unconstrainedRollingCoefficient ?: JSONObject.NULL)
+                    .put("bucket_quadratic_unconstrained_aerodynamic_per_kmh_squared",
+                        snapshot.unconstrainedAerodynamicCoefficientPerKmhSquared ?: JSONObject.NULL)
+                    .put("bucket_quadratic_rolling_standard_error",
+                        snapshot.rollingCoefficientStandardError ?: JSONObject.NULL)
+                    .put("bucket_quadratic_aerodynamic_standard_error_per_kmh_squared",
+                        snapshot.aerodynamicCoefficientStandardErrorPerKmhSquared ?: JSONObject.NULL)
+                    .put("bucket_quadratic_reference_speed_kmh",
+                        snapshot.shapeReferenceSpeedKmh ?: JSONObject.NULL)
+                    .put("bucket_quadratic_aerodynamic_share_at_reference",
+                        snapshot.aerodynamicShareAtReference ?: JSONObject.NULL)
+                    .put("bucket_quadratic_condition_number",
+                        snapshot.shapeConditionNumber ?: JSONObject.NULL)
+                    .put("bucket_quadratic_r_squared", snapshot.shapeRSquared ?: JSONObject.NULL)
+                    .put("bucket_quadratic_evidence_km", snapshot.shapeEvidenceKm)
+                    .put("bucket_quadratic_supported_buckets", snapshot.shapeSupportedBucketCount)
+                    .put("bucket_quadratic_refits", snapshot.shapeRefits)
+                    .put("physics_rolling_mps2", snapshot.physicsShape?.rollingMps2 ?: JSONObject.NULL)
+                    .put("physics_aero_per_m", snapshot.physicsShape?.aeroPerM ?: JSONObject.NULL)
+                    .put("physics_idle_w_per_kg", snapshot.physicsShape?.idleWPerKg ?: JSONObject.NULL)
+                    .put("physics_recovery_fraction", snapshot.physicsShape?.recoveryFraction ?: JSONObject.NULL)
+                    .put("physics_r_squared", snapshot.physicsShape?.rSquared ?: JSONObject.NULL)
+                    .put("physics_windows", snapshot.physicsWindows)
+                    .put("physics_stop_go_percent_per_km", snapshot.stopGoPercentPerKm)
+                    .put("physics_hill_percent_per_km", snapshot.hillPercentPerKm)
+                    .put("physics_climb_m_per_km", snapshot.climbMPerKm ?: JSONObject.NULL)
+                    .put("physics_barometric_share", snapshot.barometricShare)
+                    .put("pack_energy_factor", snapshot.packEnergyFactor ?: JSONObject.NULL)
+                    .put("effective_battery_wh", snapshot.effectiveBatteryWh ?: JSONObject.NULL)
                     .put("estimated_battery_percent", b.batteryState?.percent ?: JSONObject.NULL)
                     .put("estimated_battery_reference_percent", b.batteryState?.referencePercent ?: JSONObject.NULL)
+                    .put("load_zero_raw", b.rawLoadZero.zeroRaw ?: JSONObject.NULL)
+                    .put("load_deadband_raw", b.rawLoadZero.deadbandRaw)
+                    .put("load_zero_sample_count", b.rawLoadZero.acceptedSampleCount)
+                    .put("load_zero_calibrated", b.rawLoadZero.calibrated)
                     .put("estimated_battery_error_to_reported_percent",
                         b.batteryState?.let { state ->
                             finalContinuity[id]?.lastReportedPercent?.let { state.percent - it }
@@ -391,7 +479,7 @@ internal object AnalyticsHistoryMigration {
             records("completed_charge_cycles_v1").map(::chargeCycleFromJson))
         report.put("before", JSONArray().apply { boards.keys.forEach { id ->
             oldStats.seed(id, rides, oldWindows)
-            val snapshot = oldStats.snapshot(id)
+            val snapshot = oldStats.snapshot(id, profile)
             val longevity = BatteryLongevityEstimator.estimate(oldCycles, id, null, snapshot)
             val oldLearningModel = oldLearning.optJSONObject(id)?.let(BatteryLearningModel::fromJson)
             put(JSONObject().put("board_id", id).put("windows", oldWindows.count { it.localBoardId == id && it.closedAt != null })

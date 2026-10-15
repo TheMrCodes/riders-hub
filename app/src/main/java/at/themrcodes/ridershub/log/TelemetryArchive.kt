@@ -164,6 +164,19 @@ class TelemetryArchive(
         directory: File,
         scratch: File,
         consume: (String, JSONObject) -> Unit,
+    ) = readFinalizedRecords(directory, scratch) { _, line, record -> consume(line, record) }
+
+    /** References identify the original committed entry, including in sealed packages. */
+    internal fun forEachFinalizedRecordWithReference(
+        directory: File,
+        scratch: File,
+        consume: (String, JSONObject) -> Unit,
+    ) = readFinalizedRecords(directory, scratch) { reference, _, record -> consume(reference, record) }
+
+    private fun readFinalizedRecords(
+        directory: File,
+        scratch: File,
+        consume: (String, String, JSONObject) -> Unit,
     ) =
         synchronized(ARCHIVE_LOCK) {
             scratch.mkdirs()
@@ -191,6 +204,7 @@ class TelemetryArchive(
                             val prior = seen.putIfAbsent(entry.entryId.toHex(), fingerprint)
                             require(prior == null || prior == fingerprint) { "Conflicting duplicate telemetry entry" }
                             if (prior == null) {
+                                val reference = "rha:${File(directory, partitionBaseName(scan.sequence)).absolutePath}#${entry.entryId.toHex()}"
                                 FileInputStream(file).use { raw ->
                                     raw.channel.position(entry.payloadOffset)
                                     BoundedInputStream(raw, entry.payloadBytes).bufferedReader().use { reader ->
@@ -209,7 +223,7 @@ class TelemetryArchive(
                                                     .contentEquals(scan.remoteAddress)) { "Archive board mismatch" }
                                             }
                                             first = false
-                                            consume(line, record)
+                                            consume(reference, line, record)
                                         }
                                         require(lastType == "session_end") { "Missing session end" }
                                     }
@@ -221,6 +235,29 @@ class TelemetryArchive(
                 } finally { temporary.delete() }
             }
         }
+
+    /** Byte-for-byte local backup, including working partitions; never contacts the API. */
+    fun exportZip(archiveDirectory: File, scratchDirectory: File, destination: java.io.OutputStream): Int {
+        scratchDirectory.mkdirs()
+        val snapshot = java.nio.file.Files.createTempDirectory(scratchDirectory.toPath(), "archive-export-").toFile()
+        try {
+            val files = synchronized(ARCHIVE_LOCK) {
+                val sources = (packageFiles(archiveDirectory) + workingFiles(archiveDirectory)).sortedBy { it.name }
+                check(sources.isNotEmpty()) { "No local archives to export" }
+                sources.map { source -> source.copyTo(File(snapshot, source.name)) }
+            }
+            java.util.zip.ZipOutputStream(destination).use { zip ->
+                files.forEach { file ->
+                    zip.putNextEntry(java.util.zip.ZipEntry("archive/${file.name}"))
+                    file.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
+            }
+            return files.size
+        } finally {
+            snapshot.deleteRecursively()
+        }
+    }
 
     /**
      * Produces stable upload candidates without sealing or mutating a live working partition.

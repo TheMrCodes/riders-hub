@@ -29,6 +29,9 @@ respective owners.
   same logical ride and telemetry log.
 - A configurable low-board-battery warning and notification, with a 20%
   default and five-point adjustment steps.
+- Storage-mode reminders after 14 days without a recorded ride, with weekly
+  battery observations, a learned charging deadline, and a Home progress card
+  that disappears outside storage mode. See [storage reminders](docs/storage-reminders.md).
 - Local ride archives that preserve decoded telemetry and original BLE frames
   in compact, verified files.
 - Battery Longevity tracking with a speed-normalized full-charge estimate,
@@ -143,7 +146,7 @@ enables metrics, realtime, and analytics independently. Enrollment requires HTTP
 
 Core snapshots are best-effort every ten seconds while riding, while ride start
 and end events use a durable SQLite outbox. Realtime sends only the newest frame
-at most once per second. Optional precise GPS follows the logical ride through
+in five-second batches containing every buffered valid frame. Optional precise GPS is requested once before each batch and follows the logical ride through
 the reconnect grace period. Raw RHA and charger-observation synchronization
 share separate explicit consent scoped to both the URL and authenticated server
 identity. Charger COA files use their own endpoint and durable delivery ledger;
@@ -208,6 +211,14 @@ as the phone build. For Google Play distribution, publish both form-factor
 artifacts under the same listing and signing key. Modern Wear OS installs its
 artifact through Play on the compatible watch; a directly sideloaded phone APK
 does not embed or automatically sideload the watch APK.
+
+Phone and watch releases have independent version names and build codes in
+`gradle/libs.versions.toml`. See the [phone release notes](CHANGELOG.md),
+[watch release notes](wear/CHANGELOG.md) and
+[supported version pairs](docs/release-compatibility.json). Each app's distribution
+notes include the compatibility map. Advance only the app being released; use
+the distribution command's `--module phone` or `--module wear` option for a
+single-app release, or `--module both` for a coordinated release.
 
 ### Install on a watch from Android Studio
 
@@ -292,6 +303,7 @@ The receiver and sample values are absent from release builds.
 
 ## Technical documentation
 
+- [Versions and changes](CHANGELOG.md)
 - [Android app, lifecycle, and log schema](docs/android-logger.md)
 - [Backfire BLE API and evidence levels](docs/ble-api.md)
 - [Moving telemetry capture analysis](docs/capture-analysis-2026-08-25.md)

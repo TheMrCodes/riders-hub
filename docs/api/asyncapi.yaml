@@ -69,6 +69,7 @@ components:
           frame_at: { type: string, format: date-time }
           segment_elapsed_ms: { type: integer, minimum: 0, description: Android monotonic elapsed time within this capture segment. }
           speed_kmh: { type: number, minimum: 0 }
+          raw_hex: { type: string, pattern: "^[0-9a-fA-F]+$", maxLength: 8192, description: Original frame bytes as hexadecimal; new phone builds include this for common raw-frame storage. }
           location:
             type: object
             required: [fix_at, latitude, longitude]

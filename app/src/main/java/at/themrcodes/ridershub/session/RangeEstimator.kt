@@ -9,8 +9,6 @@ object RangeEstimator {
     private const val MIN_DISTANCE_KM = 1.0
     private const val MIN_DEPLETION_PERCENT = 5.0
     private const val MIN_BUCKET_COVERAGE_RATIO = 0.95
-    private const val BUCKET_PRIOR_STRENGTH_KM_SQUARED = 1.0
-    private const val BUCKET_MODEL_ITERATIONS = 40
 
     @JvmOverloads
     fun estimate(
@@ -71,7 +69,7 @@ object RangeEstimator {
 
         val aggregatePercentPerKm = 1.0 / aggregateKmPerPercent
         val bucketPercentPerKm = if (useAccumulated) accumulatedRates
-            else fitBucketConsumption(observations, aggregatePercentPerKm)
+            else fitBucketConsumption(observations)
         val commonProfile = boardStats?.measuredProfile().orEmpty()
             .ifEmpty { recentSpeedProfile(profileSessions, PROFILE_DISTANCE_KM) }
             .ifEmpty { pooledObservationProfile(observations) }
@@ -138,7 +136,6 @@ object RangeEstimator {
 
     private fun fitBucketConsumption(
         observations: List<DepletionObservation>,
-        aggregatePercentPerKm: Double,
     ): Map<Int, Double> {
         val bucketed = observations.filter { it.hasCompleteBucketCoverage() }
         val bucketStarts = bucketed
@@ -146,32 +143,51 @@ object RangeEstimator {
             .distinct()
             .sorted()
         if (bucketStarts.isEmpty()) return emptyMap()
-        if (bucketStarts.size == 1) return mapOf(bucketStarts.single() to aggregatePercentPerKm)
 
-        val percentPerKm = bucketStarts.associateWith { aggregatePercentPerKm }.toMutableMap()
-        repeat(BUCKET_MODEL_ITERATIONS) {
-            bucketStarts.forEach { bucket ->
-                var numerator = BUCKET_PRIOR_STRENGTH_KM_SQUARED * aggregatePercentPerKm
-                var denominator = BUCKET_PRIOR_STRENGTH_KM_SQUARED
-                bucketed.forEach observationLoop@{ observation ->
-                    val bucketDistance = observation.effectiveBuckets[bucket] ?: 0.0
-                    if (bucketDistance <= 0.0) return@observationLoop
-                    val depletionFromOtherBuckets = observation.effectiveBuckets.entries.sumOf {
-                        (otherBucket, distanceKm) ->
-                        if (otherBucket == bucket) 0.0
-                        else distanceKm * (percentPerKm[otherBucket] ?: aggregatePercentPerKm)
-                    }
-                    numerator += observation.measuredShare * bucketDistance *
-                        (observation.depletionPercent - depletionFromOtherBuckets)
-                    denominator += observation.measuredShare * bucketDistance * bucketDistance
+        val exposure = mutableMapOf<Int, Double>()
+        val measured = mutableMapOf<Int, Double>()
+        val target = mutableMapOf<Int, Double>()
+        val cross = mutableMapOf<Int, MutableMap<Int, Double>>()
+        val fittedDepletion = bucketed.sumOf { observation ->
+            observation.measuredShare * observation.depletionPercent
+        }
+        val squaredDepletion = bucketed.sumOf { observation ->
+            observation.measuredShare * observation.depletionPercent * observation.depletionPercent
+        }
+        val windowWeight = bucketed.sumOf { it.measuredShare }
+        bucketed.forEach { observation ->
+            observation.speedBucketDistancesKm.forEach { (bucket, distanceKm) ->
+                measured[bucket] = (measured[bucket] ?: 0.0) + distanceKm
+            }
+            observation.effectiveBuckets.forEach { (bucket, distanceKm) ->
+                exposure[bucket] = (exposure[bucket] ?: 0.0) +
+                    observation.measuredShare * distanceKm
+                target[bucket] = (target[bucket] ?: 0.0) + observation.measuredShare *
+                    distanceKm * observation.depletionPercent
+                val row = cross.getOrPut(bucket) { mutableMapOf() }
+                observation.effectiveBuckets.forEach { (column, columnDistanceKm) ->
+                    row[column] = (row[column] ?: 0.0) + observation.measuredShare *
+                        distanceKm * columnDistanceKm
                 }
-                percentPerKm[bucket] = (numerator / denominator).coerceIn(
-                    1.0 / MAX_KM_PER_PERCENT,
-                    1.0 / MIN_KM_PER_PERCENT,
-                )
             }
         }
-        return percentPerKm
+        val shape = SpeedBucketQuadraticFit.fit(
+            exposureKm = exposure,
+            target = target,
+            cross = cross,
+            supportedBuckets = measured.filterValues { it >= MIN_DISTANCE_KM }.keys,
+            weightedDepletion = fittedDepletion,
+            weightedSquaredDepletion = squaredDepletion,
+            windowWeight = windowWeight,
+            acceptedWindows = bucketed.size.toLong(),
+        )
+        val consumption = SpeedBucketConsumptionFit.quadratic(
+            exposure,
+            fittedDepletion,
+            shape.rollingCoefficient,
+            shape.aerodynamicCoefficientPerKmhSquared,
+        )
+        return consumption.rates.filterKeys { it !in consumption.limitBuckets }
     }
 
     private fun recentObservations(

@@ -136,15 +136,22 @@ internal class ApiDatabase(context: Context) : SQLiteOpenHelper(
         queryValue("source_id") ?: UUID.randomUUID().toString().also { putValue("source_id", it) }
     }
 
-    fun exportId(kind: String, localKey: String): String = writableDatabase.inTransactionResult {
-        rawQuery(
-            "SELECT export_id FROM identity_map WHERE kind=? AND local_key=?",
-            arrayOf(kind, localKey),
-        ).use { if (it.moveToFirst()) return@inTransactionResult it.getString(0) }
-        UUID.randomUUID().toString().also { generated ->
-            insertOrThrow("identity_map", null, ContentValues().apply {
-                put("kind", kind); put("local_key", localKey); put("export_id", generated)
-            })
+    fun exportId(kind: String, localKey: String): String {
+        if (kind == "board" && localKey.startsWith("board_")) {
+            return UUID.nameUUIDFromBytes(
+                ("riders-hub-api-board:v1:" + localKey.lowercase(java.util.Locale.ROOT)).toByteArray(Charsets.UTF_8),
+            ).toString()
+        }
+        return writableDatabase.inTransactionResult {
+            rawQuery(
+                "SELECT export_id FROM identity_map WHERE kind=? AND local_key=?",
+                arrayOf(kind, localKey),
+            ).use { if (it.moveToFirst()) return@inTransactionResult it.getString(0) }
+            UUID.randomUUID().toString().also { generated ->
+                insertOrThrow("identity_map", null, ContentValues().apply {
+                    put("kind", kind); put("local_key", localKey); put("export_id", generated)
+                })
+            }
         }
     }
 

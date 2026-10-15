@@ -16,8 +16,8 @@ android {
         applicationId = "at.themrcodes.ridershub"
         minSdk = 34
         targetSdk = 36
-        versionCode = 23
-        versionName = "0.7.3-test"
+        versionCode = libs.versions.phoneVersionCode.get().toInt()
+        versionName = libs.versions.phoneVersion.get()
 
         testInstrumentationRunner = "android.app.Instrumentation"
         manifestPlaceholders["appAuthRedirectScheme"] = oidcRedirectUri.substringBefore(':')

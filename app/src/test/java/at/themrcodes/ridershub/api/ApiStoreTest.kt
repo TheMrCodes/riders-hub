@@ -17,9 +17,13 @@ class ApiStoreTest {
     private val app = RuntimeEnvironment.getApplication()
     private val database = ApiDatabase(app)
     // Configuration state tests inject protection; production always uses the Android Keystore.
+    private var decryptions = 0
     private val protection = object : ApiCredentialProtection {
         override fun encrypt(value: String, purpose: String) = "$purpose|$value"
-        override fun decrypt(value: String, purpose: String) = value.removePrefix("$purpose|")
+        override fun decrypt(value: String, purpose: String): String {
+            decryptions++
+            return value.removePrefix("$purpose|")
+        }
     }
     private val store = ApiStore(app, protection, database)
 
@@ -95,6 +99,52 @@ class ApiStoreTest {
             .commit()
         assertNull(store.connection())
         assertFalse(store.snapshot().configured)
+    }
+
+    @Test fun repeatedReadsReuseIdentityButObserveChangesFromAnotherStore() {
+        val original = configure("https://one.example.test", "server-a")
+        val reads = decryptions
+        repeat(20) {
+            assertEquals(original, store.connection())
+            assertTrue(store.allows(original, "metrics"))
+            store.snapshot()
+        }
+        assertEquals(reads, decryptions)
+        val other = ApiStore(app, protection, database)
+        other.setEnabled(false)
+        assertFalse(store.allows(original, "metrics"))
+        other.setEnabled(true)
+        other.setGpsEnabled(true)
+        assertTrue(store.snapshot().gpsEnabled)
+        other.configureOidc("https://one.example.test", "rhd_" + "C".repeat(43))
+        val beforeRefresh = decryptions
+        assertNotEquals(original, store.connection())
+        assertEquals(beforeRefresh + 2, decryptions)
+        assertFalse(store.allows(original, "metrics"))
+        other.clearConfiguration()
+        assertNull(store.connection())
+        assertFalse(store.snapshot().configured)
+    }
+
+    @Test fun motionConsentIsIndependentAndScopedToAuthenticatedServer() {
+        val connection = configure("https://motion.example.test", "motion-server-a")
+        val response = JSONObject("""{"contract_version":1,"server_id":"motion-server-a","capabilities":{
+            "metrics":{"schema_version":1},"motion":{"schema_version":1,"max_batch_samples":4096,"max_upload_bytes":1048576}}}""")
+        store.saveCapabilities(connection.destinationId, response, parseCapabilities(response))
+        assertFalse(store.allows(connection, "motion"))
+        MotionStore.get(app).approve(connection.deliveryScope, true)
+        assertTrue(store.allows(connection, "motion"))
+        assertFalse(store.allows(connection, "analytics"))
+        store.setGpsEnabled(false)
+        assertTrue(store.allows(connection, "motion"))
+        MotionStore.get(app).approve(connection.deliveryScope, false)
+        assertFalse(store.allows(connection, "motion"))
+        assertTrue(store.allows(connection, "metrics"))
+        MotionStore.get(app).approve(connection.deliveryScope, true)
+        response.put("server_id", "motion-server-b")
+        store.saveCapabilities(connection.destinationId, response, parseCapabilities(response))
+        assertFalse(store.snapshot().motionEnabled)
+        assertFalse(store.allows(requireNotNull(store.connection()), "motion"))
     }
 
     private fun configure(url: String, server: String): ApiConnection {

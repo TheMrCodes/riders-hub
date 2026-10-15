@@ -42,6 +42,58 @@ class TelemetryArchiveTest {
         assertEquals(listOf(2), uploads.map { it.partitionSequence })
     }
 
+    @Test
+    fun localZipPreservesEveryPartitionAndCleansScratch() {
+        val root = temporaryRoot()
+        val archive = TelemetryArchive(targetPartitionBytes = 200L)
+        val sealed = archive.archiveFinalized(telemetryFile(root, "synthetic-sealed"), "synthetic-sealed")
+        val workingArchive = TelemetryArchive(targetPartitionBytes = 100 * 1024L)
+        workingArchive.archiveFinalized(telemetryFile(root, "synthetic-working"), "synthetic-working")
+        File(sealed.archiveDirectory, ".unrelated.tmp").writeText("Synthetic temporary data")
+        val originals = sealed.archiveDirectory.listFiles()!!.filter { it.extension in setOf("rha", "rhp") }
+            .associate { "archive/${it.name}" to it.readBytes() }
+        assertTrue(originals.keys.any { it.endsWith(".rha") })
+        assertTrue(originals.keys.any { it.endsWith(".rhp") })
+        val scratch = File(root, "scratch")
+        val output = java.io.ByteArrayOutputStream()
+        assertEquals(originals.size, archive.exportZip(sealed.archiveDirectory, scratch, output))
+        val entries = mutableMapOf<String, ByteArray>()
+        java.util.zip.ZipInputStream(output.toByteArray().inputStream()).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                entries[entry.name] = zip.readBytes()
+            }
+        }
+        assertEquals(originals.keys, entries.keys)
+        originals.forEach { (name, bytes) -> assertArrayEquals(bytes, entries[name]) }
+        assertTrue(scratch.listFiles()!!.isEmpty())
+        originals.forEach { (name, bytes) -> assertArrayEquals(bytes, File(sealed.archiveDirectory, name.substringAfter('/')).readBytes()) }
+    }
+
+    @Test
+    fun localZipCleansSnapshotWhenDestinationFails() {
+        val root = temporaryRoot()
+        val archive = TelemetryArchive()
+        val saved = archive.archiveFinalized(telemetryFile(root, "synthetic-failure"), "synthetic-failure")
+        val scratch = File(root, "scratch")
+        val output = object : java.io.OutputStream() {
+            override fun write(value: Int) { throw java.io.IOException("Synthetic full destination") }
+        }
+        assertTrue(runCatching { archive.exportZip(saved.archiveDirectory, scratch, output) }.isFailure)
+        assertTrue(scratch.listFiles()!!.isEmpty())
+        assertTrue(saved.storageFile.exists())
+    }
+
+    @Test
+    fun emptyLocalArchiveDoesNotProduceASuccessfulBackup() {
+        val root = temporaryRoot()
+        val scratch = File(root, "scratch")
+        assertTrue(runCatching {
+            TelemetryArchive().exportZip(File(root, "missing"), scratch, java.io.ByteArrayOutputStream())
+        }.isFailure)
+        assertTrue(scratch.listFiles()!!.isEmpty())
+    }
+
     @After
     fun cleanUp() {
         temporaryRoots.forEach { root ->
@@ -84,7 +136,9 @@ class TelemetryArchiveTest {
     @Test
     fun sameRemoteAppendsWithoutRewritingExistingPartitionBytes() {
         val root = temporaryRoot()
-        val archive = TelemetryArchive(targetPartitionBytes = 100 * 1024L)
+        // This test exercises append integrity, so diagnostic payload growth must not
+        // accidentally turn it into a partition-sealing test.
+        val archive = TelemetryArchive(targetPartitionBytes = Long.MAX_VALUE)
         val first = archive.archiveFinalized(telemetryFile(root, "session-one"), "session-one")
         val originalPrefix = first.storageFile.readBytes()
         val second = archive.archiveFinalized(telemetryFile(root, "session-two"), "session-two")

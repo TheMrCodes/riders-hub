@@ -55,7 +55,12 @@ internal class ApiClient private constructor(
             .post(payload.toRequestBody(JSON))
             .build()
         client.newCall(request).execute().use { response ->
-            acknowledged(response)
+            if (response.code !in 200..299) {
+                val publicError = runCatching { readBoundedJson(response).optString("error") }
+                    .getOrNull()
+                    ?.takeIf { it == "OIDC provider is unavailable" || it == "device registration is unavailable" }
+                throw ApiHttpException(response.code, response.header("Retry-After"), publicError)
+            }
             return runCatching { parseDeviceRegistration(readBoundedJson(response), sourceId) }
                 .getOrElse { throw IOException("Invalid device registration response", it) }
         }
@@ -85,6 +90,10 @@ internal class ApiClient private constructor(
             .getOrElse { throw IOException("Response was not valid JSON", it) }
     }
 
+    fun postMotion(connection: ApiConnection, payload: String): Int =
+        executeAcknowledged(connection, "motion", authenticated(connection, apiUrls(connection.baseUrl).motionBatches())
+            .post(payload.toRequestBody(JSON)).build())
+
     fun postMetric(connection: ApiConnection, payload: String): Int =
         executeAcknowledged(connection, "metrics", metricRequest(connection, payload))
 
@@ -95,14 +104,28 @@ internal class ApiClient private constructor(
         authenticated(connection, apiUrls(connection.baseUrl).metrics).post(payload.toRequestBody(JSON)).build()
 
     fun uploadArchive(connection: ApiConnection, sourceId: String, partitionSequence: Int, file: File,
-                      entries: Int, final: Boolean, compressedDigest: String, uncompressedDigest: String): Int =
-        executeAcknowledged(connection, "analytics", archiveRequest(connection, sourceId, partitionSequence,
-            file, entries, final, compressedDigest, uncompressedDigest))
+                      entries: Int, final: Boolean, compressedDigest: String, uncompressedDigest: String): Int {
+        val request = archiveRequest(connection, sourceId, partitionSequence,
+            file, entries, final, compressedDigest, uncompressedDigest)
+        if (final && archiveAlreadyStored { executeAcknowledged(connection, "analytics", request.newBuilder().head().build()) }) return 204
+        return executeAcknowledged(connection, "analytics", request)
+    }
 
     suspend fun uploadArchiveDurable(connection: ApiConnection, sourceId: String, partitionSequence: Int, file: File,
-                                     entries: Int, final: Boolean, compressedDigest: String, uncompressedDigest: String): Int =
-        executeAcknowledgedAsync(connection, "analytics", archiveRequest(connection, sourceId, partitionSequence,
-            file, entries, final, compressedDigest, uncompressedDigest))
+                                     entries: Int, final: Boolean, compressedDigest: String, uncompressedDigest: String): Int {
+        val request = archiveRequest(connection, sourceId, partitionSequence,
+            file, entries, final, compressedDigest, uncompressedDigest)
+        if (final && archiveAlreadyStored { executeAcknowledgedAsync(connection, "analytics", request.newBuilder().head().build()) }) return 204
+        return executeAcknowledgedAsync(connection, "analytics", request)
+    }
+
+    // A missing archive or an older server without HEAD support falls back to PUT.
+    // Authentication, overload and network failures retain the normal retry policy.
+    private inline fun archiveAlreadyStored(check: () -> Int): Boolean = try {
+        check() == 204
+    } catch (error: ApiHttpException) {
+        if (error.statusCode == 404 || error.statusCode == 405) false else throw error
+    }
 
     private fun archiveRequest(connection: ApiConnection, sourceId: String, partitionSequence: Int, file: File,
                                entries: Int, final: Boolean, compressedDigest: String, uncompressedDigest: String) =
@@ -147,11 +170,15 @@ internal class ApiClient private constructor(
             checkAllowed(connection, channel)
             client.newCall(request).also {
                 if (channel == "analytics") it.timeout().timeout(8, TimeUnit.MINUTES)
+                if (channel == "motion") synchronized(MOTION_CALLS) {
+                    checkAllowed(connection, channel)
+                    MOTION_CALLS.add(it)
+                }
                 CALLS.add(it)
             }
         }
 
-    private fun forget(call: Call) { synchronized(ApiStore.CONFIG_LOCK) { CALLS.remove(call) } }
+    private fun forget(call: Call) { synchronized(ApiStore.CONFIG_LOCK) { CALLS.remove(call); synchronized(MOTION_CALLS) { MOTION_CALLS.remove(call) } } }
 
     private fun executeAcknowledged(connection: ApiConnection, channel: String, request: Request): Int {
         val call = newCall(connection, channel, request)
@@ -192,6 +219,10 @@ internal class ApiClient private constructor(
         private val COA = "application/vnd.ridershub.coa;version=1".toMediaType()
         private val CLIENTS = Collections.newSetFromMap(WeakHashMap<OkHttpClient, Boolean>())
         private val CALLS = mutableSetOf<Call>()
+        private val MOTION_CALLS = mutableSetOf<Call>()
+        fun cancelMotionTransports() = synchronized(MOTION_CALLS) {
+            MOTION_CALLS.toList().forEach { it.cancel() }
+        }
         private val SOCKETS = Collections.newSetFromMap(WeakHashMap<WebSocket, Boolean>())
 
         private fun defaultClient() = OkHttpClient.Builder()
@@ -216,6 +247,7 @@ internal class ApiDeliveryCancelled : IOException("API delivery configuration is
 internal class ApiHttpException(
     val statusCode: Int,
     val retryAfter: String? = null,
+    val publicError: String? = null,
 ) : IOException("HTTP $statusCode") {
     val retryable: Boolean get() = statusCode == 408 || statusCode == 429 || statusCode >= 500
     val unauthorized: Boolean get() = statusCode == 401 || statusCode == 403

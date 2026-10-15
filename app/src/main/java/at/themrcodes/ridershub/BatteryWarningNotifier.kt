@@ -25,15 +25,28 @@ class BatteryWarningNotifier(private val context: Context) {
         sessionId: String,
         batteryPercent: Int,
         packVoltageV: Double,
+        chargingBehaviorThresholdPercent: Int? = null,
         nowEpochMs: Long = System.currentTimeMillis(),
     ) {
         val warningPercent = generalSettings.snapshot().lowBatteryWarningPercent
-        if (!shouldNotifyLowBoardBattery(batteryPercent, packVoltageV, warningPercent)) return
+        val rideEndThreshold = rideEndChargingReminderThreshold(
+            warningPercent,
+            chargingBehaviorThresholdPercent,
+        )
+        if (!shouldNotifyLowBoardBattery(batteryPercent, packVoltageV, rideEndThreshold)) return
         val lastNotificationAtEpochMs = preferences
             .takeIf { it.contains(KEY_LAST_BOARD_NOTIFICATION_AT) }
             ?.getLong(KEY_LAST_BOARD_NOTIFICATION_AT, 0L)
         if (!shouldNotifyLowBatteryRideEndReminder(lastNotificationAtEpochMs, nowEpochMs)) return
-        notifyBoard(sessionId, batteryPercent, packVoltageV, nowEpochMs)
+        notifyBoard(
+            sessionId,
+            batteryPercent,
+            packVoltageV,
+            nowEpochMs,
+            chargingBehaviorThresholdPercent?.takeIf {
+                batteryPercent <= it && batteryPercent > warningPercent
+            },
+        )
     }
 
     private fun notifyBoard(
@@ -41,6 +54,7 @@ class BatteryWarningNotifier(private val context: Context) {
         batteryPercent: Int,
         packVoltageV: Double,
         nowEpochMs: Long = System.currentTimeMillis(),
+        chargingBehaviorThresholdPercent: Int? = null,
     ) {
         if (context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -52,10 +66,21 @@ class BatteryWarningNotifier(private val context: Context) {
             Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val title = if (chargingBehaviorThresholdPercent == null) {
+            "Board battery is low"
+        } else {
+            "Charge before the next ride"
+        }
+        val body = if (chargingBehaviorThresholdPercent == null) {
+            "$batteryPercent% remaining (${"%.1f".format(Locale.US, packVoltageV)} V). Recharge before the next ride."
+        } else {
+            "$batteryPercent% remaining. Your confirmed charging history suggests charging around " +
+                "$chargingBehaviorThresholdPercent% or below."
+        }
         val notification = Notification.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Board battery is low")
-            .setContentText("$batteryPercent% remaining (${"%.1f".format(Locale.US, packVoltageV)} V). Recharge before the next ride.")
+            .setContentTitle(title)
+            .setContentText(body)
             .setContentIntent(openApp)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_STATUS)
@@ -92,5 +117,10 @@ internal fun shouldNotifyLowBatteryRideEndReminder(
     nowEpochMs: Long,
 ): Boolean = lastNotificationAtEpochMs == null ||
     nowEpochMs - lastNotificationAtEpochMs >= LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS
+
+internal fun rideEndChargingReminderThreshold(
+    configuredLowBatteryPercent: Int,
+    learnedChargingPercent: Int?,
+): Int = maxOf(configuredLowBatteryPercent, learnedChargingPercent ?: configuredLowBatteryPercent)
 
 internal const val LOW_BATTERY_RIDE_END_REMINDER_COOLDOWN_MS = 2 * 60 * 60 * 1_000L

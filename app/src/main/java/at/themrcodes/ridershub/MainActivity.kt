@@ -1,12 +1,24 @@
 package at.themrcodes.ridershub
 
 import android.Manifest
+import at.themrcodes.ridershub.storage.StorageModeStore
+import at.themrcodes.ridershub.storage.StorageState
+import at.themrcodes.ridershub.storage.StorageNotifications
+import at.themrcodes.ridershub.storage.StorageProgressCard
+import at.themrcodes.ridershub.session.pseudonymousBoardId
 import android.content.Intent
 import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.provider.DocumentsContract
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import at.themrcodes.ridershub.log.TelemetryArchive
+import java.io.File
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -76,6 +88,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -97,12 +110,16 @@ import at.themrcodes.ridershub.session.BatteryLongevitySnapshot
 import at.themrcodes.ridershub.session.BatteryLongevityStatus
 import at.themrcodes.ridershub.session.LongevityGranularity
 import at.themrcodes.ridershub.session.RideStore
+import at.themrcodes.ridershub.session.ArchiveReplayState
 import at.themrcodes.ridershub.session.RideStoreSnapshot
 import at.themrcodes.ridershub.session.RideSummary
 import at.themrcodes.ridershub.session.TripHistoryGroups
 import at.themrcodes.ridershub.session.TripHistoryGroup
 import at.themrcodes.ridershub.session.BoardSpeedBucketStatistics
+import at.themrcodes.ridershub.session.BoardModelCatalog
+import at.themrcodes.ridershub.session.RiderBoardProfile
 import at.themrcodes.ridershub.api.ApiIntegration
+import at.themrcodes.ridershub.api.ApiHttpException
 import at.themrcodes.ridershub.api.ApiSnapshot
 import at.themrcodes.ridershub.api.OidcAuthConfig
 import at.themrcodes.ridershub.api.apiUrls
@@ -139,7 +156,36 @@ class MainActivity : ComponentActivity() {
     private var developerTapCount = 0
     private var dashboard by mutableStateOf<DashboardState?>(null)
     private var chargerPromptToken by mutableStateOf<String?>(null)
+    private var storageOpenToken by mutableStateOf(0)
     private var pendingOidcBaseUrl: String? = null
+    private var oidcSignInPending by mutableStateOf(false)
+    private var oidcSignInError by mutableStateOf<String?>(null)
+
+    private var archiveExportBusy by mutableStateOf(false)
+    private var archiveExportMessage by mutableStateOf<String?>(null)
+    private val archiveExportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri == null) {
+            archiveExportBusy = false
+        } else {
+            lifecycleScope.launch {
+                val appContext = applicationContext
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val telemetry = appContext.getExternalFilesDir("telemetry") ?: File(appContext.filesDir, "telemetry")
+                        val output = appContext.contentResolver.openOutputStream(uri, "wt") ?: error("Cannot open destination")
+                        output.use { TelemetryArchive().exportZip(File(telemetry, "archive"), appContext.cacheDir, it) }
+                    }.onFailure {
+                        runCatching { DocumentsContract.deleteDocument(appContext.contentResolver, uri) }
+                    }
+                }
+                archiveExportBusy = false
+                archiveExportMessage = result.fold(
+                    onSuccess = { "Saved $it archive files in one ZIP." },
+                    onFailure = { "Export failed. Check that local archives exist and the destination has enough space, then retry." },
+                )
+            }
+        }
+    }
 
     private val oidcAuthorizationLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -148,9 +194,8 @@ class MainActivity : ComponentActivity() {
         val response = intent?.let(AuthorizationResponse::fromIntent)
         val authorizationError = intent?.let(AuthorizationException::fromIntent)
         if (response == null) {
-            state.setError(if (authorizationError != null) "SSO authorization failed" else "SSO sign-in was cancelled")
+            reportOidcSignInError(if (authorizationError != null) "SSO authorization failed" else "SSO sign-in was cancelled")
             pendingOidcBaseUrl = null
-            dashboard = loadDashboard()
             return@registerForActivityResult
         }
         authorizationService.performTokenRequest(response.createTokenExchangeRequest()) { tokenResponse, tokenError ->
@@ -159,10 +204,20 @@ class MainActivity : ComponentActivity() {
                 val baseUrl = pendingOidcBaseUrl
                 pendingOidcBaseUrl = null
                 if (accessToken == null || baseUrl == null || tokenError != null) {
-                    state.setError("SSO token exchange failed")
+                    reportOidcSignInError("SSO token exchange failed")
                 } else {
-                    runCatching { api.completeOidcEnrollment(baseUrl, accessToken) }
-                        .onFailure { state.setError(it.message ?: "Could not enroll this device") }
+                    runCatching {
+                        api.completeOidcEnrollment(baseUrl, accessToken) { outcome, step ->
+                            outcome.onSuccess { oidcSignInPending = false }
+                                .onFailure { error ->
+                                    val detail = if (error is ApiHttpException) {
+                                        " (HTTP ${error.statusCode})" + (error.publicError?.let { ": $it" } ?: "")
+                                    } else ""
+                                    reportOidcSignInError("$step failed$detail; check the server configuration")
+                                }
+                            dashboard = loadDashboard()
+                        }
+                    }.onFailure { reportOidcSignInError("Could not enroll this device") }
                 }
                 dashboard = loadDashboard()
             }
@@ -254,6 +309,11 @@ class MainActivity : ComponentActivity() {
                 }
                 RidersHubDashboard(
                     dashboard = dashboard ?: loadDashboard(),
+                    storageOpenToken = storageOpenToken,
+                    onStorageAnswer = { enable ->
+                        StorageModeStore.get(this).answer(enable)
+                        dashboard = loadDashboard()
+                    },
                     associationInProgress = associationInProgress,
                     expertControlsUnlocked = expertControlsUnlocked,
                     onAssociate = { requestAssociationWithPermissions(CompanionRole.BOARD_REMOTE) },
@@ -266,14 +326,30 @@ class MainActivity : ComponentActivity() {
                     onVersionTap = ::onVersionTapped,
                     onSetChildLimiter = ::requestChildLimiter,
                     onSetLowBatteryWarningPercent = ::setLowBatteryWarningPercent,
+                    onSetRiderBoardProfile = ::setRiderBoardProfile,
                     onSetApiEnabled = api::setEnabled,
                     onStartOidc = ::startOidcEnrollment,
+                    onClearOidcError = { oidcSignInError = null },
+                    oidcSignInPending = oidcSignInPending,
+                    oidcSignInError = oidcSignInError,
                     onDisconnectApi = api::clearConfiguration,
                     onRefreshApi = api::refreshCapabilities,
                     onSyncApi = api::manualSync,
                     onSetAnalytics = api::approveAnalytics,
                     onResyncArchives = api::resyncArchives,
                     onSetGps = ::setGpsEnabled,
+                    onSetMotion = api::setMotionEnabled,
+                    archiveExportBusy = archiveExportBusy,
+                    archiveExportMessage = archiveExportMessage,
+                    onExportArchive = {
+                        archiveExportBusy = true
+                        archiveExportMessage = null
+                        archiveExportLauncher.launch("ridershub-archive.zip")
+                    },
+                    onReplayArchive = {
+                        rideStore.replayCurrentArchive()
+                        dashboard = loadDashboard()
+                    },
                 )
             }
         }
@@ -284,9 +360,24 @@ class MainActivity : ComponentActivity() {
         val restingVoltage = app.packVoltageV
             ?.takeIf { (app.speedKmh ?: Float.MAX_VALUE) <= 0.5f }
             ?.toDouble()
+        val rides = rideStore.snapshot(app.boardBatteryPercent, restingVoltage)
+        val storage = StorageModeStore.get(this)
+        app.address?.let { address ->
+            val board = pseudonymousBoardId(address)
+            if (storage.snapshot().boardId != board) {
+                val lastRideAt = (rides.recentTracks + listOfNotNull(rides.activeRide, rides.lastCompletedRide))
+                    .filter { it.localBoardId == board && it.distanceKm > 0.1 }
+                    .mapNotNull { ride -> runCatching { Instant.parse(ride.lastFrameAt ?: ride.endedAt ?: ride.startedAt).toEpochMilli() }.getOrNull() }
+                    .maxOrNull() ?: System.currentTimeMillis()
+                storage.selectBoard(board, lastRideAt)
+            }
+        }
         return DashboardState(
             app = app,
-            rides = rideStore.snapshot(app.boardBatteryPercent, restingVoltage),
+            rides = rides,
+            storage = storage.snapshot(),
+            storageNotificationsAvailable = StorageNotifications.available(this),
+            archiveReplay = rideStore.archiveReplayState(),
             generalSettings = generalSettings.snapshot(),
             api = api.snapshot(),
             charger = chargerStore.snapshot(),
@@ -298,14 +389,32 @@ class MainActivity : ComponentActivity() {
         dashboard = loadDashboard()
     }
 
+    private fun setRiderBoardProfile(profile: RiderBoardProfile) {
+        generalSettings.setRiderBoardProfile(profile)
+        dashboard = loadDashboard()
+    }
+
     private fun startOidcEnrollment(baseUrl: String) {
+        oidcSignInPending = true
+        oidcSignInError = null
         runCatching {
             api.prepareOidcEnrollment(baseUrl) { outcome ->
                 outcome.onSuccess { config -> discoverOidcAndAuthorize(baseUrl, config) }
-                    .onFailure { state.setError("Could not load the API SSO configuration") }
+                    .onFailure { error ->
+                        val detail = if (error is ApiHttpException) " (HTTP ${error.statusCode})" else ""
+                        reportOidcSignInError("Could not load SSO settings from this API$detail. Check the URL and server availability.")
+                    }
                 dashboard = loadDashboard()
             }
-        }.onFailure { state.setError(it.message ?: "Could not start SSO enrollment") }
+        }.onFailure { reportOidcSignInError(it.message ?: "Could not start SSO sign-in") }
+        dashboard = loadDashboard()
+    }
+
+    private fun reportOidcSignInError(message: String) {
+        pendingOidcBaseUrl = null
+        oidcSignInPending = false
+        oidcSignInError = message
+        state.setError(message)
         dashboard = loadDashboard()
     }
 
@@ -313,13 +422,14 @@ class MainActivity : ComponentActivity() {
         AuthorizationServiceConfiguration.fetchFromIssuer(Uri.parse(config.issuer)) { serviceConfig, error ->
             runOnUiThread {
                 if (serviceConfig == null || error != null) {
-                    state.setError("Could not discover the configured identity provider")
-                    dashboard = loadDashboard()
+                    reportOidcSignInError("Could not discover the configured identity provider")
                     return@runOnUiThread
                 }
-                val request = oidcAuthorizationRequest(serviceConfig, config)
-                pendingOidcBaseUrl = apiUrls(baseUrl).base.toString().removeSuffix("/")
-                oidcAuthorizationLauncher.launch(authorizationService.getAuthorizationRequestIntent(request))
+                runCatching {
+                    val request = oidcAuthorizationRequest(serviceConfig, config)
+                    pendingOidcBaseUrl = apiUrls(baseUrl).base.toString().removeSuffix("/")
+                    oidcAuthorizationLauncher.launch(authorizationService.getAuthorizationRequestIntent(request))
+                }.onFailure { reportOidcSignInError("Could not open SSO sign-in in a browser") }
             }
         }
     }
@@ -357,6 +467,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleChargerPromptIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("open_storage", false) == true) {
+            storageOpenToken++
+            intent.removeExtra("open_storage")
+        }
         if (intent?.getBooleanExtra(ChargerControl.EXTRA_OPEN_PROMPT, false) == true) {
             val supplied = intent.getStringExtra(ChargerControl.EXTRA_APPEARANCE_TOKEN)
             chargerPromptToken = supplied?.takeIf { it == chargerStore.snapshot().appearanceToken }
@@ -493,9 +607,14 @@ class MainActivity : ComponentActivity() {
 private data class DashboardState(
     val app: AppSnapshot,
     val rides: RideStoreSnapshot,
+    val archiveReplay: ArchiveReplayState,
     val generalSettings: GeneralSettingsSnapshot,
     val api: ApiSnapshot,
     val charger: ChargerSnapshot,
+    val storage: StorageState,
+    val storageNotificationsAvailable: Boolean,
+    // Refresh date-dependent storage UI even when disconnected telemetry is unchanged.
+    val currentMinute: Long = System.currentTimeMillis() / 60_000,
 )
 
 private val NothingRed = Color(0xFFD71921)
@@ -530,6 +649,8 @@ private fun RidersHubTheme(content: @Composable () -> Unit) {
 @Composable
 private fun RidersHubDashboard(
     dashboard: DashboardState,
+    storageOpenToken: Int,
+    onStorageAnswer: (Boolean) -> Unit,
     associationInProgress: Boolean,
     expertControlsUnlocked: Boolean,
     onAssociate: () -> Unit,
@@ -542,14 +663,23 @@ private fun RidersHubDashboard(
     onVersionTap: () -> Unit,
     onSetChildLimiter: (Boolean) -> Unit,
     onSetLowBatteryWarningPercent: (Int) -> Unit,
+    onSetRiderBoardProfile: (RiderBoardProfile) -> Unit,
     onSetApiEnabled: (Boolean) -> Unit,
     onStartOidc: (String) -> Unit,
+    onClearOidcError: () -> Unit,
+    oidcSignInPending: Boolean,
+    oidcSignInError: String?,
     onDisconnectApi: () -> Unit,
     onRefreshApi: () -> Unit,
     onSyncApi: () -> Unit,
     onSetAnalytics: (Boolean) -> Unit,
     onResyncArchives: () -> Unit,
     onSetGps: (Boolean) -> Unit,
+    onSetMotion: (Boolean) -> Unit,
+    archiveExportBusy: Boolean,
+    archiveExportMessage: String?,
+    onExportArchive: () -> Unit,
+    onReplayArchive: () -> Unit,
 ) {
     val app = dashboard.app
     val rides = dashboard.rides
@@ -558,7 +688,10 @@ private fun RidersHubDashboard(
         TripHistoryGroups.build(rides.recentTracks, today)
     }
     var expandedHistoryGroups by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var apiBaseUrl by rememberSaveable { mutableStateOf(dashboard.api.baseUrl.orEmpty()) }
     var page by remember { mutableStateOf(DashboardPage.OVERVIEW) }
+    var storagePromptDismissed by remember(storageOpenToken) { mutableStateOf(false) }
+    LaunchedEffect(storageOpenToken) { page = DashboardPage.OVERVIEW }
     var pendingLimiterChoice by remember { mutableStateOf<Boolean?>(null) }
     var pendingApiRemoval by remember { mutableStateOf(false) }
     fun leaveDevicePage() { page = DashboardPage.OVERVIEW }
@@ -585,6 +718,11 @@ private fun RidersHubDashboard(
                     app.error?.let { message -> item {
                         Box(Modifier.padding(bottom = 24.dp)) { ErrorWidget(message) }
                     } }
+                    if (dashboard.storage.enabled) {
+                        item(key = "storage-progress") {
+                            StorageProgressCard(dashboard.storage, dashboard.currentMinute * 60_000, dashboard.storageNotificationsAvailable, onOpenSettings)
+                        }
+                    }
                     item {
                         Box(Modifier.padding(bottom = 24.dp)) {
                             CurrentTripWidget(
@@ -596,6 +734,9 @@ private fun RidersHubDashboard(
                     }
                     item { RangeWidget(rides.rangeEstimate, Modifier.padding(top = 12.dp, bottom = 24.dp)) }
                     item { RidersProfileSection(rides.speedBucketStatistics, Modifier.padding(top = 12.dp, bottom = 24.dp)) }
+                    rides.speedBucketStatistics?.takeIf { it.profileBuckets(true).isNotEmpty() }?.let { statistics ->
+                        item { RidingOverheads(statistics, Modifier.padding(bottom = 24.dp)) }
+                    }
                     item {
                         BatteryLongevitySection(
                             rides.batteryLongevity,
@@ -649,6 +790,8 @@ private fun RidersHubDashboard(
                         GeneralSettingsSection(
                             lowBatteryWarningPercent = dashboard.generalSettings.lowBatteryWarningPercent,
                             onSetLowBatteryWarningPercent = onSetLowBatteryWarningPercent,
+                            riderBoardProfile = dashboard.generalSettings.riderBoardProfile,
+                            onSetRiderBoardProfile = onSetRiderBoardProfile,
                         )
                     }
                     if (expertControlsUnlocked) {
@@ -662,6 +805,13 @@ private fun RidersHubDashboard(
                     item {
                         SelfHostedApiSection(
                             state = dashboard.api,
+                            baseUrl = apiBaseUrl,
+                            onBaseUrlChange = {
+                                apiBaseUrl = it
+                                onClearOidcError()
+                            },
+                            oidcSignInPending = oidcSignInPending,
+                            oidcSignInError = oidcSignInError,
                             onSetEnabled = onSetApiEnabled,
                             onStartOidc = onStartOidc,
                             onRequestRemoval = { pendingApiRemoval = true },
@@ -670,12 +820,38 @@ private fun RidersHubDashboard(
                             onSetAnalytics = onSetAnalytics,
                             onResyncArchives = onResyncArchives,
                             onSetGps = onSetGps,
+                            onSetMotion = onSetMotion,
                         )
                     }
                     item { AppSection(onOpenSettings = onOpenSettings, onVersionTap = onVersionTap) }
+                    item {
+                        Column {
+                            ArchiveReplaySection(
+                                state = dashboard.archiveReplay,
+                                recording = rides.activeRide != null,
+                                onReplay = onReplayArchive,
+                            )
+                            Spacer(Modifier.height(24.dp))
+                            SectionTitle("Export archive", "Save all local archive partitions in one ZIP file.")
+                            Spacer(Modifier.height(16.dp))
+                            Button(onClick = onExportArchive, enabled = !archiveExportBusy, modifier = Modifier.fillMaxWidth()) {
+                                Text(if (archiveExportBusy) "EXPORTING ARCHIVE…" else "EXPORT LOCAL ARCHIVE")
+                            }
+                            archiveExportMessage?.let { NothingText(it, color = NothingMuted, size = 11, lineHeight = 17) }
+                        }
+                    }
                 }
             }
         }
+    }
+    if (dashboard.storage.offerDue(System.currentTimeMillis()) && !storagePromptDismissed) {
+        AlertDialog(
+            onDismissRequest = { storagePromptDismissed = true },
+            title = { Text("Activate storage mode?") },
+            text = { Text("No recorded ride for 14 days. Connect your board to record its starting charge, then check in weekly while Riders Hub learns its battery loss. A ride over 0.1 km ends storage mode.") },
+            confirmButton = { TextButton(onClick = { onStorageAnswer(true) }) { Text("ACTIVATE") } },
+            dismissButton = { TextButton(onClick = { onStorageAnswer(false) }) { Text("NO") } },
+        )
     }
     pendingLimiterChoice?.let { enabled ->
         LimiterConfirmationDialog(
@@ -932,55 +1108,20 @@ private fun RangeWidget(estimate: RangeEstimate, modifier: Modifier = Modifier) 
 @Composable
 private fun RidersProfileSection(statistics: BoardSpeedBucketStatistics?, modifier: Modifier = Modifier) {
     var energyUse by rememberSaveable { mutableStateOf(false) }
-    val buckets = statistics?.buckets.orEmpty().filter {
-        it.measuredDistanceKm > 0 || it.inferredDistanceKm > 0 ||
-            it.calibrationMeasuredKm > 0 || it.calibrationInferredKm > 0
-    }.sortedBy { it.startKmh }
-    val values = buckets.map {
-        (if (energyUse) it.batteryPercentPer100Km?.div(100.0).takeUnless { _ -> it.modelLimitReached } else it.distanceSharePercent)
-            ?.takeIf { value -> value.isFinite() && value >= 0 }
-    }
-    val maximum = values.filterNotNull().maxOrNull()?.coerceAtLeast(0.001) ?: 1.0
     Column(modifier.fillMaxWidth()) {
         NothingText("Riders Profile", size = 22, weight = FontWeight.Bold)
         Spacer(Modifier.height(7.dp))
         NothingText("Your riding mix and battery use by speed", color = NothingMuted, size = 11, lineHeight = 17)
         Spacer(Modifier.height(12.dp))
-        NothingText(if (energyUse) "Energy use · % / km" else "Distance %", color = NothingMuted, size = 9)
-        Spacer(Modifier.height(8.dp))
-        if (buckets.isEmpty()) {
-            NothingText("Collecting ride data", color = NothingMuted, size = 10)
-        } else {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                buckets.forEachIndexed { index, bucket ->
-                    val value = values[index]
-                    val supported = !energyUse || bucket.hasUsableConsumptionSupport
-                    val color = if (supported) NothingWhite else NothingLine
-                    Column(Modifier.weight(1f).semantics(mergeDescendants = true) {
-                        contentDescription = "${bucket.startKmh} to ${bucket.startKmh + 5} km/h, " +
-                            (value?.let { UiFormat.decimal(it, if (energyUse) 2 else 1) } ?: "no estimate") +
-                            (if (energyUse) " battery percentage points per kilometre" else " percent of distance") +
-                            if (supported) "" else ", insufficient support"
-                    }, horizontalAlignment = Alignment.CenterHorizontally) {
-                        NothingText(value?.let { UiFormat.decimal(it, if (energyUse) 2 else 0) } ?: "—",
-                            color = if (supported) NothingWhite else NothingMuted, size = 8)
-                        Spacer(Modifier.height(4.dp))
-                        Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.BottomCenter) {
-                            if (value != null && value > 0) {
-                                Box(Modifier.fillMaxWidth().height((100 * value / maximum).toFloat().dp)
-                                    .background(color))
-                            } else if (energyUse) {
-                                Box(Modifier.fillMaxWidth().height(3.dp).background(NothingLine))
-                            }
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        NothingText("${bucket.startKmh}–${bucket.startKmh + 5}", color = NothingMuted, size = 8)
-                    }
-                }
-            }
-            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                NothingText(if (energyUse) "Gray = low support · — = unavailable" else "", color = NothingMuted, size = 8)
-                NothingText("km/h", color = NothingMuted, size = 8)
+        // Measure both views to reserve their natural height, including larger font settings.
+        // Only the selected chart is placed, drawn and exposed to accessibility services.
+        Layout(content = {
+            RidersProfileChart(statistics, energyUse = false)
+            RidersProfileChart(statistics, energyUse = true)
+        }, modifier = Modifier.fillMaxWidth()) { measurables, constraints ->
+            val charts = measurables.map { it.measure(constraints) }
+            layout(charts.maxOf { it.width }, charts.maxOf { it.height }) {
+                charts[if (energyUse) 1 else 0].placeRelative(0, 0)
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -997,6 +1138,98 @@ private fun RidersProfileSection(statistics: BoardSpeedBucketStatistics?, modifi
                             size = 11, weight = FontWeight.Bold)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RidersProfileChart(statistics: BoardSpeedBucketStatistics?, energyUse: Boolean) {
+    val buckets = statistics?.profileBuckets(energyUse).orEmpty()
+    val values = buckets.map {
+        (if (energyUse) it.batteryPercentPer100Km?.div(100.0) else it.distanceSharePercent)
+            ?.takeIf { value -> value.isFinite() && value >= 0 }
+    }
+    val maximum = values.filterNotNull().maxOrNull()?.coerceAtLeast(0.001) ?: 1.0
+    val minimum = values.filterNotNull().minOrNull() ?: maximum
+    // A nearly flat cruise curve must not round to identical labels.
+    val energyDecimals = if (maximum > 0 && (maximum - minimum) / maximum < 0.05) 3 else 2
+    Column(Modifier.fillMaxWidth()) {
+        NothingText(if (energyUse) "Energy use · % / km" else "Distance % · supported speeds", color = NothingMuted, size = 9)
+        Spacer(Modifier.height(8.dp))
+        if (buckets.isEmpty()) {
+            NothingText(if (energyUse) "Collecting battery data" else "Collecting ride data", color = NothingMuted, size = 10)
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                buckets.forEachIndexed { index, bucket ->
+                    val value = values[index]
+                    Column(Modifier.weight(1f).semantics(mergeDescendants = true) {
+                        contentDescription = "${bucket.startKmh} to ${bucket.startKmh + 5} km/h, " +
+                            (value?.let { UiFormat.decimal(it, if (energyUse) energyDecimals else 1) } ?: "no estimate") +
+                            (if (energyUse) " battery percentage points per kilometre" else " percent of supported distance")
+                    }, horizontalAlignment = Alignment.CenterHorizontally) {
+                        NothingText(value?.let { UiFormat.decimal(it, if (energyUse) energyDecimals else 0) } ?: "—",
+                            color = NothingWhite, size = 8)
+                        Spacer(Modifier.height(4.dp))
+                        Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.BottomCenter) {
+                            if (value != null && value > 0) {
+                                Box(Modifier.fillMaxWidth().height((100 * value / maximum).toFloat().dp)
+                                    .background(NothingWhite))
+                            } else if (energyUse) {
+                                Box(Modifier.fillMaxWidth().height(3.dp).background(NothingLine))
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        NothingText("${bucket.startKmh}–${bucket.startKmh + 5}", color = NothingMuted, size = 8)
+                    }
+                }
+            }
+            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                NothingText(if (energyUse) "≥5 km measured · battery support" else "≥5 km measured per bucket", color = NothingMuted, size = 8)
+                NothingText("km/h", color = NothingMuted, size = 8)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RidingOverheads(statistics: BoardSpeedBucketStatistics, modifier: Modifier = Modifier) {
+    val energyValues = statistics.profileBuckets(true).mapNotNull { it.batteryPercentPer100Km?.div(100.0) }
+    val flatCurve = energyValues.size > 1 &&
+        requireNotNull(energyValues.maxOrNull()) - requireNotNull(energyValues.minOrNull()) < 1e-9
+    val shape = statistics.physicsShape
+    val lines = buildList {
+        if (shape == null) {
+            add("Speed curve" to if (flatCurve) "Learning · shared rate" else "Window fit")
+        } else {
+            add("Stop-and-go" to "+${UiFormat.decimal(statistics.stopGoPercentPerKm, 3)} % / km")
+            add("Hills" to "+${UiFormat.decimal(statistics.hillPercentPerKm, 3)} % / km")
+            add("Recuperation" to (shape.recoveryFraction?.let { "${UiFormat.decimal(it * 100, 0)} % of braking" }
+                ?: "Learning"))
+            val nominalWh = statistics.nominalBatteryWh
+            val effectiveWh = statistics.effectiveBatteryWh
+            if (nominalWh != null && effectiveWh != null) {
+                add("Usable pack energy" to if (statistics.packEnergyFactor == 1.0) {
+                    "${UiFormat.decimal(nominalWh, 0)} Wh · stated"
+                } else {
+                    "${UiFormat.decimal(effectiveWh, 0)} of ${UiFormat.decimal(nominalWh, 0)} Wh"
+                })
+            }
+            statistics.climbMPerKm?.let {
+                add("Climbing" to "${UiFormat.decimal(it, 0)} m / km · " +
+                    if (statistics.barometricShare >= 0.5) "barometer" else "inferred")
+            }
+        }
+    }
+    Column(modifier.fillMaxWidth()) {
+        NothingText("Energy statistics", size = 22, weight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+        NothingText("Cruise cost per speed; extras added to every trip", color = NothingMuted, size = 9)
+        lines.forEach { (label, value) ->
+            Row(Modifier.fillMaxWidth().padding(top = 6.dp).semantics(mergeDescendants = true) {},
+                horizontalArrangement = Arrangement.SpaceBetween) {
+                NothingText(label, color = NothingMuted, size = 10)
+                NothingText(value, size = 10, weight = FontWeight.Bold)
             }
         }
     }
@@ -1505,6 +1738,8 @@ private fun ExperimentalControl(
 private fun GeneralSettingsSection(
     lowBatteryWarningPercent: Int,
     onSetLowBatteryWarningPercent: (Int) -> Unit,
+    riderBoardProfile: RiderBoardProfile,
+    onSetRiderBoardProfile: (RiderBoardProfile) -> Unit,
 ) {
     val sliderColors = SliderDefaults.colors(
         thumbColor = NothingWhite,
@@ -1572,12 +1807,124 @@ private fun GeneralSettingsSection(
             NothingText("$MIN_LOW_BATTERY_WARNING_PERCENT%", color = NothingMuted, size = 9)
             NothingText("$MAX_LOW_BATTERY_WARNING_PERCENT%", color = NothingMuted, size = 9)
         }
+        Spacer(Modifier.height(30.dp))
+        RiderBoardProfileSettings(riderBoardProfile, onSetRiderBoardProfile)
     }
+}
+
+@Composable
+private fun RiderBoardProfileSettings(
+    profile: RiderBoardProfile,
+    onSetProfile: (RiderBoardProfile) -> Unit,
+) {
+    var choosingModel by remember { mutableStateOf(false) }
+    val model = profile.boardModel
+    NothingText("Rider and board", size = 16, weight = FontWeight.Bold)
+    Spacer(Modifier.height(7.dp))
+    NothingText(
+        "Starting values for the consumption model; it learns how much energy your pack really delivers. " +
+            "Stays on this phone.",
+        color = NothingMuted,
+        size = 10,
+        lineHeight = 16,
+    )
+    Spacer(Modifier.height(14.dp))
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(role = Role.Button, onClickLabel = "Choose board model") { choosingModel = !choosingModel }
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        NothingText("Board model", color = NothingMuted, size = 10)
+        NothingText(model.displayName, size = 10, weight = FontWeight.Bold)
+    }
+    if (choosingModel) {
+        Column(Modifier.selectableGroup()) {
+            BoardModelCatalog.models.forEach { option ->
+                val selected = option.id == model.id
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .selectable(selected = selected, role = Role.RadioButton, onClick = {
+                            choosingModel = false
+                            // A new model resets board-specific overrides to its published values.
+                            onSetProfile(profile.copy(boardModelId = option.id, boardMassKgOverride = null, batteryWhOverride = null))
+                        })
+                        .padding(vertical = 7.dp, horizontal = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    NothingText(option.displayName, color = if (selected) NothingRed else NothingWhite, size = 10)
+                    NothingText(
+                        "${UiFormat.decimal(option.boardMassKg, 1)} kg · ${UiFormat.decimal(option.batteryWh, 0)} Wh",
+                        color = NothingMuted,
+                        size = 10,
+                    )
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+    ProfileNumberField(
+        label = "Rider weight (kg)",
+        value = profile.riderMassKg,
+        placeholder = UiFormat.decimal(RiderBoardProfile.DEFAULT_RIDER_MASS_KG, 0),
+        range = RiderBoardProfile.MIN_RIDER_MASS_KG..RiderBoardProfile.MAX_RIDER_MASS_KG,
+        clearable = false,
+    ) { onSetProfile(profile.copy(riderMassKg = it ?: RiderBoardProfile.DEFAULT_RIDER_MASS_KG)) }
+    Spacer(Modifier.height(8.dp))
+    ProfileNumberField(
+        label = "Board weight (kg)",
+        value = profile.boardMassKgOverride,
+        placeholder = "${UiFormat.decimal(model.boardMassKg, 1)} · stock",
+        range = RiderBoardProfile.MIN_BOARD_MASS_KG..RiderBoardProfile.MAX_BOARD_MASS_KG,
+    ) { onSetProfile(profile.copy(boardMassKgOverride = it)) }
+    Spacer(Modifier.height(8.dp))
+    ProfileNumberField(
+        label = "Battery energy (Wh)",
+        value = profile.batteryWhOverride,
+        placeholder = "${UiFormat.decimal(model.batteryWh, 0)} · stock",
+        range = RiderBoardProfile.MIN_BATTERY_WH..RiderBoardProfile.MAX_BATTERY_WH,
+    ) { onSetProfile(profile.copy(batteryWhOverride = it)) }
+}
+
+/** Commits only parseable in-range values; clearing an override restores the stock value. */
+@Composable
+private fun ProfileNumberField(
+    label: String,
+    value: Double?,
+    placeholder: String,
+    range: ClosedFloatingPointRange<Double>,
+    clearable: Boolean = true,
+    onCommit: (Double?) -> Unit,
+) {
+    var text by remember(value) { mutableStateOf(value?.let { UiFormat.decimal(it, if (it % 1.0 == 0.0) 0 else 1) } ?: "") }
+    val parsed = text.replace(',', '.').toDoubleOrNull()
+    val invalid = text.isNotBlank() && (parsed == null || parsed !in range)
+    ApiTextField(
+        value = text,
+        onValueChange = { next ->
+            text = next
+            val number = next.replace(',', '.').toDoubleOrNull()
+            when {
+                next.isBlank() -> if (clearable) onCommit(null)
+                number != null && number in range && number != value -> onCommit(number)
+            }
+        },
+        label = label,
+        placeholder = placeholder,
+        keyboardType = KeyboardType.Decimal,
+        isError = invalid,
+    )
 }
 
 @Composable
 private fun SelfHostedApiSection(
     state: ApiSnapshot,
+    baseUrl: String,
+    onBaseUrlChange: (String) -> Unit,
+    oidcSignInPending: Boolean,
+    oidcSignInError: String?,
     onSetEnabled: (Boolean) -> Unit,
     onStartOidc: (String) -> Unit,
     onRequestRemoval: () -> Unit,
@@ -1586,8 +1933,8 @@ private fun SelfHostedApiSection(
     onSetAnalytics: (Boolean) -> Unit,
     onResyncArchives: () -> Unit,
     onSetGps: (Boolean) -> Unit,
+    onSetMotion: (Boolean) -> Unit,
 ) {
-    var baseUrl by remember(state.baseUrl) { mutableStateOf(state.baseUrl.orEmpty()) }
     val parsed = runCatching { apiUrls(baseUrl) }.getOrNull()
     Column {
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
@@ -1600,14 +1947,24 @@ private fun SelfHostedApiSection(
         if (!state.enabled) return@Column
         Spacer(Modifier.height(22.dp))
         if (!state.configured) {
-            ApiTextField(baseUrl, { baseUrl = it }, "API base URL",
+            ApiTextField(baseUrl, onBaseUrlChange, "API base URL",
                 "https://api.example.test/prefix", keyboardType = KeyboardType.Uri)
             Spacer(Modifier.height(14.dp))
             Button(
                 onClick = { onStartOidc(baseUrl) },
-                enabled = parsed?.base?.isHttps == true,
+                enabled = parsed?.base?.isHttps == true && !oidcSignInPending,
                 colors = ButtonDefaults.buttonColors(containerColor = NothingRed),
-            ) { NothingLabel("SIGN IN WITH SSO", Color.White) }
+            ) {
+                if (oidcSignInPending) {
+                    CircularProgressIndicator(Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                }
+                NothingLabel(if (oidcSignInPending) "CONNECTING TO SSO" else "SIGN IN WITH SSO", Color.White)
+            }
+            oidcSignInError?.let {
+                Spacer(Modifier.height(8.dp))
+                NothingText(it, color = NothingRed, size = 10, lineHeight = 15)
+            }
             NothingText(
                 "Uses your server's OIDC provider. The app receives a device credential after browser sign-in.",
                 color = NothingMuted,
@@ -1629,6 +1986,7 @@ private fun SelfHostedApiSection(
                 listOfNotNull(
                     caps?.metrics?.let { "METRICS v${it.schemaVersion}" },
                     caps?.realtime?.let { "REALTIME v${it.schemaVersion}" },
+                    caps?.motion?.let { "MOTION v${it.schemaVersion}" },
                     caps?.analytics?.let { "ANALYTICS v${it.schemaVersion}" },
                     caps?.realtime?.takeIf { it.gps }?.let { "GPS" },
                 ).ifEmpty { listOf("NO VALID CAPABILITIES") }.joinToString("  ·  "),
@@ -1640,6 +1998,7 @@ private fun SelfHostedApiSection(
             ApiStatusRow("Ride archives", state.analyticsStatus)
             ApiStatusRow("Charger observations", state.chargerAnalyticsStatus)
             ApiStatusRow("GPS", state.gpsStatus)
+            ApiStatusRow("Phone motion", if (caps?.motion == null) "Unsupported" else state.motionStatus)
             state.lastError?.let {
                 Spacer(Modifier.height(8.dp)); NothingText(it, color = NothingRed, size = 9, lineHeight = 14)
             }
@@ -1663,6 +2022,17 @@ private fun SelfHostedApiSection(
                 }
                 if (state.analyticsApproved) TextButton(onClick = onResyncArchives) {
                     NothingLabel("RESYNC ALL ARCHIVES", NothingRed)
+                }
+            }
+            if (caps?.motion != null) {
+                Spacer(Modifier.height(16.dp))
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        NothingText("Record and share phone motion", size = 12, weight = FontWeight.Bold)
+                        NothingText("Accelerometer and gyroscope during rides, at about 50 Hz. Saved locally and sent every five seconds. Includes precise sample times. Approval applies only to this API server.",
+                            color = NothingMuted, size = 9, lineHeight = 14)
+                    }
+                    Switch(checked = state.motionEnabled, onCheckedChange = onSetMotion)
                 }
             }
             if (caps?.realtime?.gps == true) {
@@ -1749,6 +2119,31 @@ private fun TrashIcon() {
 }
 
 @Composable
+internal fun ArchiveReplaySection(state: ArchiveReplayState, recording: Boolean, onReplay: () -> Unit) {
+    Column {
+        SectionTitle("Archive recovery", "Restore trips and rebuild Riders Profile from saved recordings on this phone.")
+        Spacer(Modifier.height(20.dp))
+        Button(
+            onClick = onReplay,
+            enabled = !state.running && !recording,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = NothingWhite, contentColor = NothingBlack),
+        ) {
+            if (state.running) {
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(12.dp))
+            }
+            Text(if (state.running) "REPLAYING ARCHIVE…" else "REPLAY LOCAL ARCHIVE", fontSize = 12.sp)
+        }
+        val message = if (recording && !state.running) "Finish the current recording before replaying archives." else state.message
+        message?.let {
+            Spacer(Modifier.height(12.dp))
+            NothingText(it, color = if (state.failed) NothingRed else NothingMuted, size = 11, lineHeight = 17)
+        }
+    }
+}
+
+@Composable
 private fun AppSection(onOpenSettings: () -> Unit, onVersionTap: () -> Unit) {
     Column {
         SectionTitle("App", "Permissions and version")
@@ -1766,7 +2161,7 @@ private fun AppSection(onOpenSettings: () -> Unit, onVersionTap: () -> Unit) {
         }
         HorizontalDivider(color = NothingLine)
         NothingText(
-            "Version ${BuildConfig.VERSION_NAME}",
+            "Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
             modifier = Modifier.clickable(onClick = onVersionTap).padding(vertical = 22.dp),
             color = NothingMuted,
             size = 10,
